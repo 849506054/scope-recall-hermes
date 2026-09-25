@@ -14,6 +14,7 @@ from scope_recall.core import CoreConfig, MemoryCore
 from scope_recall.core.admission import AdmissionPolicy
 from scope_recall.core.recall_policy import SPACE_ID
 from scope_recall.maintenance import doctor
+from scope_recall.maintenance import cli
 from test_autonomous_admission import app_at, capture
 from test_qdrant_runtime import runtime_config
 from v11_support import downgrade_store
@@ -321,6 +322,27 @@ def test_doctor_describes_a_remote_backend_without_failing_the_report(tmp_path, 
     assert remote['collection'].startswith('scope-recall-')
     assert remote['status'] == 'unreachable' and remote['detail'] == 'network_error'
     assert app.storage.path.read_bytes() == before
+
+
+def test_snapshot_remote_reports_an_unreachable_backend_and_writes_nothing(tmp_path, monkeypatch, capsys):
+    """The remote half of a backup is a status when the server cannot be
+    reached, and it never leaves a half-written manifest behind."""
+    app, ctx = _doctor_app(tmp_path, monkeypatch)
+    monkeypatch.setenv('SCOPE_RECALL_QDRANT_API_KEY', 'test-only-qdrant-secret')
+    _write_runtime_config(ctx, vector={
+        'backend': 'qdrant',
+        'storage_dir': str(ctx.binding.data_directory / 'vectors' / SPACE_ID),
+        'table_name': 'TEST_vectors', 'dimensions': 3072,
+        'qdrant': {'url': 'http://127.0.0.1:1', 'timeout_seconds': 0.2},
+    })
+    before = app.storage.path.read_bytes()
+    output = tmp_path / 'snapshot.json'
+    code = cli.main(['snapshot-remote', '--host', 'hermes', '--instance-root',
+                     str(ctx.binding.data_directory), '--output', str(output)])
+    payload = json.loads(capsys.readouterr().out)
+    assert code == 1 and payload['status'] == 'unreachable'
+    assert payload['detail'] == 'network_error'
+    assert not output.exists() and app.storage.path.read_bytes() == before
 
 
 def test_remote_coverage_compares_the_sqlite_expectation(tmp_path, monkeypatch):

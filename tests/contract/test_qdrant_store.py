@@ -57,22 +57,37 @@ class Server:
                 "config": {"params": deepcopy(body)},
                 "payload_schema": {},
                 "points": {},
+                "snapshots": {},
+                "status": "green",
             }
             return self.ok(True)
         if name not in self.collections:
             raise QdrantHTTPError("http_status", 404)
         collection = self.collections[name]
+        if method == "POST" and parts[2:] == ["snapshots"]:
+            assert "wait=true" in path
+            index = len(collection["snapshots"]) + 1
+            snapshot = {"name": f"{name}-{index}.snapshot", "size": 4096,
+                        "checksum": f"sha256:{index:064x}"}
+            collection["snapshots"][snapshot["name"]] = snapshot
+            return self.ok(dict(snapshot))
+        if method == "GET" and parts[2:] == ["snapshots"]:
+            return self.ok([deepcopy(value) for value in collection["snapshots"].values()])
+        if method == "PUT" and parts[2:] == ["snapshots", "recover"]:
+            assert body["priority"] == "snapshot"
+            collection["recovered_from"] = body["location"]
+            return self.ok(True)
         if method == "GET" and len(parts) == 2:
             return self.ok(
                 {
-                    "status": "green",
+                    "status": collection.get("status", "green"),
                     "optimizer_status": "ok",
                     "points_count": len(collection["points"]),
                     "indexed_vectors_count": len(collection["points"]),
                     **{
                         key: deepcopy(value)
                         for key, value in collection.items()
-                        if key != "points"
+                        if key not in {"points", "snapshots", "recovered_from", "status"}
                     },
                 }
             )
@@ -322,6 +337,72 @@ def test_describe_turns_a_remote_fault_into_a_status(setup, code, status):
     facts = store.describe(remaining_seconds=4)
     assert facts["status"] == status and facts["detail"] == code
     assert facts["collection"] == store.collection_name
+
+
+def test_snapshot_creation_is_confirmed_by_a_read_back(setup):
+    store, server, _, _ = setup
+    store.open()
+    store.upsert_records([row(1)])
+    facts = store.create_snapshot(remaining_seconds=4)
+    assert facts["collection"] == store.collection_name
+    assert facts["snapshot"] in server.collections[store.collection_name]["snapshots"]
+    assert facts["size_bytes"] == 4096 and facts["checksum"].startswith("sha256:")
+    assert store.list_snapshots(remaining_seconds=4) == [facts["snapshot"]]
+
+
+def test_snapshot_creation_is_refused_while_a_write_is_unconfirmed(setup):
+    store, server, _, _ = setup
+    store.open()
+    with pytest.raises(ContractError):
+        with store.mutation_gate.mutation("upsert", store.collection_name, time.monotonic() + 4):
+            pass  # an unacknowledged mutation leaves the durable marker behind
+    with pytest.raises(ContractError):
+        store.create_snapshot(remaining_seconds=4)
+    assert server.collections[store.collection_name]["snapshots"] == {}
+
+
+def test_recovery_plan_is_read_only_and_names_what_is_missing(setup):
+    store, server, _, _ = setup
+    store.open()
+    plan = store.plan_recovery("absent.snapshot", remaining_seconds=4)
+    assert plan["status"] == "missing_snapshot" and plan["detail"] == "snapshot_absent"
+    created = store.create_snapshot(remaining_seconds=4)
+    server.calls.clear()
+    plan = store.plan_recovery(created["snapshot"], remaining_seconds=4)
+    assert plan["status"] == "ok" and plan["points_count"] == 0
+    assert {method for method, *_ in server.calls} == {"GET"}
+    assert "recovered_from" not in server.collections[store.collection_name]
+
+
+def test_recovery_clears_pending_only_after_the_collection_settles(setup):
+    store, server, _, _ = setup
+    store.open()
+    store.upsert_records([row(1)])
+    created = store.create_snapshot(remaining_seconds=4)
+    server.collections[store.collection_name]["status"] = "yellow"
+
+    def settle(method, path, body):
+        if path.endswith("/snapshots/recover"):
+            server.collections[store.collection_name]["status"] = "green"
+        return None
+
+    server.hook = settle
+    result = store.recover_snapshot(created["snapshot"], remaining_seconds=4)
+    assert result["status"] == "recovered" and result["collection_status"] == "green"
+    location = server.collections[store.collection_name]["recovered_from"]
+    assert location.endswith(f"/collections/{store.collection_name}/snapshots/{created['snapshot']}")
+    assert store.mutation_gate.status() is None
+
+
+def test_recovery_that_does_not_settle_stays_pending(setup):
+    store, server, _, _ = setup
+    store.open()
+    created = store.create_snapshot(remaining_seconds=4)
+    server.collections[store.collection_name]["status"] = "yellow"
+    with pytest.raises(QdrantHTTPError):
+        store.recover_snapshot(created["snapshot"], remaining_seconds=0.3)
+    # Fail-closed: maintenance decides when an unacknowledged replacement is settled.
+    assert store.mutation_gate.status() is not None
 
 
 def test_roundtrip_search_pagination_count_delete(setup):

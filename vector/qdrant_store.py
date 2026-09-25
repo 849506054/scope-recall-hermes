@@ -230,6 +230,21 @@ class QdrantVectorStore(VectorStore):
             ) from None
         return result
 
+    def _snapshot_names(self, deadline: float) -> set[str]:
+        result = self._request("GET", self._path + "/snapshots", None, deadline)
+        if type(result) is not list:
+            raise _invalid()
+        names = []
+        for entry in result:
+            _check_budget(deadline)
+            name = _nested(entry, "name")
+            if type(name) is not str or not name:
+                raise _invalid()
+            names.append(name)
+        if len(names) != len(set(names)):
+            raise _invalid()
+        return set(names)
+
     def describe(self, *, remaining_seconds: float) -> dict[str, Any]:
         """Read-only inventory of this installation's collection, for a report.
 
@@ -290,6 +305,100 @@ class QdrantVectorStore(VectorStore):
             and "scope_id" in schema
         )
         return facts
+
+    def list_snapshots(self, *, remaining_seconds: float) -> list[str]:
+        """The snapshot names this installation's collection has on the server."""
+        return sorted(self._snapshot_names(self._deadline(remaining_seconds)))
+
+    def create_snapshot(self, *, remaining_seconds: float) -> dict[str, Any]:
+        """Take one server-side snapshot inside the write boundary.
+
+        A snapshot changes no point, so it marks no pending write: the shared
+        lock is the consistency boundary. The create response is confirmed by
+        reading the snapshot list back rather than trusted on its own.
+        """
+        deadline = self._deadline(remaining_seconds)
+        gate = self.mutation_gate
+        with gate.locked(deadline):
+            created = self._request("POST", self._path + "/snapshots?wait=true", None, deadline)
+            name = _nested(created, "name")
+            if type(name) is not str or not name:
+                raise _invalid()
+            if name not in self._snapshot_names(deadline):
+                raise _invalid()
+        facts: dict[str, Any] = {"collection": self.collection_name, "snapshot": name}
+        size = _nested(created, "size")
+        checksum = _nested(created, "checksum")
+        if type(size) is int:
+            facts["size_bytes"] = size
+        if type(checksum) is str:
+            facts["checksum"] = checksum
+        return facts
+
+    def plan_recovery(self, snapshot: str, *, remaining_seconds: float) -> dict[str, Any]:
+        """Read-only checks before a snapshot may replace this collection."""
+        _text(snapshot, "snapshot", maximum=255)
+        facts = self.describe(remaining_seconds=remaining_seconds)
+        plan: dict[str, Any] = {
+            "collection": self.collection_name,
+            "snapshot": snapshot,
+            "status": facts.get("status", "unknown"),
+            "detail": facts.get("detail", ""),
+        }
+        if plan["status"] != "ok":
+            return plan
+        if snapshot not in self._snapshot_names(self._deadline(remaining_seconds)):
+            return {**plan, "status": "missing_snapshot", "detail": "snapshot_absent"}
+        if facts.get("shape_matches") is not True:
+            return {**plan, "status": "shape_mismatch", "detail": "collection_shape"}
+        plan["points_count"] = facts.get("points_count")
+        return plan
+
+    def recover_snapshot(self, snapshot: str, *, remaining_seconds: float) -> dict[str, Any]:
+        """Replace this collection from a server-side snapshot, fail-closed.
+
+        The recovery is marked pending before it is issued and cleared only
+        after the collection reports a settled state. A timeout, or a
+        collection that does not settle, leaves the marker for maintenance:
+        an unacknowledged replacement is never assumed applied.
+        """
+        _text(snapshot, "snapshot", maximum=255)
+        deadline = self._deadline(remaining_seconds)
+        location = f"{self.config.url}/collections/{self.collection_name}/snapshots/{snapshot}"
+        gate = self.mutation_gate
+        with gate.mutation("recover_snapshot", self.collection_name, deadline) as receipt:
+            applied = self._request(
+                "PUT",
+                self._path + "/snapshots/recover",
+                {"location": location, "priority": "snapshot"},
+                deadline,
+            )
+            if applied is not True:
+                raise _invalid()
+            settled = self._await_settled(deadline)
+            receipt.complete()
+        return {
+            "collection": self.collection_name,
+            "snapshot": snapshot,
+            "status": "recovered",
+            "collection_status": settled.get("collection_status"),
+            "points_count": settled.get("points_count"),
+        }
+
+    def _await_settled(self, deadline: float) -> dict[str, Any]:
+        """Poll until the collection is green again, inside the caller's budget."""
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise QdrantHTTPError("timeout")
+            facts = self.describe(remaining_seconds=remaining)
+            if facts.get("status") == "ok" and facts.get("collection_status") == "green":
+                return facts
+            if facts.get("status") != "ok":
+                raise QdrantHTTPError(str(facts.get("detail") or "network_error"))
+            # ponytail: a fixed poll interval; a server that reports progress
+            # could be polled adaptively, which no verified version does yet.
+            time.sleep(min(0.5, max(0.0, deadline - time.monotonic())))
 
     def is_available(self) -> bool:
         try:

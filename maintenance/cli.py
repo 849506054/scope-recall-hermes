@@ -201,6 +201,78 @@ def _rollback(args: argparse.Namespace) -> int:
     return 0
 
 
+#: One bounded budget for a maintenance command's remote work. A snapshot of a
+#: large collection is not instantaneous, and the command is not a request path.
+_REMOTE_SECONDS = 30.0
+
+
+def _remote_store(host: str, instance_root: Path):
+    """The instance's configured remote companion, built but never opened."""
+    from ..runtime.instance import RuntimeInstanceConfig, default_vector_factory
+    from .doctor import _load_binding
+
+    binding, data_directory = _load_binding(host, instance_root)
+    raw = json.loads((data_directory / "runtime-config.json").read_text(encoding="utf-8"))
+    config = RuntimeInstanceConfig.from_mapping(raw)
+    if config.vector is None or config.vector.qdrant is None:
+        raise BackupError("this instance has no remote vector backend configured")
+    return default_vector_factory(
+        config.vector, binding=binding, embedding_space=config.embedding_space_id()
+    )
+
+
+def _add_snapshot_remote_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--host", required=True, choices=("hermes", "codex"))
+    parser.add_argument("--instance-root", required=True)
+    parser.add_argument("--output", help="write the snapshot manifest beside the backup")
+
+
+def _snapshot_remote(args: argparse.Namespace) -> int:
+    store = _remote_store(args.host, _path(args.instance_root, "instance_root"))
+    facts = store.describe(remaining_seconds=_REMOTE_SECONDS)
+    if facts.get("status") != "ok":
+        _emit({"status": facts.get("status"), "detail": facts.get("detail"),
+               "collection": facts.get("collection")})
+        return 1
+    result = {"status": "ok", "url": store.config.url, "points_count": facts.get("points_count"),
+              **store.create_snapshot(remaining_seconds=_REMOTE_SECONDS)}
+    if args.output:
+        output = _path(args.output, "output")
+        output.write_text(json.dumps(result, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+                          encoding="utf-8")
+    _emit(result)
+    return 0
+
+
+def _add_recover_remote_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--host", required=True, choices=("hermes", "codex"))
+    parser.add_argument("--instance-root", required=True)
+    parser.add_argument("--snapshot", required=True)
+    parser.add_argument("--apply", action="store_true",
+                        help="replace the collection; without it only the plan is reported")
+
+
+def _recover_remote(args: argparse.Namespace) -> int:
+    from ..contracts import ContractError
+    from ..vector.qdrant_http import QdrantHTTPError
+
+    store = _remote_store(args.host, _path(args.instance_root, "instance_root"))
+    plan = store.plan_recovery(args.snapshot, remaining_seconds=_REMOTE_SECONDS)
+    if plan["status"] != "ok" or not args.apply:
+        _emit(plan)
+        return 0 if plan["status"] == "ok" else 1
+    try:
+        _emit(store.recover_snapshot(args.snapshot, remaining_seconds=_REMOTE_SECONDS))
+    except (QdrantHTTPError, ContractError) as error:
+        # An unacknowledged replacement stays pending: say so, and let the
+        # operator decide when the server was quiet enough to clear it.
+        _emit({"status": "unsettled", "snapshot": args.snapshot,
+               "detail": getattr(error, "code", type(error).__name__),
+               "pending": store.mutation_gate.status()})
+        return 1
+    return 0
+
+
 def _add_install_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--host", required=True, choices=("hermes", "codex"))
     parser.add_argument("--target-plugin-dir", required=True)
@@ -485,6 +557,8 @@ _COMMANDS: tuple[tuple[str, str | None, Callable[[argparse.ArgumentParser], None
     ("retire-rootless-claims", "retire a bounded page of proposed claims no derivation root supports (tool output alone)", _add_requalify_arguments, _retire_rootless),
     ("retry-failures", "grant one bounded re-look to failed work after a fix has shipped", _add_retry_arguments, _retry_failures),
     ("backup", "create a new consistent SQLite snapshot and manifest", _add_backup_arguments, _backup),
+    ("snapshot-remote", "take one server-side Qdrant snapshot inside the write boundary", _add_snapshot_remote_arguments, _snapshot_remote),
+    ("recover-remote", "inspect recovery from a Qdrant snapshot; --apply replaces the collection", _add_recover_remote_arguments, _recover_remote),
     ("rollback", "inspect rollback; --apply may stop writes when new data must be reconciled", _add_rollback_arguments, _rollback),
     ("plan-install", None, _add_install_arguments, _plan_install),
     ("apply-install", None, _add_install_arguments, _apply_install),
