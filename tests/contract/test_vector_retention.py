@@ -10,6 +10,7 @@ import sqlite3
 
 import pytest
 
+from scope_recall.contracts import ContractError
 from scope_recall.maintenance import doctor
 from scope_recall.runtime import vector_retention
 from scope_recall.runtime.instance import VectorRuntimeConfig
@@ -85,6 +86,30 @@ def test_a_tool_output_older_than_the_window_loses_its_vector_and_nothing_else(a
     assert _pass(core, ctx, store, tmp_path, now=NOW + timedelta(minutes=30)) is None
     later = _pass(core, ctx, store, tmp_path, now=NOW + timedelta(hours=2))
     assert later["outcome"] == "nothing_due" and len(store.deleted) == 1
+
+
+def test_a_refused_gated_delete_leaves_the_ledger_and_the_vectors_untouched(app, tmp_path):
+    """Retention deletes through the store's gated method, so a refusal there is
+    a refusal of the whole pass: nothing is recorded as expired, and the next
+    drain tries again instead of the ledger claiming vectors that still exist."""
+    core, ctx = app
+    tools = [capture(core, ctx, f"TEST gated {index}", origin="tool_observation") for index in range(2)]
+    _embedded(core, aged=tools)
+
+    class RefusingStore:
+        def __init__(self):
+            self.calls: list[list[str]] = []
+
+        def delete_by_ids(self, ids):
+            self.calls.append(list(ids))
+            raise ContractError("STORAGE_UNAVAILABLE", "qdrant_mutation_uncertain")
+
+    store = RefusingStore()
+    receipt = _pass(core, ctx, store, tmp_path)
+    assert receipt["outcome"] == "failed" and receipt["error"] == "ContractError"
+    assert receipt["expired"] == 0 and receipt["backlog"] is False
+    assert store.calls == [[f"p10:{item.ref}@1:{SPACE}" for item in tools]]
+    assert _count(core, "SELECT count(*) FROM expired_vectors") == 0
 
 
 def test_a_backlog_is_cleared_one_batch_per_drain(app, tmp_path, monkeypatch):
