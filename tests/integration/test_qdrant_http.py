@@ -243,6 +243,23 @@ def test_http_name_resolution_is_checked_before_connect(monkeypatch, addresses):
     assert transport.wire._request(raw) == {"ok": False, "code": "request_invalid", "status": None}
 
 
+def test_a_full_dimension_batch_is_not_refused_by_the_shape_walk():
+    """A 64-point batch at 2048 dimensions is 1.8 MB and 263,619 nodes: the walk
+    must refuse a body by its bytes, not by a node count a legitimate batch
+    exceeds."""
+    row = {"id": "p10:TEST@1:space", "scope_id": "TEST-scope", "source": "event",
+           "target": "{}", "content": "x", "summary": "",
+           "updated_at": "2026-09-25T00:00:00Z", "vector": [0.001] * 2048}
+    body = {"points": [{"id": "TEST-point", "vector": [0.001] * 2048, "payload": row}
+                       for _ in range(64)]}
+    transport.wire._bounded_shape(body, transport.wire.MAX_BODY_BYTES,
+                                  deadline=time.monotonic() + 30)
+    oversized = {"points": [{"id": f"TEST-{index}", "vector": [0.0]} for index in range(100)]}
+    with pytest.raises(transport.wire._Failure) as caught:
+        transport.wire._bounded_shape(oversized, 64, deadline=time.monotonic() + 30)
+    assert caught.value.code == "request_limit"
+
+
 def test_internal_dns_connects_checked_address_once(server, monkeypatch):
     calls = []
 

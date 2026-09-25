@@ -48,18 +48,14 @@ def _load_object(raw):
     return result
 
 
-#: Bound on the number of leaves a size walk visits before declaring the body oversized.
-_MAX_WALK_ITEMS = 200_000
-
-
 def _bounded_shape(value, limit, *, deadline):
     """Refuse a body whose shape cannot be encoded inside the budget or the limit.
 
     ``json`` emits a whole string literal at once, so one huge string can consume
     the budget before any per-piece check runs: a string longer than the limit can
-    never fit, and an unbounded leaf count is refused outright.  Lengths are read
-    rather than encoded, so every step stays interruptible, and a legitimate body
-    is left to the encoder's exact per-piece limit.
+    never fit, and a body with more nodes than the limit has bytes cannot either.
+    Lengths are read rather than encoded, so every step stays interruptible, and a
+    legitimate body is left to the encoder's exact per-piece limit.
     """
     seen = 0
     stack = [value]
@@ -79,7 +75,10 @@ def _bounded_shape(value, limit, *, deadline):
             stack.extend(item)
         elif kind is not bool and item is not None and kind is not int and kind is not float:
             raise _Failure("request_invalid")
-        if seen > _MAX_WALK_ITEMS:
+        # Every visited node costs at least one encoded byte, so a body with more
+        # nodes than bytes cannot fit. A fixed node count refused legitimate
+        # batches: 64 points at 2048 dimensions is 263,619 nodes in 1.8 MB.
+        if seen > limit:
             raise _Failure("request_limit")
 
 

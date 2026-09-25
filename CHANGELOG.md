@@ -2,6 +2,15 @@
 
 All notable changes to `scope-recall` will be documented in this file.
 
+## [3.2.2] - 2026-09-25
+
+- **A full-dimension batch is not refused by the size walk.** The walk that
+  refuses a body which cannot be encoded counted nodes against a fixed 200,000;
+  a 64-point batch at 2048 dimensions is 263,619 nodes in 1.8 MB, so the worker
+  refused legitimate writes and a companion copy could not proceed. The bound
+  now follows the byte limit, where every visited node costs at least one
+  encoded byte.
+
 ## [3.2.1] - 2026-09-25
 
 3.2.1 is this fork's build on `3.2.0`. It adds a remote vector companion as a selectable
