@@ -2,6 +2,14 @@
 
 All notable changes to `scope-recall` will be documented in this file.
 
+## [3.2.4] - 2026-09-25
+
+- **A copy is verified without a full scan.** Verification read the target's
+  entire id set in one call, which does not fit one request budget at 26,000
+  points. It now proves coverage page by page against the source and takes the
+  target's size from one server-side count, reporting a count difference rather
+  than listing every extra id.
+
 ## [3.2.3] - 2026-09-25
 
 - **A companion copy carries its own request budget.** The copy wrote through the

@@ -115,6 +115,22 @@ def test_the_copy_writes_through_the_fenced_entry_with_its_own_budget(tmp_path):
     assert sum(size for size, _, _ in calls) == 5
 
 
+def test_verify_does_not_scan_the_whole_target(tmp_path):
+    """A full scan does not fit one request budget at scale; verification proves
+    coverage per page and takes the target's size from one count."""
+    source = _source(tmp_path)
+    target, _ = _target(tmp_path)
+    target.open()
+    vector_migration.run(source, target, state_path=tmp_path / "state.json", batch_size=2)
+
+    def forbidden():
+        raise AssertionError("verify scanned the whole target")
+
+    target.list_ids = forbidden
+    result = vector_migration.verify(source, target)
+    assert result["ok"] and result["target_rows"] == 5 and result["scopes"] == {"TEST-scope": 5}
+
+
 def test_verify_names_a_row_the_target_lost(tmp_path):
     source = _source(tmp_path)
     target, _ = _target(tmp_path)
