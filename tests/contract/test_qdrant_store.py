@@ -65,9 +65,15 @@ class Server:
         if method == "GET" and len(parts) == 2:
             return self.ok(
                 {
-                    key: deepcopy(value)
-                    for key, value in collection.items()
-                    if key != "points"
+                    "status": "green",
+                    "optimizer_status": "ok",
+                    "points_count": len(collection["points"]),
+                    "indexed_vectors_count": len(collection["points"]),
+                    **{
+                        key: deepcopy(value)
+                        for key, value in collection.items()
+                        if key != "points"
+                    },
                 }
             )
         if method == "PUT" and parts[2] == "index":
@@ -266,6 +272,56 @@ def test_open_existing_only_reads_and_shape_mismatch_is_preserved(setup):
         server.collections[store.collection_name]["config"]["params"]["vectors"]["size"]
         == 3
     )
+
+
+def test_describe_reports_a_missing_collection_without_creating_it(setup):
+    store, server, binding, _ = setup
+    facts = store.describe(remaining_seconds=4)
+    assert facts["status"] == "missing" and facts["detail"] == "collection_absent"
+    assert facts["collection"] == store.collection_name
+    assert facts["expected_dimensions"] == 2 and facts["expected_distance"] == "Cosine"
+    assert server.collections == {} and not binding.data_directory.exists()
+
+
+def test_describe_reports_shape_counts_and_indexes_read_only(setup):
+    store, server, _, _ = setup
+    store.open()
+    store.upsert_records([row(1), row(2)])
+    server.calls.clear()
+    facts = store.describe(remaining_seconds=4)
+    assert {method for method, *_ in server.calls} == {"GET"}
+    assert facts["status"] == "ok" and facts["detail"] == ""
+    assert facts["points_count"] == 2 and facts["indexed_vectors_count"] == 2
+    assert facts["dimensions"] == 2 and facts["distance"] == "Cosine"
+    assert facts["payload_indexes"] == ["scope_id"] and facts["shape_matches"] is True
+    assert facts["collection_status"] == "green" and facts["optimizer_status"] == "ok"
+
+
+def test_describe_marks_a_shape_mismatch_without_raising(setup):
+    store, server, _, _ = setup
+    store.open()
+    server.collections[store.collection_name]["config"]["params"]["vectors"]["size"] = 3
+    facts = store.describe(remaining_seconds=4)
+    assert facts["status"] == "ok" and facts["shape_matches"] is False
+    assert facts["dimensions"] == 3 and facts["expected_dimensions"] == 2
+
+
+@pytest.mark.parametrize(
+    "code,status",
+    [("network_error", "unreachable"), ("timeout", "unreachable"),
+     ("credential_invalid", "unauthorized"), ("http_status", "unknown")],
+)
+def test_describe_turns_a_remote_fault_into_a_status(setup, code, status):
+    store, server, _, _ = setup
+    store.open()
+
+    def refuse(method, path, body):
+        raise QdrantHTTPError(code)
+
+    server.hook = refuse
+    facts = store.describe(remaining_seconds=4)
+    assert facts["status"] == status and facts["detail"] == code
+    assert facts["collection"] == store.collection_name
 
 
 def test_roundtrip_search_pagination_count_delete(setup):

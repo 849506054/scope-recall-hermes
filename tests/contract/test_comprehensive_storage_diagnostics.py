@@ -15,6 +15,7 @@ from scope_recall.core.admission import AdmissionPolicy
 from scope_recall.core.recall_policy import SPACE_ID
 from scope_recall.maintenance import doctor
 from test_autonomous_admission import app_at, capture
+from test_qdrant_runtime import runtime_config
 from v11_support import downgrade_store
 
 
@@ -300,3 +301,41 @@ def test_doctor_names_a_runtime_config_that_was_there_and_is_gone(tmp_path, monk
     _write_runtime_config(ctx, vector_threshold=0.65)
     result = doctor.run_doctor(host='hermes', instance_root=ctx.binding.data_directory)
     assert 'runtime_config_missing' not in result.capability_gaps
+
+
+def test_doctor_describes_a_remote_backend_without_failing_the_report(tmp_path, monkeypatch):
+    """A configured remote collection is probed read-only and reported: an
+    unreachable one is a status in the report, never a failed doctor run."""
+    app, ctx = _doctor_app(tmp_path, monkeypatch)
+    monkeypatch.setenv('SCOPE_RECALL_QDRANT_API_KEY', 'test-only-qdrant-secret')
+    _write_runtime_config(ctx, vector={
+        'backend': 'qdrant',
+        'storage_dir': str(ctx.binding.data_directory / 'vectors' / SPACE_ID),
+        'table_name': 'TEST_vectors', 'dimensions': 3072,
+        'qdrant': {'url': 'http://127.0.0.1:1', 'timeout_seconds': 0.2},
+    })
+    before = app.storage.path.read_bytes()
+    result = doctor.run_doctor(host='hermes', instance_root=ctx.binding.data_directory)
+    remote = result.index_metadata['remote_vector']
+    assert remote['backend'] == 'qdrant' and remote['url'] == 'http://127.0.0.1:1'
+    assert remote['collection'].startswith('scope-recall-')
+    assert remote['status'] == 'unreachable' and remote['detail'] == 'network_error'
+    assert app.storage.path.read_bytes() == before
+
+
+def test_remote_coverage_compares_the_sqlite_expectation(tmp_path, monkeypatch):
+    """The report's only local measure of a remote point set is what SQLite says
+    should be there; a gap is reported, not hidden."""
+    config = runtime_config(tmp_path)
+
+    class FakeStore:
+        def describe(self, *, remaining_seconds):
+            assert remaining_seconds > 0
+            return {'backend': 'qdrant', 'collection': 'scope-recall-x', 'status': 'ok',
+                    'points_count': 3}
+
+    monkeypatch.setattr('scope_recall.runtime.instance.default_vector_factory',
+                        lambda vector, *, binding, embedding_space: FakeStore())
+    facts = doctor._remote_vector_facts(config, config.binding, expected_points=5)
+    assert facts['expected_points'] == 5 and facts['coverage_delta'] == 2
+    assert doctor._remote_vector_facts(None, config.binding, expected_points=5) is None

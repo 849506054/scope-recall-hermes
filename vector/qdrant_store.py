@@ -51,6 +51,24 @@ def _check_budget(deadline: float) -> None:
         raise QdrantHTTPError("timeout")
 
 
+def _nested(mapping: Any, *keys: str) -> Any:
+    """Read a nested key without trusting the shape of a remote document."""
+    for key in keys:
+        if type(mapping) is not dict:
+            return None
+        mapping = mapping.get(key)
+    return mapping
+
+
+def _remote_status(error: QdrantHTTPError) -> str:
+    """A report's word for a failed remote call: reachable, allowed, or neither."""
+    if error.code in {"network_error", "timeout"}:
+        return "unreachable"
+    if error.code in {"credential_missing", "credential_invalid"}:
+        return "unauthorized"
+    return "unknown"
+
+
 def _text(value: Any, name: str, *, maximum: int = 512) -> str:
     if type(value) is not str or not value.strip() or len(value) > maximum:
         raise ValueError(f"invalid qdrant {name}")
@@ -211,6 +229,67 @@ class QdrantVectorStore(VectorStore):
                 "Qdrant collection shape/index mismatch"
             ) from None
         return result
+
+    def describe(self, *, remaining_seconds: float) -> dict[str, Any]:
+        """Read-only inventory of this installation's collection, for a report.
+
+        Never opens, creates or writes. A remote fault is a fact about the
+        collection, not an exception: the caller gets a status word and reports
+        what is known, so one unreachable backend cannot fail the report that
+        exists to describe it.
+        """
+        facts: dict[str, Any] = {
+            "backend": self.backend,
+            "collection": self.collection_name,
+            "expected_dimensions": self.dimensions,
+            "expected_distance": self.metric.capitalize(),
+        }
+        deadline = self._deadline(remaining_seconds)
+        try:
+            names = self._collection_names(deadline)
+        except QdrantHTTPError as error:
+            return {**facts, "status": _remote_status(error), "detail": error.code}
+        except ContractError:
+            return {**facts, "status": "unknown", "detail": "invalid_response"}
+        if self.collection_name not in names:
+            return {**facts, "status": "missing", "detail": "collection_absent"}
+        try:
+            info = self._request("GET", self._path, None, deadline)
+        except QdrantHTTPError as error:
+            return {**facts, "status": _remote_status(error), "detail": error.code}
+        except ContractError:
+            return {**facts, "status": "unknown", "detail": "invalid_response"}
+        if type(info) is not dict:
+            return {**facts, "status": "unknown", "detail": "invalid_response"}
+        size = _nested(info, "config", "params", "vectors", "size")
+        distance = _nested(info, "config", "params", "vectors", "distance")
+        schema = info.get("payload_schema")
+        points = info.get("points_count")
+        indexed = info.get("indexed_vectors_count")
+        collection_status = info.get("status")
+        optimizer_status = info.get("optimizer_status")
+        facts.update(
+            {
+                "status": "ok",
+                "detail": "",
+                "points_count": points if type(points) is int else None,
+                "indexed_vectors_count": indexed if type(indexed) is int else None,
+                "dimensions": size if type(size) is int else None,
+                "distance": distance if type(distance) is str else None,
+                "payload_indexes": sorted(schema) if type(schema) is dict else None,
+                "collection_status": collection_status if type(collection_status) is str else None,
+                "optimizer_status": optimizer_status if type(optimizer_status) is str else None,
+            }
+        )
+        # The same shape `_collection_info` enforces before a store may open.
+        facts["shape_matches"] = (
+            facts["dimensions"] == self.dimensions
+            and type(facts["distance"]) is str
+            and facts["distance"].lower() == self.metric.lower()
+            and type(schema) is dict
+            and "scope_id" in schema
+        )
+        return facts
 
     def is_available(self) -> bool:
         try:

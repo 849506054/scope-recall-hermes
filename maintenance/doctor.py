@@ -243,7 +243,37 @@ def _expired_vectors(db_path: Path) -> dict[str, int] | None:
     return None
 
 
-def _check_index(report: DoctorReport, data_directory: Path, *, store_readable: bool, config: Any = None) -> None:
+#: A maintenance probe answers "reachable, authorised, shaped as expected", not
+#: a recall request: bounded well under a runtime request budget.
+_REMOTE_PROBE_SECONDS = 5.0
+
+
+def _remote_vector_facts(config: Any, binding: Any, *, expected_points: int | None) -> dict[str, Any] | None:
+    """Remote companion facts for the report, or None when this instance is local."""
+    vector = getattr(config, "vector", None)
+    if vector is None or getattr(vector, "qdrant", None) is None or binding is None:
+        return None
+    facts: dict[str, Any] = {"url": vector.qdrant.url}
+    try:
+        from scope_recall.runtime.instance import default_vector_factory
+
+        store = default_vector_factory(
+            vector, binding=binding, embedding_space=config.embedding_space_id()
+        )
+        facts.update(store.describe(remaining_seconds=_REMOTE_PROBE_SECONDS))
+    except Exception as error:  # noqa: BLE001 - a report must not fail on a probe
+        facts["status"] = "unknown"
+        facts["detail"] = type(error).__name__
+    observed = facts.get("points_count")
+    if expected_points is not None:
+        facts["expected_points"] = expected_points
+        if type(observed) is int:
+            facts["coverage_delta"] = expected_points - observed
+    return facts
+
+
+def _check_index(report: DoctorReport, data_directory: Path, *, store_readable: bool, config: Any = None,
+                 binding: Any = None) -> None:
     """Optional vector-index facts. Reported, never acted on."""
     metadata: dict[str, Any] = {"vectors_dir_present": (data_directory / "vectors").is_dir()}
     embedded = _embedded_objects(data_directory / "memory.sqlite3") if store_readable else None
@@ -265,6 +295,12 @@ def _check_index(report: DoctorReport, data_directory: Path, *, store_readable: 
         metadata["vector_stores"] = instance_vector_footprints(data_directory)
     except Exception:  # noqa: BLE001 - reporting must not fail the report.
         metadata["vector_stores"] = []
+    # What SQLite says should exist is the only local measure of a remote
+    # collection: its directory size cannot describe a server-side point set.
+    expected_points = None if embedded is None else embedded - (expired or 0)
+    remote = _remote_vector_facts(config, binding, expected_points=expected_points)
+    if remote is not None:
+        metadata["remote_vector"] = remote
     report.index_metadata = metadata
 
 
@@ -1019,5 +1055,5 @@ def run_doctor(
         _check_model_output(report)
         _check_ledger(report)
         _classify_status(report)
-    _check_index(report, data_directory, store_readable=readable, config=config)
+    _check_index(report, data_directory, store_readable=readable, config=config, binding=binding)
     return report
