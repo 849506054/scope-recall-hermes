@@ -3,9 +3,10 @@ from __future__ import annotations
 
 from dataclasses import replace
 from itertools import islice
+import threading
 import time
 import unicodedata
-from typing import Protocol
+from typing import Any, Callable, Protocol
 
 from ..contracts import ContractError
 from .background_context import background_candidates, current_task_candidate
@@ -61,6 +62,37 @@ _VECTOR_SILENT_REJECTIONS = frozenset({"vector_below_threshold", "vector_id_miss
 
 class RetrievalClock(Protocol):
     def monotonic(self) -> float: ...
+
+
+class _StartedChannel:
+    """One channel's collection started before the others and joined when collected.
+
+    The semantic channel leaves this machine to embed the query and search a
+    remote collection; every other channel reads local storage.  Run after them,
+    its slice was what the deadline had left — on an instance whose local
+    channels take most of an automatic recall's budget, that was less than the
+    embedding alone needs, so the channel never contributed.  Started first and
+    joined when its turn comes, it costs the recall the longer of the two, not
+    their sum, and the local channels keep their own share of the deadline.
+    """
+
+    def __init__(self, work: Callable[[], tuple[Any, ...]]) -> None:
+        self._value: tuple[Any, ...] = ()
+        self._thread = threading.Thread(target=self._run, args=(work,), daemon=True)
+        self._thread.start()
+
+    def _run(self, work: Callable[[], tuple[Any, ...]]) -> None:
+        try:
+            self._value = work()
+        except Exception:  # a channel that fails yields nothing; its gap is recorded by the caller
+            self._value = ()
+
+    def join(self, timeout: float) -> tuple[Any, ...] | None:
+        """The collected values, or None when the deadline passed before they landed."""
+        self._thread.join(max(0.0, timeout))
+        if self._thread.is_alive():
+            return None
+        return self._value
 
 
 class ChannelBudget:
@@ -131,11 +163,13 @@ class RetrievalPipeline:
 
     # -- candidate channels ---------------------------------------------------
 
-    def _vector_candidates(self, context: SearchContext, gaps: list[str], *, budget: ChannelBudget | None = None) -> tuple[CandidateRef, ...]:
+    def _vector_candidates(self, context: SearchContext, gaps: list[str], *, budget: ChannelBudget | None = None,
+                           limit: int | None = None) -> tuple[CandidateRef, ...]:
         if self.vector_port is None or context.limits.vector_limit == 0:
             gaps.append("vector_unavailable")
             return ()
-        limit = context.limits.vector_limit if budget is None else budget.allowance("vector", context.limits.vector_limit)
+        if limit is None:
+            limit = context.limits.vector_limit if budget is None else budget.allowance("vector", context.limits.vector_limit)
         if limit <= 0:
             return ()
         remaining = self._remaining(context)
@@ -211,13 +245,23 @@ class RetrievalPipeline:
             ("claim", getattr(self.storage_reader, "claims", None), CLAIM_CANDIDATES),
             ("recent", self.storage_reader.recent, context.limits.recent_items),
         )
+        # The semantic channel embeds the query over the network; the local
+        # channels read this machine.  Started here and joined at its turn, it
+        # costs the recall the longer of the two instead of their sum, which is
+        # what let an automatic recall keep a semantic channel at all.
+        vector_gaps: list[str] = []
+        vector_started = None
+        if self.vector_port is not None and context.limits.vector_limit > 0:
+            vector_slots = budget.allowance("vector", context.limits.vector_limit)
+            if vector_slots > 0:
+                vector_started = _StartedChannel(lambda: self._vector_candidates(context, vector_gaps, limit=vector_slots))
         try:
             for channel, loader, limit in channels:
                 if loader is None:
                     continue
                 if self._remaining(context) <= 0:
                     gaps.append("deadline_exceeded_collect")
-                    return admitted()
+                    break
                 allowance = budget.allowance(channel, limit)
                 if allowance <= 0:
                     continue
@@ -228,10 +272,17 @@ class RetrievalPipeline:
             raise
         except Exception as exc:
             gaps.append(f"sqlite_candidate_error:{type(exc).__name__}")
-        if self._remaining(context) <= 0:
-            gaps.append("deadline_exceeded_collect")
+        if vector_started is None:
+            if self._remaining(context) > 0:
+                raw.extend(self._vector_candidates(context, gaps, budget=budget))
             return admitted()
-        raw.extend(self._vector_candidates(context, gaps, budget=budget))
+        values = vector_started.join(self._remaining(context))
+        if values is None:
+            vector_gaps.append("deadline_exceeded_vector")
+        else:
+            budget.spend("vector", len(values))
+            raw.extend(values)
+        gaps.extend(vector_gaps)
         return admitted()
 
     # -- hydration and admission ----------------------------------------------

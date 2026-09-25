@@ -2,6 +2,16 @@
 
 All notable changes to `scope-recall` will be documented in this file.
 
+## [3.2.6] - 2026-09-25
+
+- **The semantic channel is collected alongside the local ones, not after them.**
+  A query embedding leaves this machine while every other channel reads it, and
+  the channel ran last: it received the deadline the local channels left, which
+  on an instance with tens of thousands of sources is less than one embedding
+  needs, so it reported `vector_unavailable` and contributed nothing. It starts
+  with collection and is joined at its turn now, so a recall costs the longer of
+  the two instead of their sum.
+
 ## [3.2.5] - 2026-09-25
 
 - **A copy asks the target what it holds instead of trusting a cursor.** A pass
