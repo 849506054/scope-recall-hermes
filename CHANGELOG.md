@@ -2,6 +2,30 @@
 
 All notable changes to `scope-recall` will be documented in this file.
 
+## [3.2.1] - 2026-09-25
+
+3.2.1 is this fork's build on `3.2.0`. It adds a remote vector companion as a selectable
+backend; SQLite stays the authority for facts, identity, permissions, lifecycle and evidence,
+and every candidate a remote store returns is filtered locally before it is used.
+
+- **A `qdrant` vector backend.** Vectors live in a Qdrant collection reached over HTTP, one
+  process per request, an absolute deadline, the API key on stdin, and a code -- never a
+  server body -- in every failure the caller sees. Plaintext HTTP is accepted only for a
+  destination that is explicitly internal, and a host written in an alternative numeric
+  notation (`0x08080808`, `134744072`, `127.1`) is refused rather than resolved. A plaintext
+  destination is resolved once and the checked address is the one dialled.
+- **A durable gate around remote changes.** A change is recorded as pending before it is
+  issued and cleared only after the server reports completion and a read-back agrees. An
+  unacknowledged removal leaves the store pending; pending state blocks later changes and
+  the confirmation of an empty purge until a controlled recovery runs.
+- **Python 3.13.** `requires-python` is `>=3.11,<3.14`, and the wheel installs there.
+- **Voyage usage.** The fallback to `prompt_tokens` applies only when `total_tokens` is
+  absent, so an explicit zero is recorded as what the provider sent.
+
+The remote backend's deployment, migration and recovery paths are verified before this
+build is deployed; the instance this work was developed for runs `3.2.0` with the
+`sqlite-bruteforce` backend.
+
 ## [3.2.0] - 2026-09-24
 
 3.2.0 lets several agents keep one memory. Until now each agent had a store of its own, and what the owner told one of them the others could not recall. A shared store is one store that several Hermes agents read and write, each attached as an entry: what the owner tells one agent, another can recall, and the recall says which agent it came in through; a deletion through any of them is gone for all of them; and moving the memory to another machine is copying one directory. `import-entry` brings each agent's earlier memories along. Upgrading does not make a store shared: an agent that is not attached keeps its own store. Only Hermes agents attach so far; Codex keeps its own store. How to set one up is [docs/shared-store.md](https://github.com/410979729/scope-recall-hermes/blob/v3.2.0/docs/shared-store.md). We have run three of our own agents on one shared store since 2026-09-23, with their earlier stores imported (about 87,000 sources), and much of what follows is what that turned up.
