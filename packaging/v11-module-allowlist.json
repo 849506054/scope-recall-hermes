@@ -184,6 +184,10 @@
     "vector/compaction.py",
     "vector/lance_native.py",
     "vector/process_store.py",
+    "vector/_qdrant_http_worker.py",
+    "vector/qdrant_config.py",
+    "vector/qdrant_http.py",
+    "vector/qdrant_mutation.py",
     "vector/sqlite_store.py",
     "vector/store.py"
   ],

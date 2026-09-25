@@ -513,6 +513,9 @@ def _embedding_usage(payload: Mapping[str, Any], *, dialect: str) -> dict[str, i
         metadata, key = payload.get("usageMetadata"), "promptTokenCount"
     else:
         metadata, key = payload.get("usage"), "prompt_tokens"
+    # Voyage embeddings report only total_tokens; an explicit prompt count wins.
+    if dialect == "openai" and isinstance(metadata, dict) and key not in metadata:
+        key = "total_tokens"
     if isinstance(metadata, dict) and type(metadata.get(key)) is int:
         return {"promptTokenCount": metadata[key]}
     return None

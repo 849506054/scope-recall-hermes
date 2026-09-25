@@ -12,7 +12,7 @@ no lock and opens no store.
 """
 from __future__ import annotations
 
-from dataclasses import MISSING, dataclass, field, fields, replace
+from dataclasses import MISSING, asdict, dataclass, field, fields, replace
 from functools import partial
 import math
 from pathlib import Path
@@ -37,6 +37,7 @@ from .validation import (
     strict_int,
     utc_now,
 )
+from ..vector.qdrant_config import QdrantConfig
 from .vector_retention import expire_if_due
 from .vector_upkeep import compact_if_due
 
@@ -45,7 +46,7 @@ _RUNTIME_ORIGINS: frozenset[Origin] = frozenset(
     {"human_direct", "tool_observation", "external_document", "imported"}
 )
 _HOST_ADAPTERS = frozenset({"hermes", "codex"})
-_VECTOR_BACKENDS = frozenset({"lancedb", "sqlite-bruteforce"})
+_VECTOR_BACKENDS = frozenset({"lancedb", "sqlite-bruteforce", "qdrant"})
 
 
 @dataclass(frozen=True)
@@ -62,9 +63,15 @@ class VectorRuntimeConfig:
     #: 0 keeps every vector (``runtime/vector_retention.py``).  The text, the
     #: lexical index and everything derived from the source are never expired.
     tool_output_retention_days: int = 180
+    qdrant: QdrantConfig | None = None
 
     def __post_init__(self) -> None:
         member("vector_backend", self.backend, _VECTOR_BACKENDS)
+        if self.backend == "qdrant":
+            if not isinstance(self.qdrant, QdrantConfig):
+                raise ValueError("qdrant")
+        elif self.qdrant is not None:
+            raise ValueError("qdrant_backend_mismatch")
         if not self.storage_dir.is_absolute():
             raise ValueError("vector_storage_dir_must_be_absolute")
         identifier("vector_table_name", self.table_name)
@@ -84,6 +91,7 @@ class VectorRuntimeConfig:
             metric=raw.get("metric", "cosine"),
             test_injection_override=raw.get("test_injection_override", False),
             tool_output_retention_days=raw.get("tool_output_retention_days", 180),
+            qdrant=None if raw.get("qdrant") is None else QdrantConfig.from_mapping(raw["qdrant"]),
         )
 
 
@@ -617,7 +625,8 @@ class RuntimeInstance:
         self._default_purge = None
 
 
-def default_vector_factory(config: VectorRuntimeConfig) -> Any:
+def default_vector_factory(config: VectorRuntimeConfig, *, binding: InstanceBinding | None = None,
+                           embedding_space: str | None = None) -> Any:
     """Build an existing-companion store without opening or creating it."""
     from ..vector.store import build_vector_store
 
@@ -627,6 +636,8 @@ def default_vector_factory(config: VectorRuntimeConfig) -> Any:
         table_name=config.table_name,
         dimensions=config.dimensions,
         metric=config.metric,
+        **({"qdrant": asdict(config.qdrant)} if config.qdrant is not None else {}),
+        **({"binding": binding, "embedding_space": embedding_space} if binding is not None else {}),
     )
 
 
@@ -712,11 +723,17 @@ def build_runtime_instance(
         from ..adapters.codex.authorization import build_ingress_authorizer
 
         ingress_authorizer = build_ingress_authorizer(config.binding)
+    chosen_factory = vector_factory
+    if chosen_factory is None and config.vector is not None:
+        chosen_factory = default_vector_factory
+        if config.vector.backend == "qdrant":
+            chosen_factory = partial(default_vector_factory, binding=config.binding,
+                                     embedding_space=config.embedding_space_id())
     instance = RuntimeInstance(
         config=config,
         core=core,
         auxiliary=auxiliary,
-        _vector_factory=vector_factory or (default_vector_factory if config.vector is not None else None),
+        _vector_factory=chosen_factory,
         _vector_port=vectors,
         _vector_store=vectors,
         _ingress_authorizer=ingress_authorizer,

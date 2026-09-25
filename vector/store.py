@@ -13,7 +13,7 @@ import time
 from contextlib import contextmanager
 from datetime import timedelta
 from pathlib import Path
-from typing import Any, Callable, Iterable, Iterator
+from typing import Any, Callable, Iterable, Iterator, Mapping
 
 from ..core.file_lock import advisory_file_lock
 from . import VectorRecord, VectorStore, VectorStoreCompatibilityError
@@ -423,9 +423,27 @@ def build_vector_store(
     table_name: str,
     dimensions: int,
     metric: str = "cosine",
+    qdrant: Mapping[str, Any] | None = None,
+    binding: Any = None,
+    embedding_space: str | None = None,
 ) -> VectorStore:
     """Select a companion store without opening it."""
     normalized = str(backend or "lancedb").strip().lower()
+    if normalized == "qdrant":
+        from ..contracts import InstanceBinding
+        from .qdrant_config import QdrantConfig
+
+        if not isinstance(binding, InstanceBinding) or not isinstance(embedding_space, str) or not embedding_space:
+            raise ValueError("qdrant_binding")
+        if qdrant is None:
+            raise ValueError("qdrant_options")
+        config = QdrantConfig.from_mapping(qdrant)
+        from .qdrant_store import QdrantVectorStore
+
+        return QdrantVectorStore(Path(storage_dir), table_name=table_name, dimensions=dimensions,
+                                 metric=metric, config=config, binding=binding, embedding_space=embedding_space)
+    if qdrant is not None:
+        raise ValueError("qdrant_options")
     if normalized in {"sqlite", "sqlite-bruteforce"}:
         from .sqlite_store import SQLiteBruteForceVectorStore
 

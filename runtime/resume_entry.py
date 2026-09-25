@@ -37,6 +37,9 @@ def credential_environment(config, env_file):
     """Read only the configured credential keys; never execute/interpolate dotenv."""
     names = {route.credential_env for route in (getattr(config.auxiliary, "embedding", None),
               getattr(config.auxiliary, "consolidation", None)) if route is not None}
+    qdrant = getattr(getattr(config, "vector", None), "qdrant", None)
+    if qdrant is not None:
+        names.add(qdrant.api_key_env)
     if not env_file or not names:
         return {}
     path = Path(env_file)
