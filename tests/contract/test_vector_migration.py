@@ -93,6 +93,28 @@ def test_a_second_run_resumes_after_the_recorded_id(tmp_path):
     assert vector_migration.verify(source, target)["ok"] is True
 
 
+def test_the_copy_writes_through_the_fenced_entry_with_its_own_budget(tmp_path):
+    """A 2048-dimension batch does not fit a recall's per-request budget, so the
+    copy passes its own through the store's fenced write."""
+    source = _source(tmp_path)
+    target, _ = _target(tmp_path)
+    calls = []
+    original = target.fenced_upsert_records
+
+    def fenced(rows, *, guard, remaining_seconds):
+        rows = list(rows)
+        calls.append((len(rows), remaining_seconds, guard()))
+        return original(rows, guard=guard, remaining_seconds=remaining_seconds)
+
+    target.fenced_upsert_records = fenced
+    target.open()
+    receipt = vector_migration.run(source, target, state_path=tmp_path / "state.json",
+                                   batch_size=3, batch_seconds=20.0)
+    assert receipt["copied"] == 5
+    assert calls and all(seconds == 20.0 and permitted for _, seconds, permitted in calls)
+    assert sum(size for size, _, _ in calls) == 5
+
+
 def test_verify_names_a_row_the_target_lost(tmp_path):
     source = _source(tmp_path)
     target, _ = _target(tmp_path)

@@ -2,6 +2,14 @@
 
 All notable changes to `scope-recall` will be documented in this file.
 
+## [3.2.3] - 2026-09-25
+
+- **A companion copy carries its own request budget.** The copy wrote through the
+  store's default per-request budget, which is sized for a recall; a 2048-dimension
+  batch and its read-back do not fit it, so a maintenance copy timed out. The copy
+  now writes through the store's fenced entry with an explicit maintenance budget,
+  and the maintenance command builds its target with that same budget.
+
 ## [3.2.2] - 2026-09-25
 
 - **A full-dimension batch is not refused by the size walk.** The walk that

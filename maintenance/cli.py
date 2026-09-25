@@ -298,7 +298,8 @@ def _migration_stores(args: argparse.Namespace):
         raise BackupError("this instance has no vector companion configured")
     source = default_vector_factory(config.vector, binding=binding, embedding_space=config.embedding_space_id())
     qdrant = QdrantConfig(args.qdrant_url, api_key_env=args.qdrant_api_key_env,
-                          collection_prefix=args.qdrant_collection_prefix)
+                          collection_prefix=args.qdrant_collection_prefix,
+                          timeout_seconds=45.0)  # a copy is a maintenance call, not a recall
     target_vector = replace(config.vector, backend="qdrant", qdrant=qdrant)
     target = default_vector_factory(target_vector, binding=binding, embedding_space=config.embedding_space_id())
     return source, target, data_directory

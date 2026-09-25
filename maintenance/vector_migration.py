@@ -46,6 +46,18 @@ def _reader(store: Any) -> Callable[[list[str]], dict[str, dict]]:
     return cast(Callable[[list[str]], dict[str, dict]], read)
 
 
+def _writer(store: Any, seconds: float) -> Callable[[list[dict]], None]:
+    """The store's fenced write when it has one, with this command's budget."""
+    fenced = getattr(store, "fenced_upsert_records", None)
+    if not callable(fenced):
+        return cast(Callable[[list[dict]], None], store.upsert_records)
+
+    def write(rows: list[dict]) -> None:
+        fenced(rows, guard=lambda: True, remaining_seconds=seconds)
+
+    return write
+
+
 def _read_state(path: Path) -> dict[str, Any]:
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
@@ -96,18 +108,24 @@ def run(
     state_path: str | Path,
     batch_size: int = BATCH,
     seconds: float | None = None,
+    batch_seconds: float = 45.0,
 ) -> dict[str, Any]:
     """Copy every row the target lacks, resuming after the id in the state file.
 
     A page is written and then recorded; a run that dies between the two repeats
     that page, which is idempotent.  ``seconds`` bounds one run so a maintenance
     window can call it repeatedly and watch ``remaining`` fall.
+
+    Each page is written through the store's fenced entry with this command's own
+    budget: a companion copy is a maintenance call, and the store's default
+    per-request budget is sized for a recall, not for a 2048-dimension batch.
     """
     if type(batch_size) is not int or batch_size < 1:
         raise ValueError("batch_size")
     if seconds is not None and (type(seconds) not in (int, float) or not math.isfinite(seconds) or seconds <= 0):
         raise ValueError("seconds")
     read_source = _reader(source)
+    write = _writer(target, batch_seconds)
     state_path = Path(state_path)
     state = _read_state(state_path)
     completed = state.get("completed")
@@ -121,7 +139,7 @@ def run(
             break
         rows = read_source(page)
         if rows:
-            target.upsert_records(list(rows.values()))
+            write(list(rows.values()))
         copied += len(page)
         batches += 1
         _atomic_json(state_path, {"completed": page[-1], "copied": copied_before + copied})
