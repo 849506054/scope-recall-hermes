@@ -2,6 +2,21 @@
 
 All notable changes to `scope-recall` will be documented in this file.
 
+## [3.2.8] - 2026-09-25
+
+- **The doctor measures the environment the host actually runs.**  A deployment
+  can serve the package from a persistent directory on `PYTHONPATH` instead of
+  from site-packages.  The interpreter probes ran isolated (`-I`), which strips
+  that path, so a healthy install was reported as `python_package_missing`,
+  `host_registration_incomplete` and an `incomplete` version check — with no way
+  to tell it from a broken one.  `-P` alone keeps the protection that matters: a
+  checkout cannot answer for the install.
+- **`--python` is probed and recorded as given.**  The CLI resolved the path, so
+  a venv launcher arrived at its base interpreter: the doctor measured an
+  environment the host never runs — its missing dependencies reading as drift —
+  and `plan-install` recorded an interpreter that cannot import the package
+  (#87).
+
 ## [3.2.7] - 2026-09-25
 
 - **A pending remote mutation has a way out that is not a hand-edited file.**
