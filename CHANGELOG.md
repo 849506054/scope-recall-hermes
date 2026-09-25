@@ -2,6 +2,14 @@
 
 All notable changes to `scope-recall` will be documented in this file.
 
+## [3.2.5] - 2026-09-25
+
+- **A copy asks the target what it holds instead of trusting a cursor.** A pass
+  that resumed after the last id it had seen skipped rows that arrived earlier in
+  the order than that id: a live instance added 23 sources during one copy and no
+  later pass would have carried them. Every pass now reads the source page, asks
+  the target which of those ids it holds, and writes only the missing ones.
+
 ## [3.2.4] - 2026-09-25
 
 - **A copy is verified without a full scan.** Verification read the target's

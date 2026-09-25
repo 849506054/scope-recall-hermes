@@ -71,7 +71,7 @@ def test_a_copy_is_paged_verified_and_recorded(tmp_path):
     receipt = vector_migration.run(source, target, state_path=state, batch_size=2)
     assert (receipt["copied"], receipt["remaining"], receipt["batches"]) == (5, 0, 3)
     assert receipt["source"] == "sqlite-bruteforce" and receipt["target"] == "qdrant"
-    assert json.loads(state.read_text(encoding="utf-8")) == {"completed": _row(5)["id"], "copied": 5}
+    assert json.loads(state.read_text(encoding="utf-8"))["copied"] == 5
     result = vector_migration.verify(source, target)
     assert result["ok"] is True
     assert result["source_rows"] == result["target_rows"] == 5
@@ -80,16 +80,18 @@ def test_a_copy_is_paged_verified_and_recorded(tmp_path):
     assert len(server.collections[target.collection_name]["points"]) == 5
 
 
-def test_a_second_run_resumes_after_the_recorded_id(tmp_path):
+def test_a_second_run_copies_what_the_target_lacks(tmp_path):
+    """A full pass by design: the target's own answer decides what is missing, so
+    a row that arrived earlier in the order than the last id a run saw is still
+    copied."""
     source = _source(tmp_path)
     target, _ = _target(tmp_path)
     target.open()
-    target.upsert_records([_row(1), _row(2)])  # the first page a previous run wrote
+    target.upsert_records([_row(1), _row(3)])  # a previous, interrupted pass
     state = tmp_path / "migration-state.json"
-    state.write_text(json.dumps({"completed": _row(2)["id"], "copied": 2}), encoding="utf-8")
+    state.write_text(json.dumps({"scanned": 3, "copied": 2, "last_id": _row(3)["id"]}), encoding="utf-8")
     receipt = vector_migration.run(source, target, state_path=state, batch_size=2)
-    assert receipt["resumed_after"] == _row(2)["id"]
-    assert (receipt["copied"], receipt["copied_total"], receipt["remaining"]) == (3, 5, 0)
+    assert (receipt["copied"], receipt["scanned"], receipt["remaining"]) == (3, 5, 0)
     assert vector_migration.verify(source, target)["ok"] is True
 
 
@@ -163,7 +165,7 @@ def test_plan_reads_both_sides_without_writing(tmp_path):
     vector_migration.run(source, target, state_path=tmp_path / "state.json", batch_size=2)
     server.calls.clear()
     result = vector_migration.plan(source, target)
-    assert (result["source_rows"], result["target_rows"], result["to_copy"]) == (5, 5, 0)
+    assert (result["source_rows"], result["target_rows"], result["to_copy_estimate"]) == (5, 5, 0)
     methods = {method for method, *_ in server.calls}
     assert "PUT" not in methods and "DELETE" not in methods  # reads only, no write path
     assert target.count_rows() == 5

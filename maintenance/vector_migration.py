@@ -85,19 +85,20 @@ def _same_row(left: dict[str, Any], right: dict[str, Any], *, tolerance: float) 
 
 
 def plan(source: Any, target: Any) -> dict[str, Any]:
-    """Read-only: what a migration would copy, and what the target already holds."""
+    """Read-only: what a copy would move, from the id list and one count.
+
+    A count difference is an estimate, not a list: a full pass is what the run
+    does, and it reports what it actually copied.
+    """
     _reader(source), _reader(target)
     source_ids = sorted(source.list_ids())
-    target_ids = set(target.list_ids())
-    missing = [item for item in source_ids if item not in target_ids]
-    extra = sorted(target_ids - set(source_ids))
+    target_rows = target.count_rows()
     return {
         "source": _backend(source),
         "target": _backend(target),
         "source_rows": len(source_ids),
-        "target_rows": len(target_ids),
-        "to_copy": len(missing),
-        "target_only": {"count": len(extra), "sample": extra[:SAMPLE]},
+        "target_rows": target_rows,
+        "to_copy_estimate": max(0, len(source_ids) - target_rows),
     }
 
 
@@ -110,11 +111,14 @@ def run(
     seconds: float | None = None,
     batch_seconds: float = 45.0,
 ) -> dict[str, Any]:
-    """Copy every row the target lacks, resuming after the id in the state file.
+    """Copy every row the target lacks, one page at a time.
 
-    A page is written and then recorded; a run that dies between the two repeats
-    that page, which is idempotent.  ``seconds`` bounds one run so a maintenance
-    window can call it repeatedly and watch ``remaining`` fall.
+    Each page is read from the source, the target is asked which of those ids it
+    holds, and only the missing ones are written. Every run is a full pass by
+    design: a copy that resumed from the last id it saw would skip a row that
+    arrived earlier in the order after that point, and the target's own answer is
+    the only reliable statement of what it holds. ``seconds`` bounds one pass so a
+    maintenance window can call it repeatedly and watch ``remaining`` fall.
 
     Each page is written through the store's fenced entry with this command's own
     budget: a companion copy is a maintenance call, and the store's default
@@ -124,33 +128,32 @@ def run(
         raise ValueError("batch_size")
     if seconds is not None and (type(seconds) not in (int, float) or not math.isfinite(seconds) or seconds <= 0):
         raise ValueError("seconds")
-    read_source = _reader(source)
+    read_source, read_target = _reader(source), _reader(target)
     write = _writer(target, batch_seconds)
     state_path = Path(state_path)
-    state = _read_state(state_path)
-    completed = state.get("completed")
-    copied_before = int(state.get("copied", 0)) if type(state.get("copied")) is int else 0
     ids = sorted(source.list_ids())
-    pending = ids if completed is None else [item for item in ids if item > str(completed)]
-    copied = batches = 0
+    copied = scanned = batches = 0
     started = time.monotonic()
-    for page in _pages(pending, batch_size):
+    for page in _pages(ids, batch_size):
         if seconds is not None and time.monotonic() - started >= seconds:
             break
-        rows = read_source(page)
-        if rows:
-            write(list(rows.values()))
-        copied += len(page)
+        held = read_target(page)
+        absent = [item for item in page if item not in held]
+        if absent:
+            rows = read_source(absent)
+            if rows:
+                write(list(rows.values()))
+                copied += len(rows)
+        scanned += len(page)
         batches += 1
-        _atomic_json(state_path, {"completed": page[-1], "copied": copied_before + copied})
+        _atomic_json(state_path, {"scanned": scanned, "copied": copied, "last_id": page[-1]})
     return {
         "source": _backend(source),
         "target": _backend(target),
         "source_rows": len(ids),
-        "resumed_after": completed,
+        "scanned": scanned,
         "copied": copied,
-        "copied_total": copied_before + copied,
-        "remaining": len(ids) - copied_before - copied,
+        "remaining": len(ids) - scanned,
         "batches": batches,
         "seconds": round(time.monotonic() - started, 3),
     }
