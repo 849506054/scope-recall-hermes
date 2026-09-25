@@ -3,8 +3,10 @@ from __future__ import annotations
 
 import base64
 import http.client
+import ipaddress
 import json
 import math
+import re
 import socket
 import ssl
 import sys
@@ -46,9 +48,45 @@ def _load_object(raw):
     return result
 
 
+#: Bound on the number of leaves a size walk visits before declaring the body oversized.
+_MAX_WALK_ITEMS = 200_000
+
+
+def _bounded_shape(value, limit, *, deadline):
+    """Refuse a body whose shape cannot be encoded inside the budget or the limit.
+
+    ``json`` emits a whole string literal at once, so one huge string can consume
+    the budget before any per-piece check runs: a string longer than the limit can
+    never fit, and an unbounded leaf count is refused outright.  Lengths are read
+    rather than encoded, so every step stays interruptible, and a legitimate body
+    is left to the encoder's exact per-piece limit.
+    """
+    seen = 0
+    stack = [value]
+    while stack:
+        item = stack.pop()
+        seen += 1
+        if seen % 512 == 0:
+            _remaining(deadline)
+        kind = type(item)
+        if kind is str:
+            if len(item) > limit:
+                raise _Failure("request_limit")
+        elif kind is dict:
+            stack.extend(item.keys())
+            stack.extend(item.values())
+        elif kind is list:
+            stack.extend(item)
+        elif kind is not bool and item is not None and kind is not int and kind is not float:
+            raise _Failure("request_invalid")
+        if seen > _MAX_WALK_ITEMS:
+            raise _Failure("request_limit")
+
+
 def _dump_object(value, limit, *, deadline):
     if type(value) is not dict:
         raise _Failure("request_invalid")
+    _bounded_shape(value, limit, deadline=deadline)
     result = bytearray()
     for piece in json.JSONEncoder(ensure_ascii=True, allow_nan=False, separators=(",", ":")).iterencode(value):
         _remaining(deadline)
@@ -80,6 +118,74 @@ def _validate_request(method, path, key):
         raise _Failure("credential_invalid")
 
 
+_INTERNAL_NETWORKS = (
+    ipaddress.ip_network("10.0.0.0/8"), ipaddress.ip_network("172.16.0.0/12"),
+    ipaddress.ip_network("192.168.0.0/16"), ipaddress.ip_network("fc00::/7"),
+)
+_DNS_LABEL = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?")
+# Alternative numeric notations (hex, bare decimal, leading zeros) that a C resolver
+# reads as an address although they are not a dotted quad.
+_NUMERIC_LABEL = re.compile(r"(?:0[xX][0-9A-Fa-f]+|[0-9]+)")
+
+
+def _internal_literal(host):
+    """True/False for an address literal; None when the host is not one."""
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return None
+    return address.is_loopback or any(address in network for network in _INTERNAL_NETWORKS)
+
+
+def valid_origin(value):
+    """The one origin decision, shared by this worker and the config layer.
+
+    This module is the process that dials, so it owns the rule; ``qdrant_config``
+    imports it rather than keeping a second copy. A bare http(s) origin only;
+    plaintext is allowed only for an explicitly internal destination, and a host
+    written in an alternative numeric notation is refused instead of trusted.
+    """
+    if (type(value) is not str or len(value) > 2048 or not value.isascii()
+            or any(ord(char) <= 32 or ord(char) == 127 for char in value)
+            or any(char in value for char in "?#\\%")):
+        raise ValueError("origin")
+    try:
+        parsed = urlsplit(value)
+        host, port = parsed.hostname, parsed.port
+    except ValueError:
+        raise ValueError("origin") from None
+    if (parsed.scheme not in {"http", "https"} or not host or parsed.username is not None
+            or parsed.password is not None or parsed.path not in {"", "/"}
+            or parsed.netloc.endswith(":") or port == 0):
+        raise ValueError("origin")
+    internal = _internal_literal(host)
+    if internal is None:
+        labels = host.split(".")
+        if (len(host) > 253 or any(not _DNS_LABEL.fullmatch(label) for label in labels)
+                or all(_NUMERIC_LABEL.fullmatch(label) for label in labels)):
+            raise ValueError("origin")
+        internal = "." not in host
+    if port is None:
+        port = 443 if parsed.scheme == "https" else 80
+    if parsed.scheme == "http" and not internal:
+        raise ValueError("origin")
+    return parsed, host, port
+
+
+def _internal_destination(host, port):
+    """Resolve a plaintext destination once and return only a checked internal address."""
+    try:
+        infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    except OSError:
+        raise _Failure("network_error") from None
+    if not infos:
+        raise _Failure("network_error")
+    for info in infos:
+        if _internal_literal(str(info[4][0])) is not True:
+            raise _Failure("request_invalid")
+    return infos[0]
+
+
 def _parse_request(raw):
     request = _load_object(raw)
     if set(request) != {"url", "method", "path", "api_key", "body_b64", "timeout_seconds"}:
@@ -92,14 +198,10 @@ def _parse_request(raw):
     # A duration crosses the process boundary portably; this clock starts at once.
     deadline = time.monotonic() + float(timeout_seconds)
     url = request["url"]
-    if type(url) is not str or len(url) > 2048 or not url.isascii():
-        raise _Failure("request_invalid")
-    parsed = urlsplit(url)
-    if (parsed.scheme not in {"http", "https"} or not parsed.hostname
-            or parsed.username is not None or parsed.password is not None
-            or parsed.path not in {"", "/"} or parsed.query or parsed.fragment
-            or any(ord(char) <= 32 or ord(char) == 127 for char in url)):
-        raise _Failure("request_invalid")
+    try:
+        parsed, host, port = valid_origin(url)
+    except ValueError:
+        raise _Failure("request_invalid") from None
     body = None
     if request["body_b64"] is not None:
         if type(request["body_b64"]) is not str:
@@ -108,7 +210,7 @@ def _parse_request(raw):
         if len(body) > MAX_BODY_BYTES:
             raise _Failure("request_limit")
         _load_object(body)
-    return request, parsed, body, deadline
+    return request, parsed, host, port, body, deadline
 
 
 def _arm(connection, deadline):
@@ -152,15 +254,20 @@ def _request(raw):
     connection = None
     status = None
     try:
-        request, parsed, body, deadline = _parse_request(raw)
+        request, parsed, host, port, body, deadline = _parse_request(raw)
         if parsed.scheme == "https":
-            connection = http.client.HTTPSConnection(parsed.hostname, parsed.port or 443,
-                                                       context=ssl.create_default_context())
+            connection = http.client.HTTPSConnection(host, port, context=ssl.create_default_context())
         else:
-            connection = http.client.HTTPConnection(parsed.hostname, parsed.port or 80)
+            # Dial the address that was checked: a second lookup could repoint the name.
+            family, socktype, protocol, _canonical, sockaddr = _internal_destination(host, port)
+            connection = http.client.HTTPConnection(host, port)
+            connection.sock = socket.socket(family, socktype, protocol)
+            connection.sock.settimeout(_remaining(deadline))
+            connection.sock.connect(sockaddr)
         # http.client uses a direct connection and never follows redirects or environment proxies.
         _arm(connection, deadline)
-        connection.connect()
+        if connection.sock is None:
+            connection.connect()
         _arm(connection, deadline)
         connection.request(request["method"], request["path"], body=body, headers={
             "api-key": request["api_key"], "Content-Type": "application/json",

@@ -5,6 +5,7 @@ import base64
 import contextlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import shutil
 import socket
 import ssl
 import subprocess
@@ -243,12 +244,13 @@ def test_http_name_resolution_is_checked_before_connect(monkeypatch, addresses):
 
 
 def test_internal_dns_connects_checked_address_once(server, monkeypatch):
-    real_getaddrinfo = socket.getaddrinfo
     calls = []
 
     def resolve(host, port, *args, **kwargs):
+        # Answer without touching a resolver: the test boundary denies real lookups.
         calls.append(host)
-        return real_getaddrinfo("127.0.0.1", server.server_port, *args, **kwargs)
+        return [(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "",
+                 ("127.0.0.1", server.server_port))]
 
     monkeypatch.setattr(transport.wire.socket, "getaddrinfo", resolve)
     raw = json.dumps(dict(url=f"http://vectors:{server.server_port}", method="GET", path="/collections",
@@ -392,10 +394,17 @@ def test_isolated_helper_rejects_stdin_overflow_and_emits_only_json(server):
 
 
 def test_tls_validates_certificate_and_ignores_ambient_ca_override(server, tmp_path, monkeypatch):
+    openssl = shutil.which("openssl")
+    assert openssl, "openssl is not installed"
     cert, key = tmp_path / "cert.pem", tmp_path / "key.pem"
-    subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
-                    "-keyout", str(key), "-out", str(cert), "-subj", "/CN=localhost",
-                    "-addext", "subjectAltName=IP:127.0.0.1"], check=True, capture_output=True, timeout=5)
+    request = tmp_path / "openssl.cnf"
+    # The subject travels in a file: a bare ``/CN=localhost`` argument reads as an
+    # absolute path to the test boundary, which denies it.
+    request.write_text("[req]\ndistinguished_name = dn\nprompt = no\nx509_extensions = v3\n"
+                       "[dn]\nCN = localhost\n[v3]\nsubjectAltName = IP:127.0.0.1\n", encoding="utf-8")
+    subprocess.run([openssl, "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
+                    "-keyout", str(key), "-out", str(cert), "-config", str(request)],
+                   check=True, capture_output=True, timeout=5)
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     context.load_cert_chain(cert, key)
     server.socket = context.wrap_socket(server.socket, server_side=True)
@@ -445,3 +454,16 @@ def test_helper_frame_contract_is_duration_based(server):
     nonfinite = run({**base, "timeout_seconds": float("inf")})
     assert nonfinite == {"ok": False, "code": "http_protocol", "status": None}
     assert not any(KEY in value for value in nonfinite.values() if isinstance(value, str))
+
+
+def test_one_huge_string_cannot_outrun_the_deadline(monkeypatch):
+    """Sizing walks lengths instead of encoding them, so the bound holds at any budget."""
+    monkeypatch.setenv("SCOPE_RECALL_QDRANT_API_KEY", KEY)
+    config = QdrantConfig("http://127.0.0.1:6333", timeout_seconds=45.0)
+    started = time.monotonic()
+    with pytest.raises(transport.QdrantHTTPError) as exc:
+        transport.request_json(config, "POST", "/collections/x/points",
+                               {"huge": "x" * (8 * 1024 * 1024)},
+                               deadline=time.monotonic() + 0.05)
+    assert exc.value.code == "request_limit"
+    assert time.monotonic() - started < 1.0

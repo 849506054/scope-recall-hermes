@@ -109,7 +109,7 @@ SCRIPT_GATE_TESTS = [
 ]
 SUITES = {
     "unit": ["tests/unit/test_v11_context.py", "tests/unit/test_check_runner.py", "tests/unit/test_secret_patterns.py", "tests/unit/test_contract_schemas.py"],
-    "contract": ["tests/contract/test_v11_protocol.py", "tests/contract/test_v11_inputs.py", "tests/contract/test_p13_configurable_budget.py", "tests/contract/test_autostart_cli.py", "tests/contract/test_companion_publish.py", "tests/contract/test_upgrade_store_cli.py", "tests/contract/test_request_guard_escaping.py", "tests/contract/test_relation_candidates_rank.py", "tests/contract/test_status_file_beside_its_writer.py", "tests/contract/test_every_store_meets_the_runtime.py", "tests/contract/test_qdrant_config.py", "tests/contract/test_a_paused_wake_lets_go.py", "tests/contract/test_a_pass_that_ends_hands_back_its_group.py", "tests/contract/test_qdrant_mutation.py", "tests/contract/test_qdrant_runtime.py"],
+    "contract": ["tests/contract/test_v11_protocol.py", "tests/contract/test_v11_inputs.py", "tests/contract/test_p13_configurable_budget.py", "tests/contract/test_autostart_cli.py", "tests/contract/test_companion_publish.py", "tests/contract/test_upgrade_store_cli.py", "tests/contract/test_request_guard_escaping.py", "tests/contract/test_relation_candidates_rank.py", "tests/contract/test_status_file_beside_its_writer.py", "tests/contract/test_every_store_meets_the_runtime.py", "tests/contract/test_qdrant_config.py", "tests/contract/test_a_paused_wake_lets_go.py", "tests/contract/test_a_pass_that_ends_hands_back_its_group.py", "tests/contract/test_qdrant_runtime.py", "tests/contract/test_qdrant_store.py"],
     "storage": ["tests/contract/test_v11_storage.py", "tests/contract/test_shared_store.py"],
     "capture": ["tests/contract/test_v11_capture.py"],
     "claims": ["tests/contract/test_v11_claims.py"],
@@ -368,6 +368,7 @@ RUNTIME_BOUNDARY_TESTS = [
     "tests/contract/test_responses_consolidation.py",
     "tests/contract/test_runtime_auxiliary.py",
     "tests/contract/test_runtime_worker_entry.py",
+    "tests/contract/test_qdrant_mutation.py",
     "tests/host/test_runtime_watchdog.py",
     "tests/host/test_runtime_wiring_common.py",
 ]

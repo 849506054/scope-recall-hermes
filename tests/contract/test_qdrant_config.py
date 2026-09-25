@@ -84,3 +84,12 @@ def test_resume_loads_only_declared_qdrant_credential(tmp_path):
     assert credential_environment(config, env) == {"TEST_QDRANT_KEY": "test-fixture-key"}
     legacy = SimpleNamespace(vector=None, auxiliary=None)
     assert credential_environment(legacy, env) == {}
+
+
+@pytest.mark.parametrize("url", ["http://0x08080808:6333", "http://134744072:6333", "http://0177.0.0.1.:6333"])
+def test_alternative_numeric_hosts_are_not_trusted_as_internal(tmp_path, url):
+    """A C resolver reads these as addresses; the origin rule refuses them instead."""
+    raw = vector_mapping(tmp_path)
+    raw["qdrant"]["url"] = url
+    with pytest.raises(ValueError, match="qdrant_url"):
+        VectorRuntimeConfig.from_mapping(raw)

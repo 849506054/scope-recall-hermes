@@ -48,7 +48,7 @@ def test_vector_store_factory_accepts_sqlite_alias_and_rejects_unknown_backend(t
         build_vector_store("unknown", storage_dir=tmp_path, table_name="memories", dimensions=2, metric="cosine")
 
 
-@pytest.mark.parametrize("reserved_backend", ["qdrant", "chroma"])
+@pytest.mark.parametrize("reserved_backend", ["chroma"])
 def test_reserved_future_vector_backends_fail_fast_without_runtime_dependency(tmp_path, reserved_backend: str):
     with pytest.raises(ValueError, match="unsupported vector backend"):
         build_vector_store(reserved_backend, storage_dir=tmp_path, table_name="memories", dimensions=2, metric="cosine")

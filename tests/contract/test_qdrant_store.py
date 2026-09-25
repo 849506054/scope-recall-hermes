@@ -1,4 +1,5 @@
 """Current-collection REST contract, with real durable mutation gates."""
+
 from __future__ import annotations
 
 from copy import deepcopy
@@ -10,7 +11,12 @@ from uuid import UUID
 
 import pytest
 
-from scope_recall.adapters.lance import LanceIndexWriter, LancePurgePort, LanceVectorRecord, _record_row
+from scope_recall.adapters.lance import (
+    LanceIndexWriter,
+    LancePurgePort,
+    LanceVectorRecord,
+    _record_row,
+)
 from scope_recall.contracts import ContractError, InstanceBinding
 from scope_recall.core.deadline import RequestDeadline, using_request_deadline
 from scope_recall.vector import VectorStore, VectorStoreCompatibilityError
@@ -41,21 +47,35 @@ class Server:
         route = path.split("?", 1)[0]
         parts = route.strip("/").split("/")
         if parts == ["collections"]:
-            return self.ok({"collections": [{"name": name} for name in self.collections]})
+            return self.ok(
+                {"collections": [{"name": name} for name in self.collections]}
+            )
         name = parts[1]
         if method == "PUT" and len(parts) == 2:
             assert self.gate.status()["collection"] == name
-            self.collections[name] = {"config": {"params": deepcopy(body)}, "payload_schema": {}, "points": {}}
+            self.collections[name] = {
+                "config": {"params": deepcopy(body)},
+                "payload_schema": {},
+                "points": {},
+            }
             return self.ok(True)
         if name not in self.collections:
             raise QdrantHTTPError("http_status", 404)
         collection = self.collections[name]
         if method == "GET" and len(parts) == 2:
-            return self.ok({key: deepcopy(value) for key, value in collection.items() if key != "points"})
+            return self.ok(
+                {
+                    key: deepcopy(value)
+                    for key, value in collection.items()
+                    if key != "points"
+                }
+            )
         if method == "PUT" and parts[2] == "index":
             assert "wait=true" in path
             assert self.gate.status()["collection"] == name
-            collection["payload_schema"][body["field_name"]] = {"data_type": body["field_schema"]}
+            collection["payload_schema"][body["field_name"]] = {
+                "data_type": body["field_schema"]
+            }
             return self.completed()
         points = collection["points"]
         if method == "PUT" and parts[2:] == ["points"]:
@@ -78,14 +98,25 @@ class Server:
             return self.ok({"count": len(points)})
         if parts[2:] == ["points"]:
             assert body["with_payload"] is True and body["with_vector"] is True
-            return self.ok([deepcopy(points[key]) for key in body["ids"] if key in points])
+            return self.ok(
+                [deepcopy(points[key]) for key in body["ids"] if key in points]
+            )
         if parts[2:] == ["points", "scroll"]:
             assert "filter" not in body
             assert body["with_payload"] is True and body["with_vector"] is True
-            keys = sorted(key for key in points if body.get("offset") is None or key >= body["offset"])
+            keys = sorted(
+                key
+                for key in points
+                if body.get("offset") is None or key >= body["offset"]
+            )
             size = min(body["limit"], self.page_size)
             page = [deepcopy(points[key]) for key in keys[:size]]
-            return self.ok({"points": page, "next_page_offset": keys[size] if len(keys) > size else None})
+            return self.ok(
+                {
+                    "points": page,
+                    "next_page_offset": keys[size] if len(keys) > size else None,
+                }
+            )
         if parts[2:] == ["points", "query"]:
             scopes = body["filter"]["must"][0]["match"]["any"]
             assert body["filter"]["must"][0]["key"] == "scope_id"
@@ -94,10 +125,12 @@ class Server:
             selected = []
             for point in points.values():
                 if point["payload"]["scope_id"] in scopes:
-                    score = sum(left * right for left, right in zip(point["vector"], vector)) / (norm or 1)
+                    score = sum(
+                        left * right for left, right in zip(point["vector"], vector)
+                    ) / (norm or 1)
                     selected.append(deepcopy(point) | {"score": score})
             selected.sort(key=lambda point: -point["score"])
-            return self.ok({"points": selected[:body["limit"]]})
+            return self.ok({"points": selected[: body["limit"]]})
         raise AssertionError((method, path, body))
 
     @staticmethod
@@ -110,17 +143,44 @@ class Server:
 
 @pytest.fixture
 def setup(tmp_path):
-    binding = InstanceBinding("agent", "install", tmp_path / "truth", frozenset({"scope"}), test_mode=True)
+    binding = InstanceBinding(
+        "agent", "install", tmp_path / "truth", frozenset({"scope"}), test_mode=True
+    )
     server = Server(binding.data_directory)
     config = QdrantConfig("http://qdrant:6333", timeout_seconds=4)
-    store = QdrantVectorStore(tmp_path / "vectors", table_name="memories", dimensions=2,
-                              config=config, binding=binding, embedding_space="space", transport=server)
+    store = QdrantVectorStore(
+        tmp_path / "vectors",
+        table_name="memories",
+        dimensions=2,
+        config=config,
+        binding=binding,
+        embedding_space="space",
+        transport=server,
+    )
     return store, server, binding, config
 
 
-def record(number=1, *, scope="scope", space="space", ref="event:one", agent="agent", installation="install"):
-    return LanceVectorRecord("event", ref, number, f"{ref}@{number}:{space}", space, (3.0, 4.0),
-                             scope, agent, installation, updated_at="2026-09-25T00:00:00Z")
+def record(
+    number=1,
+    *,
+    scope="scope",
+    space="space",
+    ref="event:one",
+    agent="agent",
+    installation="install",
+):
+    return LanceVectorRecord(
+        "event",
+        ref,
+        number,
+        f"{ref}@{number}:{space}",
+        space,
+        (3.0, 4.0),
+        scope,
+        agent,
+        installation,
+        updated_at="2026-09-25T00:00:00Z",
+    )
 
 
 def row(number=1, **kwargs):
@@ -128,12 +188,21 @@ def row(number=1, **kwargs):
 
 
 def purge(store, *, space="space", ref="event:one", seconds=4):
-    return LancePurgePort(store, embedding_spaces=[space], agent_id="agent", installation_id="install").purge_active(
-        "operation", receipt={"physical_members": [{"kind": "event", "ref": ref}], "scope_ids": ["scope"]},
-        remaining_seconds=seconds)
+    return LancePurgePort(
+        store, embedding_spaces=[space], agent_id="agent", installation_id="install"
+    ).purge_active(
+        "operation",
+        receipt={
+            "physical_members": [{"kind": "event", "ref": ref}],
+            "scope_ids": ["scope"],
+        },
+        remaining_seconds=seconds,
+    )
 
 
-def test_construction_is_io_free_and_identity_is_deterministic(setup, monkeypatch, tmp_path):
+def test_construction_is_io_free_and_identity_is_deterministic(
+    setup, monkeypatch, tmp_path
+):
     store, server, binding, config = setup
     assert isinstance(store, VectorStore)
     assert server.calls == [] and not binding.data_directory.exists()
@@ -144,16 +213,39 @@ def test_construction_is_io_free_and_identity_is_deterministic(setup, monkeypatc
         raise AssertionError("constructor performed filesystem IO")
 
     monkeypatch.setattr(type(tmp_path), "resolve", forbidden)
-    other = QdrantVectorStore(tmp_path / "elsewhere", table_name="memories", dimensions=2,
-                              config=config, binding=binding, embedding_space="space", transport=server)
+    other = QdrantVectorStore(
+        tmp_path / "elsewhere",
+        table_name="memories",
+        dimensions=2,
+        config=config,
+        binding=binding,
+        embedding_space="space",
+        transport=server,
+    )
     assert other.collection_name == store.collection_name
     assert store.collection_name.startswith(config.collection_prefix + "-")
-    for kwargs in ({"dimensions": 3}, {"table_name": "other"}, {"embedding_space": "next"},
-                   {"binding": replace(binding, installation_id="other")},
-                   {"binding": replace(binding, agent_id="other")}):
-        values = dict(table_name="memories", dimensions=2, config=config, binding=binding,
-                      embedding_space="space", transport=server) | kwargs
-        assert QdrantVectorStore(tmp_path, **values).collection_name != store.collection_name
+    for kwargs in (
+        {"dimensions": 3},
+        {"table_name": "other"},
+        {"embedding_space": "next"},
+        {"binding": replace(binding, installation_id="other")},
+        {"binding": replace(binding, agent_id="other")},
+    ):
+        values = (
+            dict(
+                table_name="memories",
+                dimensions=2,
+                config=config,
+                binding=binding,
+                embedding_space="space",
+                transport=server,
+            )
+            | kwargs
+        )
+        assert (
+            QdrantVectorStore(tmp_path, **values).collection_name
+            != store.collection_name
+        )
 
 
 def test_open_existing_only_reads_and_shape_mismatch_is_preserved(setup):
@@ -170,7 +262,10 @@ def test_open_existing_only_reads_and_shape_mismatch_is_preserved(setup):
     server.collections[store.collection_name]["config"]["params"]["vectors"]["size"] = 3
     with pytest.raises(VectorStoreCompatibilityError):
         store.open_existing()
-    assert server.collections[store.collection_name]["config"]["params"]["vectors"]["size"] == 3
+    assert (
+        server.collections[store.collection_name]["config"]["params"]["vectors"]["size"]
+        == 3
+    )
 
 
 def test_roundtrip_search_pagination_count_delete(setup):
@@ -182,17 +277,29 @@ def test_roundtrip_search_pagination_count_delete(setup):
     assert store.list_records() == {value["id"]: value for value in rows}
     assert store.list_ids() == sorted(value["id"] for value in rows)
     assert store.count_rows() == 6
-    assert store.audit_counts() == {"physical_rows": 6, "unique_ids": 6, "duplicate_rows": 0, "duplicate_ids": 0}
+    assert store.audit_counts() == {
+        "physical_rows": 6,
+        "unique_ids": 6,
+        "duplicate_rows": 0,
+        "duplicate_ids": 0,
+    }
     assert store.contains_id(rows[0]["id"]) and not store.contains_id("absent")
     for key, point in server.collections[store.collection_name]["points"].items():
         assert str(UUID(key)) == key
         assert set(point["payload"]) == set(rows[0])
     server.calls.clear()
-    hits = store.search_scopes([3.0, 4.0], scope_ids=[rows[0]["scope_id"], "unused", rows[0]["scope_id"]], limit=3)
+    hits = store.search_scopes(
+        [3.0, 4.0],
+        scope_ids=[rows[0]["scope_id"], "unused", rows[0]["scope_id"]],
+        limit=3,
+    )
     assert len(hits) == 3 and all(hit["_distance"] == pytest.approx(0) for hit in hits)
     queries = [call for call in server.calls if "/query" in call[1]]
     assert len(queries) == 1
-    assert queries[0][2]["filter"]["must"][0]["match"]["any"] == [rows[0]["scope_id"], "unused"]
+    assert queries[0][2]["filter"]["must"][0]["match"]["any"] == [
+        rows[0]["scope_id"],
+        "unused",
+    ]
     assert store.search_scopes([3.0, 4.0], scope_ids=[], limit=3) == []
     assert store.delete([rows[0]["id"], rows[0]["id"], "absent"]) == 1
     assert store.count_rows() == 5 and not store.contains_id(rows[0]["id"])
@@ -212,7 +319,11 @@ def test_fenced_adapter_checks_one_guard_and_purges_all_revisions(setup):
         return True
 
     writer = LanceIndexWriter(store)
-    assert writer.upsert_fenced_many([record(1), record(2), record(3, ref="event:keep")], guard=guard, remaining_seconds=4)
+    assert writer.upsert_fenced_many(
+        [record(1), record(2), record(3, ref="event:keep")],
+        guard=guard,
+        remaining_seconds=4,
+    )
     assert guards == [True]
     assert purge(store)
     assert store.list_ids() == [record(3, ref="event:keep").vector_id]
@@ -224,9 +335,15 @@ def test_guard_rejection_and_bad_batch_never_mark(setup):
     store, server, _, _ = setup
     store.open()
     calls = len(server.calls)
-    assert not store.fenced_upsert_records([row()], guard=lambda: False, remaining_seconds=4)
+    assert not store.fenced_upsert_records(
+        [row()], guard=lambda: False, remaining_seconds=4
+    )
     assert len(server.calls) == calls and server.gate.status() is None
-    for bad in (row(2) | {"vector": [math.nan, 1]}, row(2) | {"vector": [1]}, row(2) | {"id": ""}):
+    for bad in (
+        row(2) | {"vector": [math.nan, 1]},
+        row(2) | {"vector": [1]},
+        row(2) | {"id": ""},
+    ):
         with pytest.raises((ValueError, TypeError)):
             store.upsert_records([row(), bad])
         assert server.gate.status() is None and len(server.calls) == calls
@@ -235,7 +352,9 @@ def test_guard_rejection_and_bad_batch_never_mark(setup):
     assert server.gate.status() is None
 
 
-@pytest.mark.parametrize("failure", ["acknowledged", "wait_timeout", "timeout", "http_status", "readback"])
+@pytest.mark.parametrize(
+    "failure", ["acknowledged", "wait_timeout", "timeout", "http_status", "readback"]
+)
 def test_uncertain_write_blocks_fresh_store_and_empty_purge(setup, failure):
     store, server, binding, config = setup
     store.open()
@@ -243,10 +362,16 @@ def test_uncertain_write_blocks_fresh_store_and_empty_purge(setup, failure):
     def hook(method, path, body):
         if method == "PUT" and "/points" in path:
             if failure in {"timeout", "http_status"}:
-                raise QdrantHTTPError(failure, 503 if failure == "http_status" else None)
+                raise QdrantHTTPError(
+                    failure, 503 if failure == "http_status" else None
+                )
             if failure != "readback":
                 return server.ok({"operation_id": 1, "status": failure})
-        if failure == "readback" and method == "POST" and path.split("?")[0].endswith("/points"):
+        if (
+            failure == "readback"
+            and method == "POST"
+            and path.split("?")[0].endswith("/points")
+        ):
             return server.ok([])
         return None
 
@@ -256,8 +381,15 @@ def test_uncertain_write_blocks_fresh_store_and_empty_purge(setup, failure):
     pending = server.gate.status()
     assert pending is not None
     server.hook = None
-    other = QdrantVectorStore(store.db_path, table_name="memories", dimensions=2, config=config,
-                              binding=binding, embedding_space="space", transport=server)
+    other = QdrantVectorStore(
+        store.db_path,
+        table_name="memories",
+        dimensions=2,
+        config=config,
+        binding=binding,
+        embedding_space="space",
+        transport=server,
+    )
     other.open_existing()
     with pytest.raises(ContractError):
         other.upsert_records([row(2)])
@@ -265,7 +397,9 @@ def test_uncertain_write_blocks_fresh_store_and_empty_purge(setup, failure):
     assert server.gate.status() == pending
 
 
-@pytest.mark.parametrize("damage", ["payload", "identity", "duplicate", "cursor", "missing_cursor", "vector"])
+@pytest.mark.parametrize(
+    "damage", ["payload", "identity", "duplicate", "cursor", "missing_cursor", "vector"]
+)
 def test_corrupt_inventory_fails_closed(setup, damage):
     store, server, _, _ = setup
     store.open()
@@ -281,7 +415,10 @@ def test_corrupt_inventory_fails_closed(setup, damage):
 
     def hook(method, path, body):
         if "/scroll" in path:
-            result = {"points": [point, point] if damage == "duplicate" else [point], "next_page_offset": None}
+            result = {
+                "points": [point, point] if damage == "duplicate" else [point],
+                "next_page_offset": None,
+            }
             if damage == "cursor":
                 result["next_page_offset"] = "not-a-uuid"
             if damage == "missing_cursor":
@@ -371,7 +508,12 @@ def test_every_mutation_requires_completion_and_readback(setup, operation):
         store.upsert_records([row()])
 
     def hook(method, path, body):
-        if operation == "create" and method == "PUT" and "/points" not in path and "/index" not in path:
+        if (
+            operation == "create"
+            and method == "PUT"
+            and "/points" not in path
+            and "/index" not in path
+        ):
             return server.ok(True)  # Lying success: collection never appeared.
         if operation == "index" and method == "PUT" and "/index" in path:
             return server.completed()  # Lying success: keyword index never appeared.
@@ -396,11 +538,15 @@ def test_existing_incompatible_collection_is_never_replaced(setup, damage):
     if damage == "metric":
         collection["config"]["params"]["vectors"]["distance"] = "Dot"
     elif damage == "named":
-        collection["config"]["params"]["vectors"] = {"other": {"size": 2, "distance": "Cosine"}}
+        collection["config"]["params"]["vectors"] = {
+            "other": {"size": 2, "distance": "Cosine"}
+        }
     elif damage == "index":
         collection["payload_schema"]["scope_id"]["data_type"] = "integer"
     else:
-        server.hook = lambda method, path, body: server.ok({"collections": []}) if path == "/collections" else None
+        server.hook = lambda method, path, body: (
+            server.ok({"collections": []}) if path == "/collections" else None
+        )
     server.calls.clear()
     with pytest.raises(VectorStoreCompatibilityError):
         store.open_existing()
@@ -414,7 +560,9 @@ def test_invalid_fence_budget_is_rejected_without_marker(setup, seconds):
     store.open()
     server.calls.clear()
     with pytest.raises(ValueError):
-        store.fenced_upsert_records([row()], guard=lambda: True, remaining_seconds=seconds)
+        store.fenced_upsert_records(
+            [row()], guard=lambda: True, remaining_seconds=seconds
+        )
     assert not server.calls and server.gate.status() is None
 
 
@@ -424,13 +572,17 @@ def test_explicit_fence_budget_is_independent_and_capped(setup):
     server.calls.clear()
     started = time.monotonic()
     with using_request_deadline(RequestDeadline.from_budget(-1)):
-        assert store.fenced_upsert_records([row()], guard=lambda: True, remaining_seconds=90)
+        assert store.fenced_upsert_records(
+            [row()], guard=lambda: True, remaining_seconds=90
+        )
     assert all(started + 44 < call[3] <= time.monotonic() + 45 for call in server.calls)
     assert purge(store, seconds=90)
 
 
 @pytest.mark.parametrize("fail_second", [False, True])
-def test_split_batch_uses_one_guard_and_one_pending_receipt(setup, monkeypatch, fail_second):
+def test_split_batch_uses_one_guard_and_one_pending_receipt(
+    setup, monkeypatch, fail_second
+):
     from scope_recall.vector import qdrant_store as module
 
     monkeypatch.setattr(module, "_BATCH_SIZE", 2)
@@ -452,12 +604,16 @@ def test_split_batch_uses_one_guard_and_one_pending_receipt(setup, monkeypatch, 
     server.hook = hook
     if fail_second:
         with pytest.raises(QdrantHTTPError):
-            store.fenced_upsert_records([row(index) for index in range(1, 6)], guard=guard, remaining_seconds=4)
+            store.fenced_upsert_records(
+                [row(index) for index in range(1, 6)], guard=guard, remaining_seconds=4
+            )
         assert server.gate.status()["operation_id"] == markers[0]
         assert store.count_rows() == 2
         assert not purge(store)
     else:
-        assert store.fenced_upsert_records([row(index) for index in range(1, 6)], guard=guard, remaining_seconds=4)
+        assert store.fenced_upsert_records(
+            [row(index) for index in range(1, 6)], guard=guard, remaining_seconds=4
+        )
         assert len(markers) == 3 and store.count_rows() == 5
         assert server.gate.status() is None
         store.upsert_records([row(index) for index in range(1, 6)])
@@ -468,8 +624,15 @@ def test_split_batch_uses_one_guard_and_one_pending_receipt(setup, monkeypatch, 
 def test_shared_gate_blocks_other_embedding_space_but_store_purge_is_local(setup):
     store, server, binding, config = setup
     store.open()
-    other = QdrantVectorStore(store.db_path / "another", table_name="memories", dimensions=2, config=config,
-                              binding=binding, embedding_space="next", transport=server)
+    other = QdrantVectorStore(
+        store.db_path / "another",
+        table_name="memories",
+        dimensions=2,
+        config=config,
+        binding=binding,
+        embedding_space="next",
+        transport=server,
+    )
     other.open()
     store.upsert_records([row()])
     other.upsert_records([row(space="next")])
@@ -490,12 +653,17 @@ def test_shared_gate_blocks_other_embedding_space_but_store_purge_is_local(setup
     assert other.count_rows() == 1
 
 
-@pytest.mark.parametrize("failure", ["short_page", "cursor_loop", "bad_count", "bad_envelope"])
+@pytest.mark.parametrize(
+    "failure", ["short_page", "cursor_loop", "bad_count", "bad_envelope"]
+)
 def test_truncated_or_malformed_read_cannot_claim_complete_inventory(setup, failure):
     store, server, _, _ = setup
     store.open()
     store.upsert_records([row(index) for index in range(1, 6)])
-    points = sorted(server.collections[store.collection_name]["points"].values(), key=lambda point: point["id"])
+    points = sorted(
+        server.collections[store.collection_name]["points"].values(),
+        key=lambda point: point["id"],
+    )
 
     def hook(method, path, body):
         if failure == "bad_count" and "/count" in path:
@@ -506,7 +674,9 @@ def test_truncated_or_malformed_read_cannot_claim_complete_inventory(setup, fail
             if failure == "short_page":
                 return server.ok({"points": points[:1], "next_page_offset": None})
             if failure == "cursor_loop":
-                return server.ok({"points": points[:1], "next_page_offset": points[0]["id"]})
+                return server.ok(
+                    {"points": points[:1], "next_page_offset": points[0]["id"]}
+                )
         return None
 
     server.hook = hook
@@ -533,7 +703,9 @@ def test_bad_guard_and_oversized_input_never_poison_gate(setup):
     assert not server.calls and server.gate.status() is None
 
 
-@pytest.mark.parametrize("vector", [[0.0, 0.0], [1e-30, 1e-30], [1e30, 1e30], [-3.0, 4.0]])
+@pytest.mark.parametrize(
+    "vector", [[0.0, 0.0], [1e-30, 1e-30], [1e30, 1e30], [-3.0, 4.0]]
+)
 def test_original_vector_roundtrip_and_float32_safe_direction(setup, vector):
     store, server, _, _ = setup
     store.open()
@@ -584,9 +756,15 @@ def test_purge_partition_mismatch_and_untrusted_identity_fail_closed(setup):
     store.upsert_records([row() | {"scope_id": "wrong-physical-partition"}])
     assert not purge(store) and store.count_rows() == 1
     with pytest.raises(ValueError):
-        store.purge_governed_members(members=[{"kind": "event", "ref": "event:one"}],
-                                     agent_id="other", installation_id="install", partitions=[{}],
-                                     project_id=None, branch_id=None, remaining_seconds=4)
+        store.purge_governed_members(
+            members=[{"kind": "event", "ref": "event:one"}],
+            agent_id="other",
+            installation_id="install",
+            partitions=[{}],
+            project_id=None,
+            branch_id=None,
+            remaining_seconds=4,
+        )
     assert server.gate.status() is None
 
 
@@ -595,7 +773,9 @@ def test_search_rejects_out_of_partition_results(setup):
     store.open()
     store.upsert_records([row(scope="private")])
     point = next(iter(server.collections[store.collection_name]["points"].values()))
-    server.hook = lambda method, path, body: server.ok({"points": [point | {"score": 1}]}) if "/query" in path else None
+    server.hook = lambda method, path, body: (
+        server.ok({"points": [point | {"score": 1}]}) if "/query" in path else None
+    )
     with pytest.raises(ContractError):
         store.search([3, 4], scope_id=row()["scope_id"], limit=1)
 

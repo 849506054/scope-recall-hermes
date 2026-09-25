@@ -408,3 +408,42 @@ def test_changed_marker_is_not_deleted_on_ack(tmp_path):
             tx.complete()
     assert_uncertain(error)
     assert gate.pending_path.exists()
+
+
+def test_clear_interruption_restores_pending(tmp_path, monkeypatch):
+    """An interruption after the unlink must leave the pending state durable again."""
+    gate = mutation.QdrantMutationGate(tmp_path)
+    real = mutation.QdrantMutationGate._sync_directory
+    calls = []
+
+    def flaky(self):
+        calls.append(1)
+        if len(calls) > 1:
+            raise RuntimeError("interrupted after unlink")
+        return real(self)
+
+    monkeypatch.setattr(mutation.QdrantMutationGate, "_sync_directory", flaky)
+    with pytest.raises(RuntimeError):
+        with gate.mutation("upsert", COLLECTION, future()) as tx:
+            tx.complete()
+    monkeypatch.setattr(mutation.QdrantMutationGate, "_sync_directory", real)
+    assert gate.status() is not None
+    with pytest.raises(ContractError) as error:
+        with gate.locked(future()):
+            pass
+    assert_uncertain(error)
+
+
+def test_a_completed_mutation_is_not_reported_as_a_timeout(tmp_path, monkeypatch):
+    """A committed, acknowledged write is decided; no later budget check reopens it."""
+    gate = mutation.QdrantMutationGate(tmp_path)
+    real = mutation.QdrantMutationGate._clear
+
+    def clear_then_expire(self, marker, deadline):
+        real(self, marker, deadline)
+        monkeypatch.setattr(mutation, "time", __import__("types").SimpleNamespace(monotonic=lambda: deadline + 60))
+
+    monkeypatch.setattr(mutation.QdrantMutationGate, "_clear", clear_then_expire)
+    with gate.mutation("upsert", COLLECTION, future()) as tx:
+        tx.complete()
+    assert gate.status() is None

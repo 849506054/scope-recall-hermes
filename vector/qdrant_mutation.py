@@ -186,9 +186,10 @@ class QdrantMutationGate:
         try:
             self._sync_directory()
             _remaining(deadline)
-        except (OSError, TimeoutError):
-            # A failed/late durable removal must remain fail-closed, even though
-            # the server completed. Restoration has safety priority over budget.
+        except BaseException:
+            # Any interruption after the unlink must leave the pending state
+            # durable again: an unacknowledged removal is never assumed gone.
+            # Restoration has safety priority over the caller's budget.
             self._persist(marker)
             raise
 
@@ -202,7 +203,14 @@ class QdrantMutationGate:
         monotonic deadline. Unacknowledged clean exits raise ContractError.
         """
         _metadata(operation, collection)
-        with self.locked(deadline):
+        # The lock is taken here rather than through ``locked()``: once the caller
+        # has acknowledged a completed request the mutation is decided, and no
+        # trailing budget check may then report it as a timeout.  The advisory
+        # lock is re-entrant, so an enclosing ``locked()`` shares this same lock.
+        remaining = _remaining(deadline)
+        with advisory_file_lock(self.lock_path, timeout_seconds=remaining):
+            _remaining(deadline)
+            self._check_clear()
             if guard is not None and not guard():
                 raise LeaseFenceRejected("qdrant mutation lease fence rejected")
             _remaining(deadline)
