@@ -2,9 +2,9 @@
 
 Scope Recall v3 is a bounded local memory core with SQLite as the authority and rebuildable vector companions. It provides host adapters for Hermes and Codex, including Codex MCP tools when the optional `codex` extra is installed. The public package is `hermes-scope-recall`; the Python import is `scope_recall`; the host wrapper identity remains `scope-recall`.
 
-This is `3.2.6`: `3.2.0` plus the remote vector companion with its Qdrant backend, the
+This is `3.2.7`: `3.2.0` plus the remote vector companion with its Qdrant backend, the
 single rule that decides a remote origin, and install support for Python 3.13. The notes
-are the `[3.2.6]` section of [CHANGELOG.md](CHANGELOG.md). Several Hermes agents
+are the `[3.2.7]` section of [CHANGELOG.md](CHANGELOG.md). Several Hermes agents
 can keep one memory: each attaches to a shared
 store as an entry, what the owner tells one of them another can recall, and each memory says
 which agent it came in through ([docs/shared-store.md](docs/shared-store.md)). An agent that
@@ -58,7 +58,7 @@ python -m pip install hermes-scope-recall==3.2.0
 python -m pip install "hermes-scope-recall[codex]==3.2.0"
 ```
 
-This fork's `3.2.6` build is installed from a wheel file built out of this branch
+This fork's `3.2.7` build is installed from a wheel file built out of this branch
 (`python -m pip install <path-to-wheel>`); the PyPI package and the release below carry
 upstream's `3.2.0`.
 

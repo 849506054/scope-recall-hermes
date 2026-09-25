@@ -6,6 +6,7 @@ sides afterwards.  These cases use the real SQLite companion as the source and
 the in-memory Qdrant double as the destination.
 """
 import json
+import time
 
 import pytest
 
@@ -177,3 +178,32 @@ def test_a_backend_that_cannot_be_read_by_ids_is_refused(tmp_path):
 
     with pytest.raises(ValueError, match="cannot be read by ids"):
         vector_migration.plan(Opaque(), _target(tmp_path)[0])
+
+
+def test_clear_pending_remote_clears_only_on_a_declared_boundary(tmp_path, monkeypatch):
+    """The command refuses until the collection is named and the work declared redone."""
+    import argparse
+
+    from scope_recall.maintenance import cli
+
+    target, _server = _target(tmp_path)
+    target.open()
+    target.upsert_records([_row(1)])
+    gate = target.mutation_gate
+    with pytest.raises(RuntimeError):
+        with gate.mutation("upsert", "scope-recall-test", time.monotonic() + 5):
+            raise RuntimeError
+    marker = gate.status()
+    assert marker is not None
+    monkeypatch.setattr(cli, "_migration_stores", lambda args: (None, target, tmp_path))
+    args = argparse.Namespace(qdrant_url="http://qdrant:6333", qdrant_api_key_env="TEST_KEY",
+                              qdrant_collection_prefix="scope-recall", confirm="not-the-collection",
+                              after_recopied=False, seconds=5.0)
+    assert cli._clear_pending_remote(args) == 1          # the collection is not named
+    args.confirm = marker["collection"]
+    assert cli._clear_pending_remote(args) == 1          # holds points, work not declared redone
+    assert gate.status() == marker
+    args.after_recopied = True
+    assert cli._clear_pending_remote(args) == 0
+    assert gate.status() is None
+    assert cli._clear_pending_remote(args) == 0          # nothing left to clear

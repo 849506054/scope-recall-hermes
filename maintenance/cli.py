@@ -340,6 +340,62 @@ def _run_vector_migration(args: argparse.Namespace) -> int:
     return 0 if receipt["verify"]["ok"] else 1
 
 
+def _add_clear_pending_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--host", required=True, choices=("hermes", "codex"))
+    parser.add_argument("--instance-root", required=True)
+    parser.add_argument("--qdrant-url", required=True)
+    parser.add_argument("--qdrant-api-key-env", default="SCOPE_RECALL_QDRANT_API_KEY")
+    parser.add_argument("--qdrant-collection-prefix", default="scope-recall")
+    parser.add_argument("--confirm", required=True,
+                        help="the pending collection's name, exactly as the status reports it")
+    parser.add_argument("--after-recopied", action="store_true",
+                        help="state that the interrupted work was redone; required when the collection holds points")
+    parser.add_argument("--seconds", type=float, default=45.0)
+
+
+def _clear_pending_remote(args: argparse.Namespace) -> int:
+    """Clear one pending remote mutation, on a boundary the caller has read back.
+
+    The gate is fail-closed on purpose: an unconfirmed write blocks later
+    mutations and purge confirmation.  Only the server decides.  An absent or
+    empty collection cannot hold the interrupted write, so the marker is stale
+    and may go; a collection that holds points could equally have taken it, so
+    the caller has to declare that the work was redone.
+    """
+    import time
+
+    from ..vector import VectorStoreCompatibilityError
+
+    source, target, _ = _migration_stores(args)
+    del source
+    gate = target.mutation_gate
+    marker = gate.status()
+    if marker is None:
+        _emit({"backend": getattr(target, "backend", "?"), "status": "nothing_to_clear"})
+        return 0
+    pending = {"collection": marker["collection"], "operation": marker["operation"],
+               "operation_id": marker["operation_id"]}
+    if args.confirm != marker["collection"]:
+        _emit({"pending": pending, "reason": "confirm_does_not_name_the_pending_collection",
+               "status": "refused"})
+        return 1
+    points = None
+    try:
+        target.open_existing()
+        points = target.count_rows()
+    except VectorStoreCompatibilityError:
+        points = None  # absent: nothing can have landed
+    if points and not args.after_recopied:
+        _emit({"pending": pending, "points_count": points,
+               "reason": "collection_holds_points_and_the_work_was_not_declared_redone",
+               "status": "refused"})
+        return 1
+    gate.release(marker, deadline=time.monotonic() + float(args.seconds))
+    _emit({"after_recopied": bool(args.after_recopied), "pending": pending, "points_count": points,
+           "status": "cleared"})
+    return 0
+
+
 def _add_install_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--host", required=True, choices=("hermes", "codex"))
     parser.add_argument("--target-plugin-dir", required=True)
@@ -628,6 +684,7 @@ _COMMANDS: tuple[tuple[str, str | None, Callable[[argparse.ArgumentParser], None
     ("recover-remote", "inspect recovery from a Qdrant snapshot; --apply replaces the collection", _add_recover_remote_arguments, _recover_remote),
     ("plan-vector-migration", "report what a companion copy would move into another backend", _add_vector_migration_arguments, _plan_vector_migration),
     ("run-vector-migration", "copy companion rows into another backend, resuming from the recorded id, then verify", _add_vector_migration_arguments, _run_vector_migration),
+    ("clear-pending-remote", "clear one pending remote mutation after a maintenance read-back", _add_clear_pending_arguments, _clear_pending_remote),
     ("rollback", "inspect rollback; --apply may stop writes when new data must be reconciled", _add_rollback_arguments, _rollback),
     ("plan-install", None, _add_install_arguments, _plan_install),
     ("apply-install", None, _add_install_arguments, _apply_install),

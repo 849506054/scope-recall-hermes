@@ -193,6 +193,20 @@ class QdrantMutationGate:
             self._persist(marker)
             raise
 
+    def release(self, marker: dict, *, deadline: float) -> None:
+        """Clear one pending marker the caller has established the boundary for.
+
+        The judgement belongs to the caller: it names the collection, reads the
+        server back and states whether the interrupted work was redone.  This
+        only performs the clear, and it does so under the same advisory lock a
+        writer takes -- a write that started between the caller's read-back and
+        this call replaces the marker, and the identity check inside ``_clear``
+        then refuses rather than clearing an operation nobody looked at.
+        """
+        with advisory_file_lock(self.lock_path, timeout_seconds=_remaining(deadline)):
+            _remaining(deadline)
+            self._clear(marker, deadline)
+
     @contextmanager
     def mutation(self, operation: str, collection: str, deadline: float,
                  guard: Callable[[], bool] | None = None) -> Iterator[MutationReceipt]:

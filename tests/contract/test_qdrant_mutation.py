@@ -447,3 +447,34 @@ def test_a_completed_mutation_is_not_reported_as_a_timeout(tmp_path, monkeypatch
     with gate.mutation("upsert", COLLECTION, future()) as tx:
         tx.complete()
     assert gate.status() is None
+
+
+def test_release_clears_a_marker_the_caller_read_back(tmp_path):
+    """The recovery path: an operator who established the boundary clears it."""
+    gate = mutation.QdrantMutationGate(tmp_path / "gate")
+    with pytest.raises(ZeroDivisionError):
+        with gate.mutation("upsert", COLLECTION, future()):
+            raise ZeroDivisionError
+    marker = gate.status()
+    assert marker is not None and marker["operation"] == "upsert"
+    gate.release(marker, deadline=future())
+    assert gate.status() is None
+    with gate.locked(future()):  # a released gate takes writes again
+        pass
+
+
+def test_release_refuses_a_marker_that_changed_after_the_read_back(tmp_path):
+    """A writer that got in between replaces the marker; the clear must refuse."""
+    gate = mutation.QdrantMutationGate(tmp_path / "gate")
+    with pytest.raises(ZeroDivisionError):
+        with gate.mutation("upsert", COLLECTION, future()):
+            raise ZeroDivisionError
+    stale = gate.status()
+    gate.release(stale, deadline=future())
+    with pytest.raises(ZeroDivisionError):
+        with gate.mutation("upsert", COLLECTION, future()):
+            raise ZeroDivisionError
+    with pytest.raises(ContractError) as error:
+        gate.release(stale, deadline=future())
+    assert_uncertain(error)
+    assert gate.status() is not None

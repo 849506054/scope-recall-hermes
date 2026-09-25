@@ -2,6 +2,18 @@
 
 All notable changes to `scope-recall` will be documented in this file.
 
+## [3.2.7] - 2026-09-25
+
+- **A pending remote mutation has a way out that is not a hand-edited file.**
+  The gate is fail-closed: an unconfirmed write blocks later mutations and purge
+  confirmation until someone clears the marker, and until now the only way was to
+  remove the file by hand. `clear-pending-remote` does it on evidence instead: the
+  collection has to be named, the server read back, and — when the collection
+  holds points, where an interrupted upsert cannot be read back as absent — the
+  operator has to declare the work redone. The clear runs under the same advisory
+  lock a writer takes, so a write that got in between replaces the marker and the
+  identity check refuses.
+
 ## [3.2.6] - 2026-09-25
 
 - **The semantic channel is collected alongside the local ones, not after them.**
