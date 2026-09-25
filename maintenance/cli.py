@@ -273,6 +273,72 @@ def _recover_remote(args: argparse.Namespace) -> int:
     return 0
 
 
+def _add_vector_migration_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--host", required=True, choices=("hermes", "codex"))
+    parser.add_argument("--instance-root", required=True)
+    parser.add_argument("--qdrant-url", required=True)
+    parser.add_argument("--qdrant-api-key-env", default="SCOPE_RECALL_QDRANT_API_KEY")
+    parser.add_argument("--qdrant-collection-prefix", default="scope-recall")
+    parser.add_argument("--state", help="progress file; defaults beside the companion")
+    parser.add_argument("--batch-size", type=int)
+    parser.add_argument("--seconds", type=float)
+
+
+def _migration_stores(args: argparse.Namespace):
+    """The instance's companion and the collection the same identity derives."""
+    from dataclasses import replace
+    from ..runtime.instance import RuntimeInstanceConfig, default_vector_factory
+    from ..vector.qdrant_config import QdrantConfig
+    from .doctor import _load_binding
+
+    binding, data_directory = _load_binding(args.host, _path(args.instance_root, "instance_root"))
+    raw = json.loads((data_directory / "runtime-config.json").read_text(encoding="utf-8"))
+    config = RuntimeInstanceConfig.from_mapping(raw)
+    if config.vector is None:
+        raise BackupError("this instance has no vector companion configured")
+    source = default_vector_factory(config.vector, binding=binding, embedding_space=config.embedding_space_id())
+    qdrant = QdrantConfig(args.qdrant_url, api_key_env=args.qdrant_api_key_env,
+                          collection_prefix=args.qdrant_collection_prefix)
+    target_vector = replace(config.vector, backend="qdrant", qdrant=qdrant)
+    target = default_vector_factory(target_vector, binding=binding, embedding_space=config.embedding_space_id())
+    return source, target, data_directory
+
+
+def _plan_vector_migration(args: argparse.Namespace) -> int:
+    from ..vector import VectorStoreCompatibilityError
+    from . import vector_migration
+
+    source, target, _ = _migration_stores(args)
+    source.open_existing()
+    try:
+        target.open_existing()
+    except VectorStoreCompatibilityError:
+        _emit({"source": getattr(source, "backend", "?"), "target": "qdrant",
+               "status": "target_missing", "detail": "collection_absent"})
+        return 1
+    _emit(vector_migration.plan(source, target))
+    return 0
+
+
+def _run_vector_migration(args: argparse.Namespace) -> int:
+    from . import vector_migration
+
+    source, target, data_directory = _migration_stores(args)
+    source.open_existing()
+    target.open()  # the copy's destination: created here, inside the gate
+    options: dict[str, Any] = {
+        "state_path": _optional_path(args.state, "state") or data_directory / "vector-migration-state.json"
+    }
+    if args.batch_size is not None:
+        options["batch_size"] = args.batch_size
+    if args.seconds is not None:
+        options["seconds"] = args.seconds
+    receipt = vector_migration.run(source, target, **options)
+    receipt["verify"] = vector_migration.verify(source, target)
+    _emit(receipt)
+    return 0 if receipt["verify"]["ok"] else 1
+
+
 def _add_install_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--host", required=True, choices=("hermes", "codex"))
     parser.add_argument("--target-plugin-dir", required=True)
@@ -559,6 +625,8 @@ _COMMANDS: tuple[tuple[str, str | None, Callable[[argparse.ArgumentParser], None
     ("backup", "create a new consistent SQLite snapshot and manifest", _add_backup_arguments, _backup),
     ("snapshot-remote", "take one server-side Qdrant snapshot inside the write boundary", _add_snapshot_remote_arguments, _snapshot_remote),
     ("recover-remote", "inspect recovery from a Qdrant snapshot; --apply replaces the collection", _add_recover_remote_arguments, _recover_remote),
+    ("plan-vector-migration", "report what a companion copy would move into another backend", _add_vector_migration_arguments, _plan_vector_migration),
+    ("run-vector-migration", "copy companion rows into another backend, resuming from the recorded id, then verify", _add_vector_migration_arguments, _run_vector_migration),
     ("rollback", "inspect rollback; --apply may stop writes when new data must be reconciled", _add_rollback_arguments, _rollback),
     ("plan-install", None, _add_install_arguments, _plan_install),
     ("apply-install", None, _add_install_arguments, _apply_install),

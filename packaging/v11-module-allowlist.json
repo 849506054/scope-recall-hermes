@@ -161,6 +161,7 @@
     "maintenance/shared_import.py",
     "maintenance/upgrade.py",
     "maintenance/upgrade_cli.py",
+    "maintenance/vector_migration.py",
     "runtime/__init__.py",
     "runtime/_http_worker.py",
     "runtime/_worker_bootstrap.py",

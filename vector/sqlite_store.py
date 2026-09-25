@@ -18,6 +18,9 @@ from typing import Any, Callable, Iterable
 from . import VectorStore, VectorStoreCompatibilityError
 
 _ROW_COLUMNS = "id, scope_id, source, target, content, summary, updated_at, vector_json"
+#: Ids per statement: SQLite's parameter limit is far higher, and a page this
+#: size keeps a migration read bounded without a long IN list.
+_ID_BATCH = 256
 
 
 class SQLiteBruteForceVectorStore(VectorStore):
@@ -359,6 +362,18 @@ class SQLiteBruteForceVectorStore(VectorStore):
         with self._lock:
             rows = self._require_conn().execute("SELECT id FROM vector_records ORDER BY id").fetchall()
         return [str(row["id"]) for row in rows]
+
+    def read_records(self, ids: Iterable[str]) -> dict[str, dict[str, Any]]:
+        """The rows for these ids, one bounded query per batch; unknown ids are absent."""
+        wanted = [str(item) for item in ids]
+        output: dict[str, dict[str, Any]] = {}
+        for offset in range(0, len(wanted), _ID_BATCH):
+            batch = wanted[offset:offset + _ID_BATCH]
+            placeholders = ",".join("?" for _ in batch)
+            for row in self._rows(f"id IN ({placeholders})", tuple(batch)):
+                record = self._row_to_record(row)
+                output[record["id"]] = record
+        return output
 
     def list_records(self) -> dict[str, dict[str, Any]]:
         return {str(record["id"]): record for record in map(self._row_to_record, self._rows())}

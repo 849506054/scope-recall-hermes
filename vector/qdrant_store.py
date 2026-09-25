@@ -742,6 +742,14 @@ class QdrantVectorStore(VectorStore):
     def list_ids(self) -> list[str]:
         return sorted(self.list_records())
 
+    def read_records(self, ids: Iterable[str]) -> dict[str, dict[str, Any]]:
+        """The rows for these ids; a missing id is simply absent."""
+        self._require_open()
+        wanted = [str(item) for item in ids]
+        if not wanted:
+            return {}
+        return self._retrieve(wanted, self._deadline())
+
     def _count(self, deadline: float) -> int:
         result = self._request(
             "POST", self._path + "/points/count", {"exact": True}, deadline
