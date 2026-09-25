@@ -34,6 +34,12 @@ HostChoice = Literal["hermes", "codex"]
 #: Run as a file by the target interpreter, so an installed package that
 #: predates these diagnostics is still measured. It imports no optional library.
 _PACKAGE_PROBE = Path(__file__).with_name("package_health.py")
+#: Flags for every interpreter probe. ``-P`` keeps the current directory off the
+#: path so a checkout cannot answer for the install; the environment is left
+#: alone, because a host may serve the package from a persistent directory on
+#: ``PYTHONPATH`` rather than from site-packages, and an isolated probe would
+#: strip that and report a healthy install as missing.
+_PROBE_FLAGS = ("-P", "-B")
 #: Largest JSON control file the doctor will read from beside the store.
 _CONTROL_FILE_LIMIT = 65536
 
@@ -169,7 +175,7 @@ def _seconds_since(stamp: Any) -> float | None:
 def _probe_python_package(python: Path) -> dict[str, Any]:
     """What the target interpreter imports; empty when it cannot answer cleanly."""
     try:
-        result = subprocess.run([str(python), "-I", "-B", str(_PACKAGE_PROBE)],
+        result = subprocess.run([str(python), *_PROBE_FLAGS, str(_PACKAGE_PROBE)],
                                 capture_output=True, text=True, timeout=30, check=False)
         found = json.loads(result.stdout) if result.returncode == 0 and len(result.stdout) <= 65536 else None
     except (OSError, subprocess.TimeoutExpired, ValueError):
@@ -498,7 +504,7 @@ def _host_registration_status(host: str, instance: Path, python_executable: Path
     if python_executable is not None:
         script = "import importlib.metadata as m,json; print(json.dumps(any(e.name=='scope-recall' for e in m.entry_points(group='hermes_agent.memory_providers'))))"
         try:
-            probe = subprocess.run([str(python_executable), "-I", "-B", "-c", script],
+            probe = subprocess.run([str(python_executable), *_PROBE_FLAGS, "-c", script],
                                    capture_output=True, text=True, timeout=15, check=False)
             if probe.returncode or json.loads(probe.stdout) is not True:
                 return "entry_point_missing"

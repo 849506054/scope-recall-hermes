@@ -392,6 +392,41 @@ def test_hermes_fresh_install_and_doctor(tmp_path):
     assert report.hook_trust_status == "unknown"
 
 
+def test_interpreter_probes_measure_an_environment_provided_install(tmp_path, monkeypatch):
+    """A host may serve the package from a directory on PYTHONPATH, not site-packages.
+
+    The package and host-registration probes must measure that install.  An
+    isolated interpreter strips PYTHONPATH, which reports a healthy install as
+    missing and leaves the version check permanently incomplete.
+    """
+    from scope_recall.maintenance.doctor import _host_registration_status, _probe_python_package
+
+    served = tmp_path / "served"
+    package = served / "scope_recall"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    (package / "_version.py").write_text('__version__ = "9.9.9"\n', encoding="utf-8")
+    dist_info = served / "hermes_scope_recall-9.9.9.dist-info"
+    dist_info.mkdir()
+    (dist_info / "METADATA").write_text(
+        "Metadata-Version: 2.1\nName: hermes-scope-recall\nVersion: 9.9.9\n", encoding="utf-8")
+    (dist_info / "entry_points.txt").write_text(
+        "[hermes_agent.memory_providers]\nscope-recall = scope_recall.distribution.hermes:register\n",
+        encoding="utf-8")
+    monkeypatch.setenv("PYTHONPATH", str(served))
+
+    probe = _probe_python_package(Path(sys.executable))
+    assert probe.get("version") == "9.9.9", probe
+    assert probe.get("path", "").startswith(str(package)), probe
+
+    instance = tmp_path / "instance"
+    instance.mkdir()
+    (instance / "config.yaml").write_text("memory:\n  provider: scope-recall\n", encoding="utf-8")
+    registration = _host_registration_status("hermes", instance, Path(sys.executable))
+    assert registration == "registered", registration
+    print(json.dumps({"probe": probe, "registration": registration}, ensure_ascii=False))
+
+
 @pytest.mark.parametrize("host", ["hermes", "codex"])
 def test_install_mode_defaults_to_production_and_test_mode_is_explicit(tmp_path, host):
     instance_root, plugin_dir, project_root = _install_paths(tmp_path / "production", host=host)
@@ -1449,3 +1484,35 @@ def test_plan_install_keeps_a_symlinked_interpreter_as_given(tmp_path):
     assert commands and all(str(link) in command for command in commands)
     resolved = str(link.resolve())
     assert resolved != str(link) and all(resolved not in command for command in commands)
+
+
+def test_the_cli_keeps_a_symlinked_interpreter_as_given(tmp_path, capsys):
+    """#87 at the CLI boundary: ``--python`` reaches plan-install and doctor as given.
+
+    Resolving it records the base interpreter for a venv launcher -- one that
+    cannot import this package -- and makes the doctor probe an environment the
+    host never runs.
+    """
+    from plugin_source import linked_interpreter
+    from scope_recall.maintenance import cli as maintenance_cli
+
+    link = linked_interpreter(tmp_path)
+    if link is None:
+        pytest.skip("no link to an interpreter can be created here")
+    assert link is not None
+    instance, plugin, project = _install_paths(tmp_path, host="hermes")
+    assert maintenance_cli.main([
+        "plan-install", "--host", "hermes", "--target-plugin-dir", str(plugin),
+        "--instance-root", str(instance), "--project-root", str(project),
+        "--agent-id", "TEST-cli-link", "--python", str(link),
+    ]) == 0
+    planned = json.loads(capsys.readouterr().out)
+    assert Path(planned["python_executable"]) == link
+
+    maintenance_cli.main([
+        "doctor", "--host", "hermes", "--instance-root", str(instance), "--python", str(link),
+    ])
+    report = json.loads(capsys.readouterr().out)
+    assert report["python_executable"] == str(link)
+    print(json.dumps({"planned": planned["python_executable"], "doctor": report["python_executable"],
+                      "resolved": str(link.resolve())}, ensure_ascii=False))

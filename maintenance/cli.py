@@ -10,7 +10,7 @@ from typing import Any, Callable
 from .backup import BackupError
 from .doctor import run_doctor
 from .install import InstallError, apply_install, apply_uninstall, plan_install, plan_uninstall
-from .install_common import _absolute
+from .install_common import _absolute, _require_interpreter
 from .install_hermes import LOCAL_PLATFORM_CHOICES
 from .rollback import RollbackError
 
@@ -25,6 +25,20 @@ def _path(value: str, field: str) -> Path:
 
 def _optional_path(value: str | None, field: str) -> Path | None:
     return _path(value, field) if value else None
+
+
+def _interpreter(value: str, field: str) -> Path:
+    """Validate an interpreter through its real target but keep the path as given.
+
+    Resolving it records the base interpreter for a venv launcher, which starts
+    without the venv on ``sys.path`` and cannot import this package (#87) --
+    and makes the doctor probe an environment the host never runs.
+    """
+    return _require_interpreter(Path(value), field)
+
+
+def _optional_interpreter(value: str | None, field: str) -> Path | None:
+    return _interpreter(value, field) if value else None
 
 
 # Sub-commands with their own parser: the first token routes to them before the
@@ -436,7 +450,7 @@ def _install_plan(args: argparse.Namespace):
         instance_root=_path(args.instance_root, "instance_root"),
         project_root=_path(args.project_root, "project_root"),
         agent_id=args.agent_id,
-        python_executable=_path(args.python, "python"),
+        python_executable=_interpreter(args.python, "python"),
         host=args.host,
         test_mode=args.test_mode,
         agent_workspace=args.agent_workspace,
@@ -466,7 +480,7 @@ def _doctor(args: argparse.Namespace) -> int:
     report = run_doctor(
         host=args.host,
         instance_root=_path(args.instance_root, "instance_root"),
-        python_executable=_optional_path(args.python, "python"),
+        python_executable=_optional_interpreter(args.python, "python"),
     )
     _emit(report.to_dict())
     return 0 if report.status == "ok" else 1
