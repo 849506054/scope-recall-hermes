@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import shutil
 from types import ModuleType
+from typing import Any
 import uuid
 
 from . import install_codex, install_hermes
@@ -244,6 +245,32 @@ def apply_install(plan: InstallPlan) -> InstallResult:
     )
 
 
+def _remote_vector_footprint(adapter: ModuleType, instance: Path) -> dict[str, Any] | None:
+    """The remote collection this instance writes to, or None for a local backend.
+
+    A plan names what a local command cannot remove: uninstall deletes this
+    instance's files, while the collection lives on the server.  An unreadable
+    configuration is reported as unknown rather than omitted.
+    """
+    from ..runtime.instance import RuntimeInstanceConfig, default_vector_factory
+
+    config_path = adapter.data_dir(instance) / "runtime-config.json"
+    if not config_path.is_file():
+        return None
+    try:
+        config = RuntimeInstanceConfig.from_mapping(json.loads(config_path.read_text(encoding="utf-8")))
+        if config.vector is None or config.vector.qdrant is None:
+            return None
+        store = default_vector_factory(
+            config.vector, binding=config.binding, embedding_space=config.embedding_space_id()
+        )
+        return {"url": config.vector.qdrant.url, "collection": store.collection_name,
+                "removed_by_uninstall": False}
+    except Exception as error:  # noqa: BLE001 - a plan reports what it can read
+        return {"url": None, "collection": None, "removed_by_uninstall": False,
+                "detail": type(error).__name__}
+
+
 def plan_uninstall(
     *,
     instance_root: Path | str,
@@ -261,6 +288,7 @@ def plan_uninstall(
         target_plugin_dir = str(receipt.get("target_plugin_dir") or "")
     target = _require_absolute(Path(target_plugin_dir), "target_plugin_dir")
     plan = UninstallPlan(host=host, instance_root=instance, target_plugin_dir=target, retain_memory=True)
+    plan.remote_vector = _remote_vector_footprint(adapter, instance)
 
     try:
         owned = _validate_receipt_binding(receipt, host=host, instance_root=instance, target_plugin_dir=target)

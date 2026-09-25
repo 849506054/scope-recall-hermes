@@ -125,6 +125,10 @@ class UninstallPlan:
     purge_paths: list[str] = field(default_factory=list)
     retained_backups: list[str] = field(default_factory=list)
     conflicts: list[str] = field(default_factory=list)
+    #: The remote collection this instance writes to, when its configuration
+    #: names one.  Uninstall removes local files; server-side data is named so
+    #: it is not silently left behind.
+    remote_vector: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -138,6 +142,7 @@ class UninstallPlan:
             "purge_paths": list(self.purge_paths),
             "retained_backups": list(self.retained_backups),
             "conflicts": list(self.conflicts),
+            "remote_vector": self.remote_vector,
         }
 
 

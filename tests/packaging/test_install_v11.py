@@ -96,6 +96,47 @@ def test_agent_setup_skill_discovery_ownership_and_uninstall(tmp_path, host):
     assert not skill.exists()
 
 
+def test_uninstall_plan_names_the_remote_collection_it_does_not_remove(tmp_path):
+    """Uninstall deletes this instance's files. A collection lives on the server,
+    so the plan names it — and says it is not part of the removal."""
+    instance, plugin, project = _install_paths(tmp_path, host="hermes")
+    options = dict(host="hermes", target_plugin_dir=plugin, instance_root=instance,
+                   project_root=project, agent_id="TEST-remote-uninstall",
+                   python_executable=Path(sys.executable))
+    apply_install(plan_install(**options))
+    data_dir = instance / "scope-recall"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    from scope_recall.core.recall_policy import SPACE_ID
+
+    (data_dir / "runtime-config.json").write_text(json.dumps({
+        "binding": {"agent_id": "TEST-remote-uninstall", "installation_id": "TEST-installation",
+                    "data_directory": str(data_dir), "scope_ids": ["TEST-scope"], "test_mode": True},
+        "session_id": "TEST-session", "allowed_scope_ids": ["TEST-scope"],
+        "auxiliary": {"external_embedding": True, "external_consolidation": False,
+                      "embedding": {"credential_env": "TEST_EMBED_KEY"}},
+        "vector": {"backend": "qdrant", "storage_dir": str(data_dir / "vectors" / SPACE_ID),
+                   "table_name": "TEST_vectors", "dimensions": 3072,
+                   "qdrant": {"url": "http://scope-recall-qdrant:6333"}},
+    }), encoding="utf-8")
+    plan = plan_uninstall(instance_root=instance, target_plugin_dir=plugin)
+    remote = plan.remote_vector
+    assert remote["url"] == "http://scope-recall-qdrant:6333"
+    assert remote["collection"].startswith("scope-recall-")
+    assert remote["removed_by_uninstall"] is False
+    assert plan.to_dict()["remote_vector"] == remote
+    assert remote["collection"] not in plan.purge_paths
+
+
+def test_uninstall_plan_leaves_a_local_backend_unnamed(tmp_path):
+    instance, plugin, project = _install_paths(tmp_path, host="hermes")
+    options = dict(host="hermes", target_plugin_dir=plugin, instance_root=instance,
+                   project_root=project, agent_id="TEST-local-uninstall",
+                   python_executable=Path(sys.executable))
+    apply_install(plan_install(**options))
+    plan = plan_uninstall(instance_root=instance, target_plugin_dir=plugin)
+    assert plan.remote_vector is None
+
+
 def test_hermes_existing_user_skill_is_not_overwritten(tmp_path):
     instance, plugin, project = _install_paths(tmp_path, host="hermes")
     skill = instance / "skills" / "scope-recall-setup" / "SKILL.md"
