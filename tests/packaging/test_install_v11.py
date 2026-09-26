@@ -427,6 +427,65 @@ def test_interpreter_probes_measure_an_environment_provided_install(tmp_path, mo
     print(json.dumps({"probe": probe, "registration": registration}, ensure_ascii=False))
 
 
+def test_a_hermes_wrapper_may_sit_where_hermes_looks_a_provider_up(tmp_path):
+    """Hermes reads a memory provider's plugin.yaml, and the core the wrapper declares, from
+    ``<home>/plugins/<name>/`` or from the installed core's own directory; once the environment it
+    runs has lost the core, only the first is left (#135).  That one directory may sit inside the
+    home; any other plugin directory still may not."""
+    instance_root, _outside, project_root = _install_paths(tmp_path, host="hermes")
+    inside = instance_root / "plugins" / "scope-recall"
+    apply_install(plan_install(host="hermes", target_plugin_dir=inside, instance_root=instance_root,
+                               project_root=project_root, agent_id="TEST-P14-agent",
+                               python_executable=Path(sys.executable)))
+    assert "register_memory_provider" in (inside / "__init__.py").read_text(encoding="utf-8")
+    assert (inside / "plugin.yaml").is_file()
+    assert (instance_root / "scope-recall" / "memory.sqlite3").is_file()
+    uninstall = apply_uninstall(plan_uninstall(instance_root=instance_root))
+    assert not (inside / "plugin.yaml").exists() and not (inside / "__init__.py").exists()
+    assert uninstall.memory_retained is True
+
+    for host, target in (("hermes", instance_root / "plugins" / "other"),
+                         ("hermes", instance_root / "wrappers" / "scope-recall"),
+                         ("codex", instance_root / "plugins" / "scope-recall")):
+        with pytest.raises(InstallError, match="instance_root overlaps target_plugin_dir"):
+            plan_install(host=host, target_plugin_dir=target, instance_root=instance_root,
+                         project_root=project_root, agent_id="TEST-P14-agent",
+                         python_executable=Path(sys.executable))
+
+
+def test_hermes_wrapper_names_a_missing_core_and_passes_other_import_errors_through(tmp_path):
+    """Only a missing core is reported as one.  An older core, or a core missing one of its own
+    dependencies, is installed: calling it missing sent the operator to install what was there."""
+    wrapper = Path(__file__).resolve().parents[2] / "distribution" / "hermes" / "__init__.py"
+    probe = (
+        "import importlib.util, sys\n"
+        "if sys.argv[2] != '-':\n"
+        "    sys.path.insert(0, sys.argv[2])\n"
+        "spec = importlib.util.spec_from_file_location('TEST_wrapper', sys.argv[1])\n"
+        "try:\n"
+        "    spec.loader.exec_module(importlib.util.module_from_spec(spec))\n"
+        "except ImportError as exc:\n"
+        "    print(type(exc).__name__, exc)\n"
+    )
+
+    def load(core: str) -> str:
+        # -S: no site-packages, so no installed core unless ``core`` puts one on the path.
+        result = subprocess.run([sys.executable, "-I", "-S", "-c", probe, str(wrapper), core],
+                                capture_output=True, text=True, timeout=60)
+        assert result.returncode == 0, result.stderr
+        return result.stdout.strip()
+
+    assert load("-").startswith("ImportError Scope Recall's core package (hermes-scope-recall) is not installed")
+    older = tmp_path / "TEST-older-core"
+    (older / "scope_recall" / "adapters" / "hermes").mkdir(parents=True)
+    for package in ("scope_recall", "scope_recall/adapters", "scope_recall/adapters/hermes"):
+        (older / package / "__init__.py").write_text("", encoding="utf-8")
+    assert load(str(older)).startswith("ImportError cannot import name 'register_adapter'")
+    (older / "scope_recall" / "adapters" / "hermes" / "__init__.py").write_text(
+        "import TEST_missing_dependency\n", encoding="utf-8")
+    assert load(str(older)) == "ModuleNotFoundError No module named 'TEST_missing_dependency'"
+
+
 @pytest.mark.parametrize("host", ["hermes", "codex"])
 def test_install_mode_defaults_to_production_and_test_mode_is_explicit(tmp_path, host):
     instance_root, plugin_dir, project_root = _install_paths(tmp_path / "production", host=host)
@@ -1516,3 +1575,20 @@ def test_the_cli_keeps_a_symlinked_interpreter_as_given(tmp_path, capsys):
     assert report["python_executable"] == str(link)
     print(json.dumps({"planned": planned["python_executable"], "doctor": report["python_executable"],
                       "resolved": str(link.resolve())}, ensure_ascii=False))
+
+
+def test_a_released_wrapper_declares_its_core_and_a_candidate_declares_nothing():
+    """Hermes builds the environment it runs plugins in from what their manifests declare, and rebuilds it
+    on updates: a wrapper that declares nothing loses its core then (#135).  A requirement Hermes cannot
+    resolve fails its whole build, so only a release on PyPI is declared."""
+    import yaml
+    from packaging.requirements import Requirement
+    from scope_recall.maintenance.install_hermes import wrapper_manifest
+
+    template = "name: scope-recall\nversion: 3.3.0\nprovider_entry: register:register\n"
+    (spec,) = yaml.safe_load(wrapper_manifest(template, "3.3.0"))["pip_dependencies"]
+    requirement = Requirement(spec)
+    assert (requirement.name, requirement.extras, str(requirement.specifier)) == (
+        "hermes-scope-recall", {"lancedb"}, "==3.3.0")
+    for build in ("3.3.0rc4", "3.3.0.dev1", "3.3.0+local"):
+        assert wrapper_manifest(template, build) == template

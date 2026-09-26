@@ -18,8 +18,9 @@ def host_source_key(
     event_kind: str,
     event_id: str,
     revision: int = 1,
+    host: str = "codex",
 ) -> str:
-    return f"codex:{installation_id}:{session_id}:{event_kind}:{event_id}@{revision}"
+    return f"{host}:{installation_id}:{session_id}:{event_kind}:{event_id}@{revision}"
 
 
 def is_scope_recall_tool(tool_name: object) -> bool:
@@ -46,6 +47,17 @@ def _serialize_tool_value(value: object) -> tuple[str, bool]:
     return encoded[:_MAX_TOOL_CHARS], len(encoded) > _MAX_TOOL_CHARS
 
 
+#: How Claude Code opens the prompt it hands the model when a background task finishes.  The session
+#: record marks such an entry ``origin.kind: task-notification``, never the owner's; the prompt hook sees
+#: only the text.
+TASK_NOTIFICATION_PREFIX = "<task-notification>"
+
+
+def is_task_notification(prompt: str) -> bool:
+    """Whether a prompt is Claude Code's notice that a background task finished, not the owner's words."""
+    return prompt.lstrip().startswith(TASK_NOTIFICATION_PREFIX)
+
+
 def user_prompt_source_event(
     *,
     installation_id: str,
@@ -53,6 +65,7 @@ def user_prompt_source_event(
     turn_id: str,
     prompt: str,
     recorded_at: str,
+    host: str = "codex",
     gaps: tuple[str, ...] = (),
 ) -> SourceEvent | None:
     if not prompt.strip():
@@ -61,6 +74,7 @@ def user_prompt_source_event(
     return {
         "protocol_version": "1.1",
         "source_event_key": host_source_key(
+            host=host,
             installation_id=installation_id,
             session_id=session_id,
             event_kind="user",
@@ -85,6 +99,7 @@ def assistant_stop_source_event(
     turn_id: str,
     message: str,
     recorded_at: str,
+    host: str = "codex",
 ) -> tuple[SourceEvent | None, tuple[str, ...]]:
     gaps: list[str] = []
     if not message.strip():
@@ -93,6 +108,7 @@ def assistant_stop_source_event(
     return {
         "protocol_version": "1.1",
         "source_event_key": host_source_key(
+            host=host,
             installation_id=installation_id,
             session_id=session_id,
             event_kind="assistant",
@@ -110,6 +126,39 @@ def assistant_stop_source_event(
     }, tuple(gaps)
 
 
+def recorded_source_event(
+    *,
+    installation_id: str,
+    session_id: str,
+    entry_id: str,
+    role: str,
+    text: str,
+    occurred_at: str,
+    recorded_at: str,
+    host: str = "claude-code",
+) -> SourceEvent:
+    """A message read from the host's own session record, under the record's id for it."""
+    return {
+        "protocol_version": "1.1",
+        "source_event_key": host_source_key(
+            host=host,
+            installation_id=installation_id,
+            session_id=session_id,
+            event_kind="record",
+            event_id=entry_id,
+        ),
+        "source_revision": 1,
+        "origin": "human_direct" if role == "user" else "assistant_visible",
+        "role": role,
+        "content": text,
+        "occurred_at": occurred_at,
+        "recorded_at": recorded_at,
+        "time_precision": "instant",
+        "capture_state": "complete",
+        "evidence_refs": [],
+    }
+
+
 def tool_use_source_event(
     *,
     installation_id: str,
@@ -120,6 +169,7 @@ def tool_use_source_event(
     tool_input: object,
     tool_response: object,
     recorded_at: str,
+    host: str = "codex",
 ) -> tuple[SourceEvent | None, tuple[str, ...], str]:
     origin = "memory_reinjection" if is_scope_recall_tool(tool_name) else "tool_observation"
     input_text, input_truncated = _serialize_tool_value(tool_input)
@@ -131,6 +181,7 @@ def tool_use_source_event(
     return {
         "protocol_version": "1.1",
         "source_event_key": host_source_key(
+            host=host,
             installation_id=installation_id,
             session_id=session_id,
             event_kind="tool",
@@ -156,11 +207,13 @@ def lifecycle_source_event(
     event_id: str,
     content: str,
     recorded_at: str,
+    host: str = "codex",
     gaps: tuple[str, ...] = (),
 ) -> SourceEvent:
     return {
         "protocol_version": "1.1",
         "source_event_key": host_source_key(
+            host=host,
             installation_id=installation_id,
             session_id=session_id,
             event_kind=event_kind,
@@ -178,8 +231,9 @@ def lifecycle_source_event(
     }
 
 
-def turn_id_from_payload(payload: dict[str, Any], *, required: bool) -> tuple[str | None, tuple[str, ...]]:
-    turn_id = _bounded_turn_id(payload.get("turn_id"))
+def turn_id_from_payload(payload: dict[str, Any], *, required: bool, field: str = "turn_id") -> tuple[str | None, tuple[str, ...]]:
+    """The host's id of this turn: Codex's ``turn_id``, Claude Code's ``prompt_id``."""
+    turn_id = _bounded_turn_id(payload.get(field))
     if turn_id is None and required:
         return None, ("capability_gap:missing_turn_id",)
     return turn_id, ()

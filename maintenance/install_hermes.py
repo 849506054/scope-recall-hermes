@@ -4,6 +4,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from packaging.version import Version
+
+from scope_recall._version import __version__
 from scope_recall.adapters.hermes.audiences import LOCAL_PLATFORMS, HermesIdentityError, normalize_local_platforms
 from scope_recall.adapters.hermes.installation import (
     approve_local_platforms as _approve_local_platforms,
@@ -45,6 +48,16 @@ def instance_wrapper_files(instance_root: Path) -> tuple[Path, ...]:
     return tuple(instance_root / "skills" / name / "SKILL.md" for name in SKILLS)
 
 
+def home_plugin_dir(instance_root: Path) -> Path:
+    """The one plugin directory that may sit inside the home: where Hermes looks a memory provider up by name.
+
+    Hermes reads a provider's ``plugin.yaml``, and with it the core the wrapper declares, from
+    ``<home>/plugins/<name>/`` or from the installed core's own directory.  Once the environment Hermes runs
+    has lost the core, only this one is left (#135).
+    """
+    return instance_root / "plugins" / "scope-recall"
+
+
 def validate_options(agent_workspace: str | None, env_file: Path | str | None) -> tuple[str, Path | None]:
     """Hermes processes inherit the gateway environment and must not carry a
     second credential path; the audience workspace defaults to the host value."""
@@ -68,13 +81,30 @@ def validate_local_platforms(values: object) -> tuple[str, ...]:
         raise InstallError(str(exc)) from exc
 
 
+def wrapper_manifest(template: str, version: str = __version__) -> str:
+    """The wrapper's ``plugin.yaml``: the template, plus the core it runs on when that is a release on PyPI.
+
+    Hermes Desktop rebuilds the Python environment it runs plugins in on updates, dropping a core installed
+    there by hand (#135), and Hermes installs what a memory provider's manifest declares
+    (``pip_dependencies``) when the provider is set up; it reads the manifest from ``home_plugin_dir`` once
+    the core is gone.  The pin is exact, as the wrapper and the core are one release.  A
+    pre-release, development or local build is not on PyPI, and a requirement that cannot be resolved fails
+    Hermes' whole build, so such a build declares nothing and is installed by hand.
+    """
+    release = Version(version)
+    if release.is_prerelease or release.is_devrelease or release.local is not None:
+        return template
+    return template.rstrip("\n") + f'\npip_dependencies:\n  - "hermes-scope-recall[lancedb]=={version}"\n'
+
+
 def planned_files(plan: InstallPlan) -> dict[Path, str | bytes]:
     files: dict[Path, str | bytes] = {}
     for name in ("__init__.py", "plugin.yaml"):
         source = DIST_HERMES / name
         if not source.is_file():
             raise InstallError(f"distribution template missing: {source}")
-        files[plan.target_plugin_dir / name] = source.read_text(encoding="utf-8")
+        text = source.read_text(encoding="utf-8")
+        files[plan.target_plugin_dir / name] = wrapper_manifest(text) if name == "plugin.yaml" else text
     for name, source in SKILLS.items():
         files[plan.instance_root / "skills" / name / "SKILL.md"] = source.read_text(encoding="utf-8")
     return files

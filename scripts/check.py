@@ -108,7 +108,7 @@ SCRIPT_GATE_TESTS = [
     "tests/packaging/test_release_notes.py",
 ]
 SUITES = {
-    "unit": ["tests/unit/test_v11_context.py", "tests/unit/test_check_runner.py", "tests/unit/test_secret_patterns.py", "tests/unit/test_contract_schemas.py"],
+    "unit": ["tests/unit/test_v11_context.py", "tests/unit/test_check_runner.py", "tests/unit/test_secret_patterns.py", "tests/unit/test_contract_schemas.py", "tests/unit/test_claude_code_record.py"],
     "contract": ["tests/contract/test_v11_protocol.py", "tests/contract/test_v11_inputs.py", "tests/contract/test_p13_configurable_budget.py", "tests/contract/test_autostart_cli.py", "tests/contract/test_companion_publish.py", "tests/contract/test_upgrade_store_cli.py", "tests/contract/test_request_guard_escaping.py", "tests/contract/test_relation_candidates_rank.py", "tests/contract/test_status_file_beside_its_writer.py", "tests/contract/test_every_store_meets_the_runtime.py", "tests/contract/test_qdrant_config.py", "tests/contract/test_a_paused_wake_lets_go.py", "tests/contract/test_a_pass_that_ends_hands_back_its_group.py", "tests/contract/test_qdrant_runtime.py", "tests/contract/test_qdrant_store.py", "tests/contract/test_vector_candidate_authority.py", "tests/contract/test_vector_migration.py"],
     "storage": ["tests/contract/test_v11_storage.py", "tests/contract/test_shared_store.py"],
     "capture": ["tests/contract/test_v11_capture.py"],
@@ -148,6 +148,7 @@ SUITES = {
         "tests/host/codex/test_lifecycle_worker_wakeup.py",
         "tests/host/codex/test_mcp.py",
         "tests/host/codex/test_runtime_wiring.py",
+        "tests/host/codex/test_shared_client.py",
     ],
     "migration": ["tests/migration/test_v11_migration.py"],
     "packaging": [
