@@ -120,7 +120,10 @@ def _doctor_app(tmp_path, monkeypatch):
 def test_doctor_checks_actual_target_version_not_import_success(tmp_path, monkeypatch, version, metadata, expected_gap):
     app, ctx = _doctor_app(tmp_path, monkeypatch)
     def run(command, **kwargs):
-        assert command[1:3] == ['-I', '-B']
+        # The probe flags are the doctor's own; asserting them here keeps this
+        # test honest about what the host actually runs (-P, not an isolated -I
+        # that strips a package served from PYTHONPATH).
+        assert command[1:3] == list(doctor._PROBE_FLAGS)
         return subprocess.CompletedProcess(command, 0, json.dumps(dict(source='installed', version=version,
                     path=str(tmp_path/'site-packages'/'scope_recall'/'_version.py'), distribution_version=metadata)), '')
     monkeypatch.setattr(doctor.subprocess, 'run', run)
