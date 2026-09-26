@@ -308,7 +308,7 @@ def test_describe_reports_shape_counts_and_indexes_read_only(setup):
     assert facts["status"] == "ok" and facts["detail"] == ""
     assert facts["points_count"] == 2 and facts["indexed_vectors_count"] == 2
     assert facts["dimensions"] == 2 and facts["distance"] == "Cosine"
-    assert facts["payload_indexes"] == ["scope_id"] and facts["shape_matches"] is True
+    assert facts["payload_indexes"] == ["scope_id", "source"] and facts["shape_matches"] is True
     assert facts["collection_status"] == "green" and facts["optimizer_status"] == "ok"
 
 
@@ -530,8 +530,14 @@ def test_uncertain_write_blocks_fresh_store_and_empty_purge(setup, failure):
     other.open_existing()
     with pytest.raises(ContractError):
         other.upsert_records([row(2)])
-    assert not purge(other)
-    assert server.gate.status() == pending
+    if failure == "readback":
+        # The points landed; the read-back proves it, so the marker clears.
+        # The refused attempt itself is still refused -- the queue retries it.
+        assert server.gate.status() is None
+        assert purge(other)
+    else:
+        assert not purge(other)
+        assert server.gate.status() == pending
 
 
 @pytest.mark.parametrize(
@@ -931,3 +937,84 @@ def test_availability_is_read_only_and_http_status_is_preserved(setup):
         store.open_existing()
     assert error.value.code == "http_status" and error.value.status == 401
     assert not binding.data_directory.exists()
+
+
+def test_lost_receipt_settles_when_the_points_read_back(setup):
+    """The production incident: the points land, the receipt never confirms.
+
+    A failed receipt used to leave the fail-closed marker and refuse every
+    write after it, for ever, with nothing to notice."""
+    store, server, _, _ = setup
+    store.open()
+    collection = server.collections[store.collection_name]
+
+    def applied_but_unconfirmed(method, path, body):
+        if method == "PUT" and path.split("?")[0].endswith("/points"):
+            for point in deepcopy(body["points"]):
+                collection["points"][point["id"]] = point
+            return server.ok({"operation_id": 1, "status": "acknowledged"})
+        return None
+
+    server.hook = applied_but_unconfirmed
+    with pytest.raises(ContractError) as error:
+        store.upsert_records([row(1)])
+    server.hook = None
+    assert error.value.code == "STORAGE_UNAVAILABLE"
+    # Distinct from the gate's own "qdrant_mutation_uncertain": this names the
+    # lost receipt, not the marker state it left behind.
+    assert error.value.field == "qdrant_ack_not_completed"
+    assert store.mutation_gate.status() is None
+    assert store.count_rows() == 1
+    store.upsert_records([row(2)])
+    assert store.count_rows() == 2
+
+
+def test_lost_receipt_stays_pending_when_the_points_never_landed(setup):
+    store, server, _, _ = setup
+    store.open()
+
+    def refused_before_apply(method, path, body):
+        if method == "PUT" and path.split("?")[0].endswith("/points"):
+            return server.ok({"operation_id": 1, "status": "acknowledged"})
+        return None
+
+    server.hook = refused_before_apply
+    with pytest.raises(ContractError):
+        store.upsert_records([row(1)])
+    server.hook = None
+    pending = store.mutation_gate.status()
+    assert pending is not None and pending["operation"] == "upsert"
+    assert pending["ids"] == [row(1)["id"]]
+    # No evidence to settle on: the gate stays shut for an operator, as before.
+    with pytest.raises(ContractError):
+        store.open()
+    assert store.mutation_gate.status() == pending
+
+
+def test_open_settles_a_marker_whose_write_already_landed(setup):
+    store, server, _, _ = setup
+    store.open()
+    store.upsert_records([row(1)])
+    # A process that dies between the write and its ack leaves this behind.
+    with pytest.raises(ContractError):
+        with store.mutation_gate.mutation(
+            "upsert", store.collection_name, time.monotonic() + 4,
+            ids=[row(1)["id"]],
+        ):
+            pass
+    assert store.mutation_gate.status() is not None
+    store.open()
+    assert store.mutation_gate.status() is None
+    store.upsert_records([row(2)])
+    assert store.count_rows() == 2
+
+
+def test_open_indexes_source_for_maintenance_filters(setup):
+    store, server, _, _ = setup
+    store.open()
+    schema = server.collections[store.collection_name]["payload_schema"]
+    assert schema["scope_id"]["data_type"] == "keyword"
+    assert schema["source"]["data_type"] == "keyword"
+    indexed = len([call for call in server.calls if "/index" in call[1]])
+    store.open()
+    assert len([call for call in server.calls if "/index" in call[1]]) == indexed

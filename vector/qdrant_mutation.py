@@ -22,13 +22,18 @@ from pathlib import Path
 import re
 import stat
 import time
-from typing import Callable, Iterator
+from typing import Any, Callable, Iterator
 from uuid import uuid4
 
 from ..contracts import ContractError
 from ..core.file_lock import advisory_file_lock
 
-_MAX_MARKER_BYTES = 4096
+_MAX_MARKER_BYTES = 131072
+#: A marker may name the batch it was written for so a later pass can read the
+#: server back and settle an interrupted write on evidence.  status() bounds
+#: every read by this same constant, so the cap has to hold that id list.
+_MAX_MARKER_IDS = 2048
+_MARKER_KEYS = frozenset({"version", "collection", "operation_id", "operation"})
 _OPERATION = re.compile(r"[a-z][a-z0-9_]{0,63}\Z", re.ASCII)
 _COLLECTION = re.compile(r"[A-Za-z0-9_-]{1,255}\Z", re.ASCII)
 _OPERATION_ID = re.compile(r"[a-f0-9]{32}\Z", re.ASCII)
@@ -40,6 +45,15 @@ _NONBLOCK = getattr(os, "O_NONBLOCK", 0)
 
 def _uncertain() -> ContractError:
     return ContractError("STORAGE_UNAVAILABLE", "qdrant_mutation_uncertain")
+
+
+def _valid_ids(value: Any) -> bool:
+    """Marker ids are read back by a later process, so they are bounded here."""
+    return (
+        isinstance(value, list)
+        and len(value) <= _MAX_MARKER_IDS
+        and all(type(item) is str and 0 < len(item) <= 512 for item in value)
+    )
 
 
 def _remaining(deadline: float) -> float:
@@ -116,10 +130,11 @@ class QdrantMutationGate:
                 raise _uncertain()
             value = json.loads(raw)
             if (not isinstance(value, dict)
-                    or set(value) != {"version", "collection", "operation_id", "operation"}
+                    or set(value) - {"ids"} != _MARKER_KEYS
                     or type(value["version"]) is not int or value["version"] != 1
                     or not isinstance(value["operation_id"], str)
-                    or not _OPERATION_ID.fullmatch(value["operation_id"])):
+                    or not _OPERATION_ID.fullmatch(value["operation_id"])
+                    or ("ids" in value and not _valid_ids(value["ids"]))):
                 raise _uncertain()
             _metadata(value["operation"], value["collection"])
             return value
@@ -209,12 +224,18 @@ class QdrantMutationGate:
 
     @contextmanager
     def mutation(self, operation: str, collection: str, deadline: float,
-                 guard: Callable[[], bool] | None = None) -> Iterator[MutationReceipt]:
+                 guard: Callable[[], bool] | None = None,
+                 ids: list[str] | None = None) -> Iterator[MutationReceipt]:
         """Mark before yielding; clear only after complete() and a clean, timely exit.
 
         A false guard raises LeaseFenceRejected before marking/yielding. Guard
         exceptions propagate unchanged. All phases consume the supplied absolute
         monotonic deadline. Unacknowledged clean exits raise ContractError.
+
+        ``ids`` records what the mutation writes so a later pass can read the
+        server back and clear an interrupted write on evidence.  A batch that
+        will not fit the marker keeps the old behaviour: pending until an
+        operator establishes the boundary.
         """
         _metadata(operation, collection)
         # The lock is taken here rather than through ``locked()``: once the caller
@@ -230,6 +251,14 @@ class QdrantMutationGate:
             _remaining(deadline)
             marker = {"version": 1, "collection": collection,
                       "operation_id": uuid4().hex, "operation": operation}
+            if ids is not None:
+                candidate = {**marker, "ids": list(ids)}
+                if _valid_ids(candidate["ids"]) and (
+                    len(json.dumps(candidate, sort_keys=True,
+                                   separators=(",", ":")).encode("ascii"))
+                    <= _MAX_MARKER_BYTES // 2
+                ):
+                    marker = candidate
             self._persist(marker)
             _remaining(deadline)
             receipt = MutationReceipt(marker["operation_id"], deadline)

@@ -407,6 +407,33 @@ class QdrantVectorStore(VectorStore):
         except (QdrantHTTPError, ContractError):
             return False
 
+    def _settle_pending(self) -> bool:
+        """Clear an interrupted write when its own ids read back from the server.
+
+        The receipt for a write can be lost while the points landed; the gate
+        then stays fail-closed and every later write is refused.  Reading back
+        is what ``clear-pending-remote`` does by hand, so the same judgement is
+        made here: all recorded ids present -> the work happened, clear it.
+        A marker with no ids (another operation, or a batch too large to
+        record), or a read that does not answer, keeps the old behaviour --
+        pending for an operator.  Writes are idempotent by point id, so
+        proving presence is enough; the queue retries the work itself.
+        """
+        gate = self.mutation_gate
+        try:
+            marker = gate.status()
+            if marker is None or marker.get("operation") != "upsert":
+                return False
+            ids = marker.get("ids")
+            if not ids:
+                return False
+            if set(self._retrieve(list(ids), self._deadline())) != set(ids):
+                return False
+            gate.release(marker, deadline=self._deadline())
+        except Exception:  # noqa: BLE001 - settling is best effort; never masks the caller's error
+            return False
+        return True
+
     def open_existing(self) -> None:
         self._opened = False
         deadline = self._deadline()
@@ -418,6 +445,9 @@ class QdrantVectorStore(VectorStore):
 
     def open(self) -> None:
         self._opened = False
+        # Settling before the gate is what makes a lost receipt self-healing;
+        # without it one interrupted write refuses every write after it.
+        self._settle_pending()
         deadline = self._deadline()
         gate = self.mutation_gate
         with gate.locked(deadline):
@@ -446,19 +476,23 @@ class QdrantVectorStore(VectorStore):
                     self._collection_info(deadline)
                     receipt.complete()
             info = self._collection_info(deadline)
-            if "scope_id" not in info["payload_schema"]:
+            # scope_id is the query filter; source is what a maintenance scan
+            # filters on.  An unindexed payload filter is a full on-disk scan:
+            # 18.9s for three hits on this collection, against 4ms by id.
+            for field in ("scope_id", "source"):
+                if field in info["payload_schema"]:
+                    continue
                 with gate.mutation(
                     "create_index", self.collection_name, deadline
                 ) as receipt:
                     self._completed(
                         "PUT",
                         self._path + "/index?wait=true",
-                        {"field_name": "scope_id", "field_schema": "keyword"},
+                        {"field_name": field, "field_schema": "keyword"},
                         deadline,
                     )
                     if (
-                        "scope_id"
-                        not in self._collection_info(deadline)["payload_schema"]
+                        field not in self._collection_info(deadline)["payload_schema"]
                     ):
                         raise _invalid()
                     receipt.complete()
@@ -537,7 +571,10 @@ class QdrantVectorStore(VectorStore):
     def _completed(self, method: str, path: str, body: dict, deadline: float) -> None:
         result = self._request(method, path, body, deadline)
         if type(result) is not dict or result.get("status") != "completed":
-            raise ContractError("STORAGE_UNAVAILABLE", "qdrant_mutation_uncertain")
+            # A distinct field from the gate's own "qdrant_mutation_uncertain":
+            # this one is a receipt the server did not confirm, not a marker
+            # state, and an operator needs to know which of the two happened.
+            raise ContractError("STORAGE_UNAVAILABLE", "qdrant_ack_not_completed")
 
     def _decode(self, point: Any) -> dict:
         try:
@@ -589,19 +626,28 @@ class QdrantVectorStore(VectorStore):
         deadline: float,
         guard: Callable[[], bool] | None = None,
     ) -> None:
-        with self.mutation_gate.mutation(
-            "upsert", self.collection_name, deadline, guard=guard
-        ) as receipt:
-            # ponytail: bounded batches share one fence; a partial remote commit
-            # leaves the whole mutation pending, requiring controlled recovery.
-            for batch in batches:
-                self._completed(
-                    "PUT", self._path + "/points?wait=true", {"points": batch}, deadline
-                )
-                expected = {point["payload"]["id"]: point["payload"] for point in batch}
-                if self._retrieve(list(expected), deadline) != expected:
-                    raise _invalid()
-            receipt.complete()
+        ids = [point["payload"]["id"] for batch in batches for point in batch]
+        try:
+            with self.mutation_gate.mutation(
+                "upsert", self.collection_name, deadline, guard=guard, ids=ids
+            ) as receipt:
+                # ponytail: bounded batches share one fence; a partial remote commit
+                # leaves the whole mutation pending, requiring controlled recovery.
+                for batch in batches:
+                    self._completed(
+                        "PUT", self._path + "/points?wait=true", {"points": batch}, deadline
+                    )
+                    expected = {point["payload"]["id"]: point["payload"] for point in batch}
+                    if self._retrieve(list(expected), deadline) != expected:
+                        raise _invalid()
+                receipt.complete()
+        except Exception:
+            # The write is decided either way: when the points read back the
+            # lost receipt must not wedge the lane, and when they do not the
+            # marker stays for the maintenance window.  The caller's own error
+            # is what propagates -- settling never turns a failure into a pass.
+            self._settle_pending()
+            raise
 
     def upsert_records(self, rows: Iterable[dict[str, Any]]) -> None:
         self._require_open()
