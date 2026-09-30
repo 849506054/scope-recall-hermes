@@ -2,6 +2,18 @@
 
 All notable changes to `scope-recall` will be documented in this file.
 
+## [3.4.6] - 2026-09-30
+
+**Fork fix.** The semantic channel ran after the local ones, so its slice was what they
+left.  A host prefetch that spent 3.66 s of its five-second window handed the remote
+search 0.03 s, and the recall lost its meaning channel to a transport timeout -- 3.4.5's
+phase line named ``vector`` as the largest phase and the search as the thing that ran out.
+
+The search now starts with collection, beside the local channels, and is joined when its
+turn comes: the recall costs the longer of the two instead of their sum, and the search
+keeps a slice of its own.  A contract test proves it with a local channel that spends
+0.45 s of a 0.5 s window: the search is handed 0.03 s before this change and 0.37 s after.
+
 ## [3.4.5] - 2026-09-30
 
 **Fork release, temporary instrumentation.** 3.4.4's prefetch line says what the recall
