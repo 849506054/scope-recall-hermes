@@ -2,6 +2,22 @@
 
 All notable changes to `scope-recall` will be documented in this file.
 
+## [3.4.7] - 2026-09-30
+
+**Fork fix.** The lexical statement's join order was left to the planner, and on a large
+index the planner drove it from ``source_events`` -- every version in the scope -- looking up
+postings per version: the term filter applied after the fact, so the posting budget bounded
+nothing and a real prompt cost seconds.
+
+Measured on this store (3M postings, 81k sources): a 648-character prompt took **3.86 s** in
+the statement alone (the document-frequency read that chooses terms: 0.02 s), the recall lost
+its collect deadline, and the semantic channel with it.  Pinned term-first with ``CROSS JOIN``
+-- an inner join SQLite does not reorder -- the same statement returns the **same rows in
+0.19 s**, and end to end the recall went from 4.10 s with ``deadline_exceeded_collect`` to
+1.04 s with no deadline gap at all.
+
+A contract test captures the statement the channel runs and fails if the pin goes away.
+
 ## [3.4.6] - 2026-09-30
 
 **Fork fix.** The semantic channel ran after the local ones, so its slice was what they

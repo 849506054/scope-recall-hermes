@@ -1,4 +1,5 @@
 """Deterministic P08 core retrieval contracts using synthetic TEST identity."""
+import sqlite3
 from contextlib import contextmanager
 from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
@@ -9,7 +10,7 @@ from scope_recall.contracts import ContractError
 from scope_recall.core import CoreConfig, MemoryCore
 from scope_recall.core.recall_policy import RecallPolicy, SPACE_ID
 from scope_recall.core.retrieval import CandidateRef, CollectionQuery, PageCursor, SearchContext
-from scope_recall.core.retrieval_storage import scope_digest
+from scope_recall.core.retrieval_storage import RetrievalStorage, scope_digest
 from tests.contract.test_v11_claims import Clock, capture
 from tests.v11_support import context, recall_request, source_event
 
@@ -404,3 +405,60 @@ def test_P08_lexical_query_without_a_synonym_is_untouched_by_the_table(app):
             with _without_synonyms():
                 base = (_lexical_pool(core, reader, query, mode=mode), core.recall(reader, request, deadline_seconds=5))
             assert expanded[0] and expanded == base, (query, mode)
+
+
+def test_the_lexical_statement_drives_from_the_terms_not_the_scope(app, monkeypatch):
+    """The plan starts at the query's terms.
+
+    Left to itself the planner drove this statement from ``source_events`` -- every version in
+    the scope -- and looked up postings per version, so the term filter applied after the fact
+    and the posting budget bounded nothing: measured on a 3M-posting store, 3.86 s against
+    0.19 s with the order pinned, same rows.
+    """
+    core, ctx = app
+    capture(core, ctx, "P08 keeps H100 as an exact identifier.", key="TEST-p08/plan")
+    captured: dict[str, object] = {}
+
+    class Recording:
+        def __init__(self, conn):
+            self._conn = conn
+
+        def execute(self, sql, params=()):
+            if "lexical_terms t" in sql and "COUNT(DISTINCT" in sql:
+                captured.setdefault("sql", sql)
+                captured.setdefault("params", tuple(params))
+            return self._conn.execute(sql, params)
+
+        def __getattr__(self, name):
+            return getattr(self._conn, name)
+
+    class Proxy:
+        def __init__(self, tx):
+            self._tx = tx
+
+        def _check(self):
+            return Recording(self._tx._check())
+
+        def __getattr__(self, name):
+            return getattr(self._tx, name)
+
+    original = RetrievalStorage.lexical
+
+    def recording_lexical(self, tx, context, *, limit):
+        return original(self, Proxy(tx), context, limit=limit)
+
+    monkeypatch.setattr(RetrievalStorage, "lexical", recording_lexical)
+    core.recall(ctx, recall_request(query="H100 exact identifier", mode="current"), deadline_seconds=5)
+    assert "sql" in captured, "the lexical channel did not run"
+    # The order is pinned in the statement: a fixture this small lets the planner choose the
+    # term-driven order anyway, so the pin is what this asserts -- the plan check below then
+    # states the order the pin is there to keep.
+    assert "CROSS JOIN lexical_postings" in captured["sql"], captured["sql"][:200]
+
+    conn = sqlite3.connect(core.storage.path)
+    try:
+        plan = [row[3] for row in conn.execute(
+            "EXPLAIN QUERY PLAN " + captured["sql"], captured["params"])]
+    finally:
+        conn.close()
+    assert "lexical_terms" in plan[0] and "term=?" in plan[0], plan[:3]
