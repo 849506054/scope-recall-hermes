@@ -38,7 +38,7 @@ Run the operator CLI from outside any source tree (`python -I -X utf8 -m scope_r
 Put the store outside every agent's home, on a short path.
 
 ```text
-scope-recall init-shared --root F:\ScopeRecall\shared
+scope-recall init-shared --root D:\ScopeRecall\shared
 ```
 
 To attach a Hermes instance that has its own store today, stop its gateway first (and its
@@ -47,7 +47,7 @@ worker: `autostart pause`), then move its `scope-recall` directory aside and att
 ```text
 scope-recall backup --database <home>\scope-recall\memory.sqlite3 --output <backup-dir>\memory.sqlite3
 ren <home>\scope-recall scope-recall.local-20260922
-scope-recall attach --host hermes --instance-root <home> --root F:\ScopeRecall\shared ^
+scope-recall attach --host hermes --instance-root <home> --root D:\ScopeRecall\shared ^
     --entry desk --display-name Desk ^
     --grants-from <home>\scope-recall.local-20260922\installation.json ^
     --runtime-config-from <home>\scope-recall.local-20260922\runtime-config.json
@@ -69,8 +69,8 @@ Then give the shared worker its credentials in `<root>\.env` and register it onc
 interpreter that has the same package version as every entry:
 
 ```text
-scope-recall autostart enable --config F:\ScopeRecall\shared\runtime-config.json ^
-    --python F:\ScopeRecall\shared-venv\Scripts\python.exe --env-file F:\ScopeRecall\shared\.env
+scope-recall autostart enable --config D:\ScopeRecall\shared\runtime-config.json ^
+    --python D:\ScopeRecall\shared-venv\Scripts\python.exe --env-file D:\ScopeRecall\shared\.env
 ```
 
 An entry never starts a worker of its own. Leave the instance's own autostart paused or
@@ -85,7 +85,7 @@ without a restart.
 stop every attached host and pause the shared worker, then run for each agent:
 
 ```text
-scope-recall import-entry --root F:\ScopeRecall\shared --entry tianshu --from <home>\scope-recall.local-<date>
+scope-recall import-entry --root D:\ScopeRecall\shared --entry desk --from <home>\scope-recall.local-<date>
 ```
 
 The old store is opened read-only and copied in one transaction: sources, facts and their history,
@@ -109,13 +109,13 @@ every attached Hermes entry reads, so that every agent hears it; otherwise `atta
 names the rows that would not. No other entry's grants change and the worker keeps running.
 
 ```text
-scope-recall attach --host claude-code --instance-root F:\ScopeRecall\claude-code ^
-    --root F:\ScopeRecall\shared --entry claude-code --display-name "Claude Code" ^
-    --grants-like all --capture-like tianshu ^
+scope-recall attach --host claude-code --instance-root D:\ScopeRecall\claude-code ^
+    --root D:\ScopeRecall\shared --entry claude-code --display-name "Claude Code" ^
+    --grants-like all --capture-like desk ^
     --runtime-config-from <an attached home>\scope-recall\runtime-config.json
 scope-recall apply-install --host claude-code --target-plugin-dir %USERPROFILE%\.claude\skills\scope-recall ^
-    --instance-root F:\ScopeRecall\claude-code --agent-id <the store's agent id> ^
-    --python F:\ScopeRecall\claude-code-venv\Scripts\python.exe --env-file <the file with the embedding key>
+    --instance-root D:\ScopeRecall\claude-code --agent-id <the store's agent id> ^
+    --python D:\ScopeRecall\claude-code-venv\Scripts\python.exe --env-file <the file with the embedding key>
 ```
 
 The plugin under `~/.claude/skills/` loads in every new Claude Code session of that user, the
@@ -128,14 +128,59 @@ owner's messages, those sent while a turn was running included, and the text Cla
 while it works. Tool calls and results, compaction summaries, task notifications and anything the
 record does not mark as the owner's or as shown text are not recorded. A background task's
 completion notice, which Claude Code hands to the model as a prompt, is not the owner's and is
-neither recorded nor answered from memory. A message a hook already stored is recognised by its
-words and moment and not stored twice; one that cannot be written now is written at a later turn. A long session is read over several turns, at most 3 s each. Where a
+neither recorded nor answered from memory. A message a hook already stored, or one still waiting in
+the capture inbox, is recognised by its prompt id (one sent while a turn was running, which has none,
+by its words and moment) and not stored twice; one that cannot be written now is written at a later turn. A long session is read over several turns, at most 3 s each. Where a
 read stopped is kept in `<home>\scope-recall\transcripts`; deleting it only makes the next read
 start from the top. Claude Code runs a hook command through a shell (Git Bash, or
 PowerShell without it), so keep the interpreter, the home and the env file on ASCII paths without
 spaces; `apply-install` refuses others. Its MCP tools read the store. Changing a memory through
 them is refused, because the tools cannot tell which conversation asks: correct or delete through
 a Hermes agent or Codex.
+
+Each hook is a process of its own, and a prompt hook that starts LanceDB for its recall was often
+not ready before the recall's budget ran out (6 of 8 cold Claude Code prompts on the pilot recalled
+by words alone). So the entry's MCP server, which the client runs for as long as it is open, keeps a
+LanceDB helper ready and answers the recall of the entry's prompts on this machine. The prompt hook
+still stores the prompt itself, then asks the server for its recall; the server writes nothing. It
+listens on 127.0.0.1 and names itself, with a token, in a folder of the user's own profile
+(`%LOCALAPPDATA%\scope-recall\hook-endpoints\`, or `~/.cache/scope-recall/hook-endpoints/`), not in
+the entry's home, and removes its name when it exits. A hook asks the newest server of its own
+version, once that server has proved it holds the token, which is never sent. The other hooks read
+no vectors and ask nothing.
+
+A prompt hook gives the server all of its time but the answer's way back, whenever at least 1 s is
+left. If the server has not answered when 1.5 s are left, the hook recalls as well, with the LanceDB
+helper it started when it started, and uses the answer that ran its vector search (the server's when
+both or neither did); a hook whose own recall went without it waits for the server until its own time
+is up. A server answer without its vector search is used as it is, unless what failed was the
+server's own (its key, its LanceDB helper, or no vector search at all while the hook has one): the
+hook then recalls as well and uses its own if that ran its vector search. An embedding call's failure
+(what the provider answered, the network, the time it took) the hook would meet as well.
+With no server running (the client closed, or its MCP server disabled), or one that says it is busy,
+the hook recalls itself at once, as before; an answer that comes after the hook is done is dropped,
+and one that failed, or came back empty because its read did not finish (the store unreadable, or its
+time up), is replaced by the hook's own. A prompt
+hook that asked says how it went on stderr (`CODEX_RECALL_RESIDENT:answered`, `slow`, `late`,
+`without_vectors:<gap>`, `busy`, `refused`, `unproven`, `none`, or `failed:<reason>`). The server
+writes no memory; its query embedding's cost is recorded in the spend ledger like any other, and so is
+the hook's when both recalled. A server with a recall past the time its hook gave it tells every hook
+that it is busy until that recall ends, and one that does not prove itself within 0.5 s loses its name
+until its own check, every 2 s, finds it answering in time. The server keeps the handler it recalls with from
+one prompt to the next, and with it its LanceDB table open and its embedding worker connected: made anew for
+each prompt, they took 3.9-4.1 s of every recall on the pilot, and two of five lost their vector search to the
+time, where a kept one answers in 1.6-2.1 s. One recall uses it at a time; another that comes meanwhile is
+recalled by a handler of its own, as before. It is made anew when the env file or the runtime config changed,
+after a recall that raised, or when its runtime could not be attached. A recall that fails in the server is answered as
+failed, with the last frames of its traceback on the server's stderr (the client's MCP log). It reads its key again at the next prompt
+after its env file or the runtime config changed, or when it could not read them before. A server
+started before an upgrade is not asked until its client restarts. Each open client keeps the LanceDB
+helper of its kept handler open, and one more ready for a recall that comes while that one is busy: about
+550 MB of committed memory each, which the system pages out while they are idle. Each prompt hook still starts one of its own, which
+ends with the hook, once its import is done, when the hook did not need it.
+
+Claude Code or Codex on another machine attaches the same way, under a name of its own, and reaches
+its entry here over HTTP on a private network: [remote-entries.md](remote-entries.md).
 
 A Codex that keeps its own store today: pause its autostart, move `codex-installation.json` and
 `data` aside, attach it with `--host codex` (its routes are the moved `data\runtime-config.json`),
@@ -149,7 +194,7 @@ for a Hermes home.
 ## Check
 
 ```text
-scope-recall entries --root F:\ScopeRecall\shared
+scope-recall entries --root D:\ScopeRecall\shared
 scope-recall doctor --host hermes --instance-root <home>
 ```
 

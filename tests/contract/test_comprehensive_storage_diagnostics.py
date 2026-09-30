@@ -1,4 +1,5 @@
 """Real SQLite diagnostic and durable replay boundaries; no models or production data."""
+from contextlib import closing
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 import json
@@ -229,6 +230,33 @@ def test_doctor_exposes_deferred_work_even_when_no_job_was_enqueued(tmp_path, mo
     assert app.storage.path.read_bytes() == before
 
 
+def test_doctor_calls_blocked_the_inbox_rows_no_replay_will_store(tmp_path, monkeypatch):
+    """Rows never tried, passing failures, a bare ``SOURCE_MISSING`` an older release left and a key collision are
+    taken by the next pass; a final failure stays blocked, and so does a row given up, which is counted apart for
+    ``retry-failures``."""
+    from scope_recall.core import capture_inbox
+    from v11_support import source_event
+
+    app, ctx = _doctor_app(tmp_path, monkeypatch)
+    from scope_recall._version import __version__
+
+    later = (datetime.now(timezone.utc) + timedelta(minutes=40)).strftime('%Y-%m-%dT%H:%M:%SZ')
+    codes = (None, 'STORAGE_UNAVAILABLE', 'SOURCE_MISSING', 'VERSION_CONFLICT', 'VERSION_CONFLICT:rekeyed',
+             'SOURCE_MISSING:TEST-final', f'DEFERRED|{__version__}|{later}|1|replay|IDENTITY_UNBOUND:TEST',
+             f'DEFERRED|0.0.1|{later}|3|rekey|TypeError', f'GAVE_UP|{__version__}|24|replay|TypeError',
+             'GAVE_UP|0.0.1|24|rekey|TypeError')
+    for index, code in enumerate(codes):
+        event = source_event(source_event_key=f'TEST-inbox-{index}', content=f'TEST 第{index}条。')
+        token, _prepared = capture_inbox.enqueue(app.storage, app.clock, ctx, event, scope_id='TEST-scope',
+                                                 host_scope=None)
+        with app.storage.write(ctx) as tx:
+            tx._check(write=True).execute('UPDATE capture_inbox SET last_error_code=? WHERE token=?', (code, token))
+    result = doctor.run_doctor(host='hermes', instance_root=ctx.binding.data_directory)
+    # Put off, by any release: blocked until its time is up; given up: blocked until an operator returns it.
+    assert (result.capture_inbox, result.capture_inbox_blocked, result.capture_inbox_given_up) == (10, 6, 2)
+    assert 'capture_ingress_blocked' in result.capability_gaps
+
+
 def test_doctor_reports_the_footprint_the_growth_and_a_budget(tmp_path, monkeypatch):
     """Bytes on disk and the week's growth are what an operator needs to see a
     store outgrow its disk before it does; a budget makes that a gap."""
@@ -279,18 +307,31 @@ def test_doctor_reads_a_shared_worker_config_past_64_kb(tmp_path, monkeypatch):
     assert {'name': 'vector_threshold', 'result': 'invalid', 'detail': 'ValueError'} in result.checks
 
 
+def _schema_facts(path):
+    """What a schema step changes: the recorded and stamped versions, and every table, index and column."""
+    with closing(sqlite3.connect(path.as_uri() + '?mode=ro', uri=True)) as conn:
+        return (conn.execute('PRAGMA user_version').fetchone()[0],
+                conn.execute('SELECT schema_version FROM instance_meta').fetchone()[0],
+                sorted(conn.execute('SELECT type,name,sql FROM sqlite_master').fetchall(), key=lambda row: row[:2]))
+
+
 def test_doctor_reports_a_pending_schema_upgrade_without_applying_it(tmp_path, monkeypatch):
     """A package upgrade leaves the store one schema behind until its first
     ordinary open brings it forward.  The doctor is read-only, so it names the
-    pending step instead of failing on a store it will not touch."""
+    pending step instead of failing on a store it will not touch.  Both what the
+    store holds and its bytes are compared: the schema facts say no step was
+    applied, the bytes that nothing was written.  (The bytes failed at random on
+    CI while the step's own connection was left to the garbage collector, which
+    moved its pages from the WAL into the file when it pleased, 3.4.0rc10.)"""
     app, ctx = _doctor_app(tmp_path, monkeypatch)
     capture(app, ctx, 'TEST-upgrade/1', 'TEST pending upgrade')
     downgrade_store(app.storage.path, 1108)
-    before = app.storage.path.read_bytes()
+    before, image = _schema_facts(app.storage.path), app.storage.path.read_bytes()
+    assert before[:2] == (1108, 1108)
     result = doctor.run_doctor(host='hermes', instance_root=ctx.binding.data_directory)
     assert 'schema_upgrade_pending' in result.capability_gaps and result.schema_version == 1108
     assert next(item for item in result.checks if item['name'] == 'schema')['result'] == 'upgrade_pending'
-    assert app.storage.path.read_bytes() == before
+    assert _schema_facts(app.storage.path) == before and app.storage.path.read_bytes() == image
     assert app.status(ctx).schema_version == 1110
     result = doctor.run_doctor(host='hermes', instance_root=ctx.binding.data_directory)
     assert 'schema_upgrade_pending' not in result.capability_gaps and result.schema_version == 1110
@@ -385,3 +426,20 @@ def test_remote_coverage_compares_the_sqlite_expectation(tmp_path, monkeypatch):
     facts = doctor._remote_vector_facts(config, config.binding, expected_points=5)
     assert facts['expected_points'] == 5 and facts['coverage_delta'] == 2
     assert doctor._remote_vector_facts(None, config.binding, expected_points=5) is None
+def test_the_downgrade_leaves_nothing_for_the_garbage_collector(tmp_path, monkeypatch):
+    """The schema test's byte comparison passed without the downgrade closing its connection unless the collector
+    ran at the wrong moment (review of rc10); with collection held back, a connection left to it shows."""
+    import gc
+
+    app, ctx = _doctor_app(tmp_path, monkeypatch)
+    capture(app, ctx, 'TEST-upgrade/2', 'TEST nothing left behind')
+    path = app.storage.path
+    gc.collect()
+    gc.disable()
+    try:
+        downgrade_store(path, 1108)
+        before = path.read_bytes()
+        gc.collect()
+        assert path.read_bytes() == before
+    finally:
+        gc.enable()

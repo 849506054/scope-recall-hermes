@@ -37,8 +37,29 @@ def retraction_after(conn, scope_ids, epoch: int) -> bool:
     ).fetchone() is not None
 
 
+def purge_work_ref(operation_id: str, scope_id: str) -> str:
+    """The subject of one scope's purge work for a delete operation."""
+    return f"{operation_id}:{scope_id}"
+
+
+def purge_work_parts(ref: str) -> tuple[str, str]:
+    """``(operation_id, scope_id)`` of a purge work subject.
+
+    The operation id holds no colon and a scope id may hold several (``workspace:6:hermes|agent:7:...``): the
+    subject splits at its first colon.  The worker split it at the last, found no such operation, and marked every
+    delete's purge on such a store obsolete, leaving the deleted text and its vectors on disk behind the read block.
+    """
+    operation_id, _colon, scope_id = str(ref).partition(":")
+    return operation_id, scope_id
+
+
 def group_digest(binding,scope_id,project_id,branch_id,group_key):
     return hashlib.sha256(canonical([binding.installation_id,scope_id,project_id,branch_id,group_key]).encode()).hexdigest()
+
+
+def purged_group_key(group_key: str) -> str:
+    """The key a purge gives a deleted source group's rows (``purge_sqlite``), by which they are still found."""
+    return "removed-"+hashlib.sha256(group_key.encode()).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -192,8 +213,43 @@ class Deletions:
         if delete:
             for scope in sorted({t.scope_id for t in targets}):
                 conn.execute("INSERT INTO work_items(work_type,subject_ref,subject_revision,scope_id,project_id,branch_id,available_at) VALUES ('purge',?,1,?,?,?,?)",
-                             (op+":"+scope,scope,ctx.project_id,ctx.branch_id,canonical_time(now)))
+                             (purge_work_ref(op,scope),scope,ctx.project_id,ctx.branch_id,canonical_time(now)))
         return op
+
+    def requeue_unfinished_purges(self,*,now: str,limit: int = 8) -> int:
+        """Give once more the purge a worker marked obsolete before it removed anything.
+
+        Up to 3.4.0rc8 the worker read a purge's operation id at the last colon of its subject (see
+        ``purge_work_parts``), so every delete's purge on a store whose scope ids hold colons was marked obsolete
+        and the operation's physical layers stayed pending.  Such a row, obsolete within three attempts, whose
+        delete operation still has a layer to remove, goes back to pending under a new lease token; each try counts
+        an attempt, so one that keeps ending obsolete stops being queued.
+        """
+        conn = self._tx._check(write=True)
+        # The obsolete purges looked at, not the ones queued, are bounded: a row that never qualifies must not hide
+        # the ones after it.  Up to three attempts allows one transient retry before the obsolete one.
+        rows = conn.execute("""SELECT work_id,subject_ref FROM work_items WHERE work_type='purge' AND state='obsolete'
+            AND last_error_code='authority_revoked' AND attempt<=3 ORDER BY work_id LIMIT 256""").fetchall()
+        requeued = 0
+        for row in rows:
+            if requeued >= limit:
+                break
+            operation_id,scope_id = purge_work_parts(row["subject_ref"])
+            if scope_id not in self._tx.context.allowed_scope_ids:
+                continue
+            try:
+                receipt = self.receipt(operation_id)
+            except ContractError:
+                continue
+            if receipt is None or receipt["mode"] != "delete":
+                continue
+            layers = receipt["layers"]
+            if layers.get("sqlite_active") == "removed" and layers.get("vector_active") == "removed":
+                continue
+            requeued += conn.execute("""UPDATE work_items SET state='pending',available_at=?,lease_token=lease_token+1,
+                lease_owner=NULL,lease_until=NULL,last_error_code='purge_requeued' WHERE work_id=? AND state='obsolete'""",
+                (now,row["work_id"])).rowcount
+        return requeued
 
     def apply_blocks(self,op,targets,*,delete: bool,now: str | None = None):
         conn = self._tx._check(write=True)
@@ -202,10 +258,47 @@ class Deletions:
             if row is None:
                 raise ContractError("SOURCE_MISSING", "deletion_operation")
             now = row["created_at"]
-        # Pending captures have no public source ref yet. Cancel the affected
-        # partition conservatively so a delayed event cannot undo forgetting.
-        for scope, project, branch in {(t.scope_id, t.project_id, t.branch_id) for t in targets}:
-            conn.execute("DELETE FROM capture_inbox WHERE scope_id=? AND project_id IS ? AND branch_id IS ?", (scope, project, branch))
+        # Pending captures have no public source ref yet: a row of the affected
+        # partition that holds a deleted message (``capture_inbox.holds``; the
+        # targets are the whole closure, a deleted claim's sources included) is
+        # cancelled, so that a delayed capture cannot undo the delete.  Every
+        # other row is kept, whichever client sent it: cancelling the whole
+        # partition lost words nothing had forgotten, from a row put off for
+        # hours, a key collision waiting for its new key (reviews of rc10), or
+        # another client's capture waiting for the next pass (rc13).  A suppress
+        # leaves the inbox alone: what arrives of the same message, or restates
+        # a suppressed claim, is suppressed as it is stored, and cancelling what
+        # merely held its words lost captures the contract keeps
+        # (``docs/deletion-contract.md``, reviews of rc10).
+        from .capture_inbox import deleted_text, holds, taking_a_new_key
+
+        digests, groups, versions = set(), set(), set()
+        for target in targets:
+            for digest, group, revision in conn.execute(
+                    "SELECT content_sha256,source_group_key,source_revision FROM source_events WHERE event_id=?",
+                    (target.ref,)).fetchall():
+                digests.add(digest)
+                groups.add(group)
+                versions.add((group, revision))
+        texts: list[frozenset[tuple[str, str]]] = []
+
+        def forgotten_texts() -> frozenset[tuple[str, str]]:
+            # Each version of a deleted message is put together once, and only when a waiting row is looked into:
+            # put together for each of its segments, under the writer lease, a delete of long messages took seconds.
+            if not texts:
+                texts.append(frozenset(deleted_text("".join(content for (content,) in conn.execute(
+                    "SELECT content FROM source_events WHERE source_group_key=? AND source_revision=? ORDER BY segment_index",
+                    version))) for version in versions))
+            return texts[0]
+
+        for scope, project, branch in ({(t.scope_id, t.project_id, t.branch_id) for t in targets} if delete else ()):
+            for token, code in conn.execute(
+                    "SELECT token,last_error_code FROM capture_inbox WHERE scope_id=? AND project_id IS ? AND branch_id IS ?",
+                    (scope, project, branch)).fetchall():
+                # One payload at a time: the inbox holds up to 64 MB.
+                if holds(conn.execute("SELECT payload_json FROM capture_inbox WHERE token=?", (token,)).fetchone()[0],
+                         frozenset(digests), frozenset(groups), forgotten_texts(), rekeyed=taking_a_new_key(code)):
+                    conn.execute("DELETE FROM capture_inbox WHERE token=?", (token,))
         for target in targets:
             conn.execute("DELETE FROM consolidation_fragments WHERE work_id IN (SELECT work_id FROM work_items WHERE subject_ref=?)", (target.ref,))
             conn.execute("""INSERT INTO object_blocks(object_kind,object_ref,scope_id,project_id,branch_id,read_blocked,suppressed,operation_id)
@@ -243,16 +336,42 @@ class Deletions:
         # internals. VACUUM/checkpoint inventory remains explicit maintenance.
         conn.execute("PRAGMA secure_delete=ON")
         members = conn.execute("SELECT object_kind,object_ref FROM deletion_members WHERE operation_id=?",(operation_id,)).fetchall()
+        # What a purge keeps of each version of a deleted message to know a later copy under its key by, once its
+        # words are gone: digests of them spaced otherwise and of their letters and digits (``capture_inbox.
+        # deleted_forms``, compared by ``Transaction.refuse_under_a_deleted_key``).  Read before any group key below
+        # is replaced (review of rc13).
+        from .capture_inbox import deleted_forms
+        forms,versions,groups = {},{},set()
+        for kind,ref in members:
+            if kind != "event":
+                continue
+            for group,revision in conn.execute("SELECT source_group_key,source_revision FROM source_events WHERE event_id=?",(ref,)).fetchall():
+                # Once per version, not once per part: joined and read again for each part of a long message, a purge
+                # took seconds under the writer lease (review of rc13).
+                if (group,revision) not in versions:
+                    text = "".join(content for (content,) in conn.execute(
+                        "SELECT content FROM source_events WHERE source_group_key=? AND source_revision=? ORDER BY segment_index",(group,revision)))
+                    versions[group,revision] = sorted(deleted_forms(text)) if text else []
+                forms[ref,revision] = versions[group,revision]
+                groups.add(group)
+        # Each group key is replaced once, by the key ``purged_group_key`` gives: replaced for each of its parts, a
+        # long message's key had been hashed once a part, and a later capture under it could not find its rows
+        # (review of rc13).  A key an earlier purge left stays as it is.
+        for group in sorted(groups):
+            if not group.startswith("removed-"):
+                conn.execute("UPDATE source_events SET source_group_key=? WHERE source_group_key=?",(purged_group_key(group),group))
         for kind,ref in members:
             if kind == "event":
-                groups = conn.execute("SELECT DISTINCT source_group_key FROM source_events WHERE event_id=?",(ref,)).fetchall()
-                for group in groups:
-                    replacement = "removed-"+hashlib.sha256(group[0].encode()).hexdigest()
-                    conn.execute("UPDATE source_events SET source_group_key=? WHERE source_group_key=?",(replacement,group[0]))
                 lexical_index.forget(conn, ref)
-                conn.execute("""UPDATE source_events SET content='',source_event_key='removed-'||event_id,
-                    extra_json='{"evidence_refs":[]}',source_original_origin=NULL,dataset_id=NULL,
-                    capture_state='gap',capture_gaps_json='["deleted"]' WHERE event_id=?""",(ref,))
+                # A row already purged keeps what it has: a restore purges its file again, and written over from its
+                # empty text, the digests a first purge kept were lost; a row purged before rc13 keeps having none
+                # (review of rc13).
+                for (revision,) in conn.execute("SELECT DISTINCT source_revision FROM source_events WHERE event_id=?",(ref,)).fetchall():
+                    conn.execute("""UPDATE source_events SET content='',source_event_key='removed-'||event_id,
+                        extra_json=CASE WHEN source_event_key='removed-'||event_id THEN extra_json ELSE ? END,
+                        source_original_origin=NULL,dataset_id=NULL,
+                        capture_state='gap',capture_gaps_json='["deleted"]' WHERE event_id=? AND source_revision=?""",
+                        (canonical({"evidence_refs":[],"deleted_forms":forms.get((ref,revision),[])}),ref,revision))
             elif kind == "claim":
                 conn.execute("UPDATE claims SET subject='',predicate='' WHERE claim_id=?",(ref,))
                 conn.execute("UPDATE claim_versions SET payload_json='{}' WHERE claim_id=?",(ref,))

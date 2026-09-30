@@ -25,8 +25,10 @@ Not responsible for performing the compaction (``store.LanceVectorStore
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -46,6 +48,19 @@ COOLDOWN = timedelta(minutes=15)
 #: from the thing it reports on.
 STATE_FILENAME = "compaction-state.json"
 STATE_SCHEMA = "scope-recall.vector-compaction.v1"
+#: The last look at the store's nearest-neighbour index (``runtime/vector_upkeep.index_if_due``), beside it too.
+INDEX_STATE_FILENAME = "index-state.json"
+INDEX_STATE_SCHEMA = "scope-recall.vector-index.v1"
+#: Where the backfill of an import's embeddings stopped (``runtime/vector_upkeep.backfill_if_due``), beside them.
+EMBED_BACKFILL_STATE_SCHEMA = "scope-recall.embed-backfill.v1"
+
+
+def embed_backfill_filename(scope_ids, project_id: str | None, branch_id: str | None) -> str:
+    """The backfill state of one worker partition: each worker queues only its own imports (its scopes, project and
+    branch), so one file for the store let a worker with none write ``finished`` for another's, which then waited a
+    day and went on from the wrong place."""
+    key = json.dumps([sorted(scope_ids), project_id, branch_id], separators=(",", ":"))
+    return f"embed-backfill-{hashlib.sha256(key.encode('utf-8')).hexdigest()[:16]}.json"
 
 
 @dataclass(frozen=True)
@@ -115,6 +130,8 @@ def instance_vector_footprints(data_directory: Path) -> list[dict[str, Any]]:
         except OSError:
             continue
         state = read_state(space)
+        index = read_state(space, filename=INDEX_STATE_FILENAME, schema=INDEX_STATE_SCHEMA)
+        backfill = _backfill_report(space, datetime.now(timezone.utc))
         for table in tables:
             footprint = measure_footprint(db_path, table.stem)
             reports.append(
@@ -126,31 +143,62 @@ def instance_vector_footprints(data_directory: Path) -> list[dict[str, Any]]:
                     "last_compaction_at": state.get("finished_at"),
                     "last_compaction_outcome": state.get("outcome"),
                     "compaction_overdue": footprint.fragments > FRAGMENT_THRESHOLD,
+                    "last_index_check_at": index.get("checked_at"),
+                    "index_outcome": index.get("outcome"),
+                    **backfill,
                 }
             )
     return reports
 
 
-def read_state(storage_dir: Path) -> dict[str, Any]:
-    """Last compaction outcome, or an empty mapping when there has been none."""
+#: A backfill partition looked at within this long still has a worker: each looks at least once a day.
+EMBED_BACKFILL_CURRENT = timedelta(days=2)
+_BACKFILL_NAME = re.compile(r"embed-backfill-[0-9a-f]{16}\.json")
+
+
+def _backfill_report(space: Path, now: datetime) -> dict[str, Any]:
+    """The import backfill's outcome for one vector store.  A backfill that failed was written down, tried again on
+    every pass and read by nothing.  Each worker partition keeps its own state (``embed_backfill_filename``): the
+    store's outcome is a failed one's, else the latest.  A partition no worker has looked at for
+    ``EMBED_BACKFILL_CURRENT`` (a retry lane, a workspace used once) is left out of it, or its last failure would
+    stand for good."""
+    states = [state for state in (read_state(space, filename=path.name, schema=EMBED_BACKFILL_STATE_SCHEMA)
+                                  for path in sorted(space.glob("embed-backfill-*.json"))
+                                  if _BACKFILL_NAME.fullmatch(path.name)) if state]
+    current = [state for state in states
+               if (checked := _parse_time(state.get("checked_at"))) is not None and now - checked <= EMBED_BACKFILL_CURRENT]
+    failed = [state for state in current if state.get("outcome") == "failed"]
+    latest = max(current or states, key=lambda state: str(state.get("checked_at") or ""), default={})
+    return {
+        "last_embed_backfill_at": latest.get("checked_at"),
+        "embed_backfill_outcome": "failed" if failed else latest.get("outcome"),
+        "embed_backfill_error": (failed[0] if failed else latest).get("error") if (
+            failed or latest.get("outcome") == "failed") else None,
+        "embed_backfill_queued_total": sum(int(state.get("queued_total") or 0) for state in states) if states else None,
+    }
+
+
+def read_state(storage_dir: Path, *, filename: str = STATE_FILENAME, schema: str = STATE_SCHEMA) -> dict[str, Any]:
+    """Last compaction outcome (or, with the index names, index outcome); empty when there has been none."""
     try:
-        raw = json.loads((Path(storage_dir) / STATE_FILENAME).read_text(encoding="utf-8"))
+        raw = json.loads((Path(storage_dir) / filename).read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return {}
-    if not isinstance(raw, dict) or raw.get("schema") != STATE_SCHEMA:
+    if not isinstance(raw, dict) or raw.get("schema") != schema:
         return {}
     return raw
 
 
-def write_state(storage_dir: Path, payload: dict[str, Any]) -> None:
+def write_state(storage_dir: Path, payload: dict[str, Any], *, filename: str = STATE_FILENAME,
+                schema: str = STATE_SCHEMA) -> None:
     """Record an outcome.  Never raises: this is a report, not a commitment."""
     directory = Path(storage_dir)
-    record = {"schema": STATE_SCHEMA, **payload}
+    record = {"schema": schema, **payload}
     try:
         directory.mkdir(parents=True, exist_ok=True)
-        partial = directory / f"{STATE_FILENAME}.partial"
+        partial = directory / f"{filename}.partial"
         partial.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
-        os.replace(partial, directory / STATE_FILENAME)
+        os.replace(partial, directory / filename)
     except OSError:
         return
 
@@ -188,11 +236,15 @@ def _parse_time(value: Any) -> datetime | None:
 
 __all__ = [
     "COOLDOWN",
+    "EMBED_BACKFILL_STATE_SCHEMA",
     "FRAGMENT_THRESHOLD",
+    "INDEX_STATE_FILENAME",
+    "INDEX_STATE_SCHEMA",
     "STATE_FILENAME",
     "STATE_SCHEMA",
     "VectorFootprint",
     "compaction_due",
+    "embed_backfill_filename",
     "instance_vector_footprints",
     "measure_footprint",
     "read_state",

@@ -20,6 +20,7 @@ from typing import Any, Literal
 import scope_recall
 from scope_recall.contracts import TrustedContext
 from scope_recall.core import CoreConfig, MemoryCore
+from scope_recall.core.capture_inbox import given_up, replayable
 from scope_recall.core.schema import SCHEMA_VERSION, UPGRADE_CHAIN, stale_header_schema
 from scope_recall.core.storage import SQLiteStorage
 from scope_recall.core.failure_retry import NEEDS_REVIEW_COUNT
@@ -76,6 +77,8 @@ class DoctorReport:
     recent_output_truncations: int = 0
     capture_inbox: int = 0
     capture_inbox_blocked: int = 0
+    #: Of those, rows a replay gave up after its tries (``retry-failures --apply`` returns them to it).
+    capture_inbox_given_up: int = 0
     extraction_outcomes: dict[str, int] = field(default_factory=dict)
     autostart_status: str = "not_registered"
     worker_status: dict[str, Any] = field(default_factory=dict)
@@ -208,13 +211,6 @@ def _load_binding(host: HostChoice, instance_root: Path):
     return config.to_binding(), config.data_directory
 
 
-#: Embedded objects beyond which a brute-force vector scan stops being free and
-#: an approximate index starts to earn its complexity. Below it an ANN index is
-#: a net loss: it costs build time and recall for a search that already answers
-#: in milliseconds. Reported rather than acted on, so the day the corpus crosses
-#: it is visible instead of arriving as unexplained latency.
-_VECTOR_SCAN_COMFORT_LIMIT = 100_000
-
 
 def _journal_mode(db_path: Path) -> str | None:
     with suppress(sqlite3.Error, OSError, ValueError):
@@ -296,8 +292,6 @@ def _check_index(report: DoctorReport, data_directory: Path, *, store_readable: 
     expired = None if by_reason is None else sum(by_reason.values())
     if embedded is not None:
         metadata["embedded_objects"] = embedded
-        metadata["vector_scan_comfort_limit"] = _VECTOR_SCAN_COMFORT_LIMIT
-        metadata["vector_index_advised"] = embedded - (expired or 0) > _VECTOR_SCAN_COMFORT_LIMIT
     if expired is not None:
         metadata["expired_vectors"] = expired
         metadata["expired_vectors_by_reason"] = by_reason
@@ -305,7 +299,8 @@ def _check_index(report: DoctorReport, data_directory: Path, *, store_readable: 
     if vector is not None:
         metadata["tool_output_retention_days"] = vector.tool_output_retention_days
     # Fragment count is what a missed compaction shows up as first, and the one
-    # cost an operator can verify with a plain file listing.
+    # cost an operator can verify with a plain file listing.  Each store also
+    # says whether its nearest-neighbour index was built (``index_outcome``).
     try:
         metadata["vector_stores"] = instance_vector_footprints(data_directory)
     except Exception:  # noqa: BLE001 - reporting must not fail the report.
@@ -429,6 +424,7 @@ _WORKER_STATUS_KEYS = frozenset({
     "last_success_at", "completed", "failed", "retried", "deferred", "recovered",
     "daily_queue_used", "capability_gaps", "unavailable_work_types",
     "pending_work", "failed_work", "oldest_pending_at", "worker_error",
+    "ingress_deferred", "ingress_given_up",
 })
 
 
@@ -671,7 +667,10 @@ def _check_storage(report: DoctorReport, binding, data_directory: Path) -> bool:
             status = transaction.status(include_all_projects=True, include_admission=True)
             conn = transaction._check()
             report.capture_inbox = conn.execute("SELECT count(*) FROM capture_inbox").fetchone()[0]
-            report.capture_inbox_blocked = conn.execute("SELECT count(*) FROM capture_inbox WHERE last_error_code IS NOT NULL AND last_error_code NOT IN ('STORAGE_UNAVAILABLE','DEADLINE_EXCEEDED')").fetchone()[0]
+            moment = datetime.now(timezone.utc)
+            codes = [code for (code,) in conn.execute("SELECT last_error_code FROM capture_inbox")]
+            report.capture_inbox_blocked = sum(not replayable(code, moment) for code in codes)
+            report.capture_inbox_given_up = sum(given_up(code) for code in codes)
             report.recent_work_errors = [dict(r) for r in conn.execute("SELECT work_id,lease_token,stage,error_code,error_field,recorded_at FROM work_error_details ORDER BY detail_id DESC LIMIT 16")]
             moment = datetime.now(timezone.utc)
             hour_ago = (moment - timedelta(hours=1)).isoformat()

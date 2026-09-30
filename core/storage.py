@@ -20,7 +20,7 @@ from .writer_lease import TruthWriterBusyError
 from . import lexical_index
 from .schema import (APPLICATION_ID, SCHEMA_VERSION, STATEMENTS, UPGRADE_CHAIN, stale_header_schema, upgrade_1105,
                      upgrade_1106, upgrade_1107, upgrade_1108, upgrade_1109)
-from .events import lexical_terms, prepare_capture, query_terms, stored_content_digest
+from .events import lexical_terms, prepare_capture, query_terms, segment_key, stored_content_digest
 
 #: How often a writer looks again for another process's lease while it waits.
 _LEASE_POLL_SECONDS = 0.01
@@ -262,7 +262,7 @@ class Transaction:
         source = self.source('event-' + hashlib.sha256(identity.encode('utf-8')).hexdigest(), revision)
         if source is not None:
             return source
-        first_key = 'segmented-' + hashlib.sha256(source_event_key.encode('utf-8')).hexdigest() + '/0'
+        first_key = segment_key(source_event_key, 0)
         identity = _json([self.context.binding.installation_id, first_key])
         source = self.source('event-' + hashlib.sha256(identity.encode('utf-8')).hexdigest(), revision)
         if source is not None and source.event.get('segment', {}).get('group_key') == source_event_key:
@@ -402,6 +402,111 @@ class Transaction:
             AND NOT EXISTS(SELECT 1 FROM json_each(v.payload_json,'$.conditions') WHERE instr(?,value)=0) LIMIT 1""",
             (scope_id, self.context.project_id, self.context.branch_id, content, content, content, content)).fetchone() is not None
 
+    def _copies_a_suppressed_source(self, conn, scope_id: str, group_key: str, event) -> bool:
+        """A capture given a new key because another message held its key (``capture_inbox.REKEY_MARKER``) that is a
+        copy of a suppressed or deleted message is suppressed with it.  Its new key is a group of its own, which the
+        first message's suppression does not reach: a suppressed message sent again under a colliding key came back to
+        automatic recall (rc13).  A copy has the same role and words as a suppressed part in the same scope, project
+        and branch (a digest outlasts a purge), or holds the words of the message whose key it took, compared as a
+        delete compares them (``capture_inbox.holds``: whitespace aside, and so on).  A source group is suppressed
+        whole: a part that is a copy suppresses the parts of its group stored before it and after it (review of
+        rc13)."""
+        from .capture_inbox import REKEY_MARKER, deleted_text, holds_events
+        if REKEY_MARKER not in group_key:
+            return False
+        partition = (scope_id, self.context.project_id, self.context.branch_id)
+        if conn.execute("""SELECT 1 FROM source_events WHERE source_group_key=? AND scope_id=? AND project_id IS ?
+                           AND branch_id IS ? AND suppressed=1 LIMIT 1""", (group_key, *partition)).fetchone():
+            return True
+        copy = conn.execute(
+            """SELECT 1 FROM source_events WHERE scope_id=? AND role=? AND content_sha256=? AND project_id IS ?
+               AND branch_id IS ? AND suppressed=1 LIMIT 1""",
+            (scope_id, event["role"], hashlib.sha256(event["content"].encode("utf-8")).hexdigest(),
+             self.context.project_id, self.context.branch_id)).fetchone() is not None
+        if not copy:
+            taken = conn.execute(
+                """SELECT content FROM source_events WHERE source_group_key=? AND scope_id=? AND project_id IS ?
+                   AND branch_id IS ? AND role=? AND suppressed=1 AND content<>''""",
+                (group_key.split(REKEY_MARKER, 1)[0], *partition, event["role"])).fetchall()
+            copy = bool(taken) and holds_events([event], frozenset(), frozenset(),
+                                                frozenset(deleted_text(row["content"]) for row in taken), rekeyed=True)
+        if copy:
+            conn.execute("""UPDATE source_events SET suppressed=1 WHERE source_group_key=? AND scope_id=?
+                            AND project_id IS ? AND branch_id IS ?""", (group_key, *partition))
+        return copy
+
+    def _source_ref(self, key: str) -> str:
+        return "event-" + hashlib.sha256(_json([self.context.binding.installation_id, key]).encode("utf-8")).hexdigest()
+
+    def refuse_under_a_deleted_key(self, events, *, scope_id: str) -> None:
+        """Refuse a message under a deleted message's key or source group, or tell another message from it.
+
+        The deletion contract's least unit is a source group, with its later versions and missing parts: a revision
+        the deleted group never stored, and a part sent without the message's first, are refused.  A whole message is
+        compared with the deleted one, all its parts together (a first part changed by one character had let the
+        second through, word for word): a part with a deleted part's digest; while the deleted words are kept, all of
+        them held or a near copy, as a delete compares waiting captures (``capture_inbox.holds_events``); after the
+        purge, the same words spaced, cased or punctuated otherwise (``capture_inbox.deleted_forms``).  A copy is
+        refused (``source_unavailable``).  Anything else is a key collision (``VERSION_CONFLICT``), which the capture
+        inbox stores under a key of its own: a restarted Hermes gateway numbers its turns from 1 again, and a delete
+        removes its own command's key, so the next message at that turn had been refused (reviews of rc13).  After the
+        purge, a copy with words added is not known by anything kept, and is stored as another message.  A key with
+        nothing stored left to compare with (a restored absence) refuses whatever comes."""
+        from .capture_inbox import deleted_forms, deleted_text, holds_events
+        from .delete_storage import group_digest, purged_group_key
+        from .visibility import allowed
+        if not events:
+            return
+        conn = self._check()
+        first = events[0]
+        segment = first.get("segment")
+        group_key = segment["group_key"] if segment else first["source_event_key"]
+        partition = (scope_id, self.context.project_id, self.context.branch_id)
+        hidden = [ref for ref in (self._source_ref(event["source_event_key"]) for event in events)
+                  if not allowed(self, "event", ref)]
+        block = conn.execute("SELECT read_blocked FROM source_group_blocks WHERE group_sha256=?",
+                             (group_digest(self.context.binding, *partition, group_key),)).fetchone()
+        if not hidden and not (block is not None and block["read_blocked"]):
+            return
+        # The deleted message's rows: under the refs this message's parts would take, under its key's own, and under its
+        # group key, before the purge or as the purge left it.  A long message purged before rc13 had its group key
+        # hashed once for each part and is found by none of these: with nothing to compare, it refuses, as it did.
+        refs = sorted({*hidden, self._source_ref(group_key)})
+        rows = conn.execute(
+            f"""SELECT source_revision,segment_index,content,content_sha256,extra_json,
+                       source_event_key='removed-'||event_id AS purged FROM source_events
+                WHERE read_blocked=1 AND (event_id IN ({','.join('?' for _ in refs)})
+                   OR (source_group_key IN (?,?) AND scope_id=? AND project_id IS ? AND branch_id IS ?))""",
+            (*refs, group_key, purged_group_key(group_key), *partition)).fetchall()
+        refuse = ContractError("ACCESS_DENIED", "source_unavailable")
+        if not rows:
+            raise refuse
+        indexes = {event["segment"]["index"] for event in events if event.get("segment")}
+        if first["source_revision"] not in {row["source_revision"] for row in rows} or (indexes and 0 not in indexes):
+            raise refuse
+        versions: dict[int, list] = {}
+        for row in rows:
+            versions.setdefault(row["source_revision"], []).append((row, json.loads(row["extra_json"] or "{}")))
+        texts, kept = set(), set()
+        for parts in versions.values():
+            if all(row["content"] for row, _extra in parts):
+                texts.add(deleted_text("".join(row["content"] for row, _extra in
+                                               sorted(parts, key=lambda part: part[0]["segment_index"]))))
+            elif (all(row["purged"] for row, _extra in parts)
+                  and not any("deleted_forms" in extra for _row, extra in parts)):
+                # Purged before rc13, which kept no forms of the words: nothing tells a near copy there from another
+                # message, so a message under that key is refused, as every release before rc13 refused it.  A deleted
+                # message with no text (attachments alone) is not purged yet, and is compared by its digest (reviews
+                # of rc13).
+                raise refuse
+            kept.update(form for _row, extra in parts for form in extra.get("deleted_forms") or ())
+        ordered = sorted(events, key=lambda event: (event.get("segment") or {}).get("index", 0))
+        if (holds_events(events, frozenset(row["content_sha256"] for row in rows), frozenset(), frozenset(texts),
+                         rekeyed=True)
+                or kept & deleted_forms("".join(event["content"] for event in ordered))):
+            raise refuse
+        raise ContractError("VERSION_CONFLICT", "source_deleted_key")
+
     def put_source(self, event: SourceEvent, *, scope_id: str, persisted_at: str, capture_gaps: tuple[str, ...] = ()) -> SourceWrite:
         conn = self._check(write=True)
         self._scope(scope_id)
@@ -422,9 +527,10 @@ class Transaction:
         provenance = self.context.import_provenance
         # First delivery's recorded_at is retained.  Transport retries may arrive
         # later; occurrence time and all provenance/content fields must agree.
-        identity = _json([self.context.binding.installation_id, event["source_event_key"]])
-        ref = "event-" + hashlib.sha256(identity.encode("utf-8")).hexdigest()
+        ref = self._source_ref(event["source_event_key"])
         from .visibility import allowed
+        # A message under a deleted key has been compared with the deleted one before its parts are stored
+        # (``refuse_under_a_deleted_key``); a hidden key refuses whatever reaches it here.
         if not allowed(self, "event", ref):
             raise ContractError("ACCESS_DENIED", "source_unavailable")
         revision = event["source_revision"]
@@ -447,7 +553,9 @@ class Transaction:
             *(event[k] for k in columns), hashlib.sha256(event["content"].encode("utf-8")).hexdigest(), fingerprint, persisted_at,
             event.get("source_original_origin"), event.get("dataset_id"), _json(extras), group_key, segment_index, segment_total, _json(capture_gaps), provenance_hash,
             self.context.entry_id or "local"))
-        if (group_policy is not None and group_policy["suppressed"]) or self._inherits_suppression(conn, scope_id, event["content"]):
+        if ((group_policy is not None and group_policy["suppressed"])
+                or self._inherits_suppression(conn, scope_id, event["content"])
+                or self._copies_a_suppressed_source(conn, scope_id, group_key, event)):
             conn.execute("UPDATE source_events SET suppressed=1 WHERE event_id=? AND source_revision=?", (ref, revision))
         conn.execute("UPDATE instance_meta SET memory_epoch=memory_epoch+1 WHERE singleton=1")
         return SourceWrite("inserted", ref, revision)
@@ -542,24 +650,82 @@ class Transaction:
             ORDER BY hits DESC,e.occurred_at DESC,e.event_id,e.source_revision DESC LIMIT ?""", (*terms, *scopes,self.context.project_id,self.context.branch_id,limit)).fetchall()
         return tuple(source for row in rows if (source := self.source(row["event_id"], row["source_revision"])) is not None)
 
-    def said_in_session(self, scope_id: str, items: tuple[tuple[str, str, str], ...], *,
+    def said_in_session(self, scope_id: str, items: tuple[tuple[str, str, str, str | None], ...], *,
                         window_seconds: float) -> tuple[bool, ...]:
-        """For each (role, content, occurred_at): whether this session already holds those words from that role,
-        said within ``window_seconds`` of that time.
+        """For each (role, content, occurred_at, host_key): whether this session already holds that message.
 
-        A host that records one message by two routes -- a hook as it happens, its session record later -- asks
-        this before the second: the two keys differ, the words and the moment do not.  The same words said again
-        later are a new message and are not matched.
+        A host that records one message by two routes -- a hook as it happens, its session record later --
+        asks this before the second.  A message the host names is held only under ``host_key``, the key its
+        hook wrote, so the same short words said again are a new message.  One it does not name is held by
+        its words said within ``window_seconds`` of that time.  Each copy answers for one message, and a
+        hook's capture still waiting in the inbox counts as held: the inbox stores it later.
         """
         self._scope(scope_id)
         conn = self._check()
-        answers = []
-        for role, content, occurred_at in items:
-            stamps = conn.execute(
-                "SELECT occurred_at FROM source_events WHERE scope_id=? AND role=? AND content_sha256=? AND session_id=?",
-                (scope_id, role, stored_content_digest(content), self.context.session_id)).fetchall()
-            answers.append(any(_seconds_apart(stamp[0], occurred_at) <= window_seconds for stamp in stamps))
+        waiting = self._waiting_in_inbox(scope_id)
+        waiting_keys = {key for found in waiting.values() for _stamp, key in found}
+        answers = [False] * len(items)
+        # Named messages first, so the same words said again cannot take the copy a named message owns.
+        named = {host_key for *_said, host_key in items if host_key is not None}
+        # A message over 65,536 characters is stored in segments under keys of their own, grouped under the host's
+        # key: looked up by the host's key alone, it was never found, and the Stop's read of the session record
+        # stored a long prompt a second time.  A message stored whole is its own group.
+        # A named message that was deleted counts as said as well: once the delete is purged its rows no longer
+        # carry the key, and a record read stored the words again under a key of the record's (review of rc10).
+        from .delete_storage import group_digest
+
+        for index, (_role, _content, _occurred_at, host_key) in enumerate(items):
+            if host_key is not None:
+                answers[index] = host_key in waiting_keys or conn.execute(
+                    "SELECT 1 FROM source_events WHERE source_group_key=? AND scope_id=? AND session_id=? LIMIT 1",
+                    (host_key, scope_id, self.context.session_id)).fetchone() is not None or conn.execute(
+                    "SELECT 1 FROM source_group_blocks WHERE group_sha256=? AND read_blocked=1",
+                    (group_digest(self.context.binding, scope_id, self.context.project_id, self.context.branch_id,
+                                  host_key),)).fetchone() is not None
+        copies: dict[tuple[str, str], list[tuple[object, str]]] = {}
+        for index, (role, content, occurred_at, host_key) in enumerate(items):
+            if host_key is not None:
+                continue
+            digest = stored_content_digest(content)
+            if (role, digest) not in copies:
+                copies[role, digest] = [(stamp, key) for stamp, key in (*conn.execute(
+                    "SELECT occurred_at,source_group_key FROM source_events "
+                    "WHERE scope_id=? AND role=? AND content_sha256=? AND session_id=?",
+                    (scope_id, role, digest, self.context.session_id)).fetchall(),
+                    *waiting.get((role, digest), ())) if key not in named]
+            found = copies[role, digest]
+            near = [(distance, position) for position, (stamp, _key) in enumerate(found)
+                    if (distance := _seconds_apart(stamp, occurred_at)) <= window_seconds]
+            if near:
+                found.pop(min(near)[1])
+            answers[index] = bool(near)
         return tuple(answers)
+
+    def _waiting_in_inbox(self, scope_id: str) -> dict[tuple[str, str], list[tuple[object, str]]]:
+        """This session's captures a replay of the inbox will still store, by (role, content digest)."""
+        from .capture_inbox import waiting as replays
+
+        waiting: dict[tuple[str, str], list[tuple[object, str]]] = {}
+        for payload, code in self._check().execute(
+                "SELECT payload_json,last_error_code FROM capture_inbox WHERE scope_id=? AND project_id IS ? AND branch_id IS ?",
+                (scope_id, self.context.project_id, self.context.branch_id)):
+            if not replays(code):
+                continue
+            try:
+                body = json.loads(payload)
+            except ValueError:
+                continue
+            if not isinstance(body, dict) or not isinstance(body.get("context"), dict) \
+                    or body["context"].get("session_id") != self.context.session_id:
+                continue
+            for event in body.get("events") or ():
+                if isinstance(event, dict) and type(event.get("content")) is str and type(event.get("role")) is str:
+                    # A segment answers to its message's key, as its stored rows do (``said_in_session``).
+                    segment = event.get("segment")
+                    key = segment.get("group_key") if isinstance(segment, dict) else event.get("source_event_key")
+                    waiting.setdefault((event["role"], stored_content_digest(event["content"])), []).append(
+                        (event.get("occurred_at"), str(key)))
+        return waiting
 
     def enqueue_source(self, ref: str, revision: int, *, work_type: str, available_at: str) -> None:
         conn = self._check(write=True)

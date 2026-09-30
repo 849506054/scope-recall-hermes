@@ -106,6 +106,120 @@ def test_one_pass_finishes_every_page_a_source_owes(app):
     assert _pending_pages(core, ctx) == 0
 
 
+def test_a_page_matches_its_source_outside_the_writer_lease(app, monkeypatch):
+    """Matching a source against every candidate that shares a term is most of a page: inside the page's write it
+    held the writer lease 0.5-7.4 s a page on the shared store (median 1.3 s), and a hook that waited its second
+    for the lease meanwhile lost its capture.  The pass finds the candidates in a read; the write only links."""
+    from scope_recall.contracts import ContractError
+    from scope_recall.core.candidate_intake import CandidateIntake
+
+    core, ctx = app
+    count = SOURCE_MATCH_LIMIT * 3 + 4
+    _candidates(core, ctx, count)
+    trigger = capture(core, ctx, "sharedtoken 提供了统一的新证据。", key="TEST-rc35/read")
+    _finish_source_work(core)
+    under_write, real = [], CandidateIntake._candidates_mentioned_by
+
+    def spy(self, source, limit):
+        try:
+            self._tx._check(write=True)
+            under_write.append(True)
+        except ContractError:
+            under_write.append(False)
+        return real(self, source, limit)
+
+    monkeypatch.setattr(CandidateIntake, "_candidates_mentioned_by", spy)
+    core.drain_worker(ctx, max_items=32, remaining_seconds=10, consolidation=Evaluator())
+
+    assert under_write and not any(under_write), under_write
+    assert _linked(core, trigger.ref) == count
+    assert _trigger(core, trigger.ref) == (count, 0)
+
+
+def test_a_candidate_archived_after_the_page_was_read_takes_no_evidence(app):
+    core, ctx = app
+    refs = _candidates(core, ctx, SOURCE_MATCH_LIMIT * 2 + 4)
+    trigger = capture(core, ctx, "sharedtoken 提供了统一的新证据。", key="TEST-rc35/archived")
+    before = _linked(core, trigger.ref)
+    with core.storage.read(ctx) as tx:
+        page = tx.candidates.next_source_page()
+    assert page is not None and page[0] == trigger.ref and page[2]
+    archived = page[2][0]
+    with sqlite3.connect(core.storage.path) as db:
+        db.execute("UPDATE candidate_lifecycle SET processing_state='archived',reason='TEST_archived' "
+                   "WHERE candidate_ref=? AND candidate_revision=?", archived)
+    with core.storage.write(ctx) as tx:
+        linked = tx.candidates.resume_source_pages(now=core.clock.utc_now(), page=page)
+    assert linked == min(SOURCE_MATCH_LIMIT, len(page[2])) - 1
+    assert _linked(core, trigger.ref) == before + linked
+    with sqlite3.connect(core.storage.path) as db:
+        assert db.execute("SELECT count(*) FROM candidate_evidence WHERE source_ref=? AND candidate_ref=?",
+                          (trigger.ref, archived[0])).fetchone()[0] == 0
+    assert archived[0] in refs
+
+
+def test_the_page_queries_read_the_triggers_first(app):
+    """Both page queries hold the page's write, so they must not start from every source of every scope.
+
+    On 2026-09-27 the shared store (8,819 triggers, 192 truncated, 379 scopes) took 2.7 s to count the pending
+    pages and 3.5 s to find the next one: SQLite started from ``source_events``, whose scope index it could use,
+    and looked up a trigger for every source.  A pass runs up to sixteen pages back to back, so the writer lease
+    was held for a minute at a time and every hook that waited its one second for it failed to capture.
+    """
+    core, ctx = app
+    _candidates(core, ctx, SOURCE_MATCH_LIMIT + 4)
+    capture(core, ctx, "sharedtoken 提供了统一的新证据。", key="TEST-rc35/plan")
+    statements = []
+    with core.storage.write(ctx) as tx:
+        connection = tx._check(write=True)
+        connection.set_trace_callback(statements.append)
+        tx.candidates.pending_source_pages()
+        tx.candidates.resume_source_pages(now=core.clock.utc_now())
+        connection.set_trace_callback(None)
+    page_queries = [sql for sql in statements
+                    if "candidate_source_triggers t" in sql and sql.lstrip().upper().startswith("SELECT")]
+    assert len(page_queries) == 2, statements
+    with sqlite3.connect(core.storage.path) as db:
+        for sql in page_queries:
+            plan = [row[3] for row in db.execute("EXPLAIN QUERY PLAN " + sql)]
+            assert plan[0].startswith("SCAN t"), plan
+
+
+def test_a_pass_gives_a_waiting_writer_its_turn_between_pages(app, monkeypatch):
+    """A page's write ends and the next begins at once; a hook polling for the lease every 10 ms rarely lands in
+    that gap.  The pass waits a moment after each page so a capture waits behind at most one page."""
+    core, ctx = app
+    monkeypatch.setattr(worker, "SOURCE_PAGES_PER_PASS", 3)
+    count = SOURCE_MATCH_LIMIT * 4 + 4
+    _candidates(core, ctx, count)
+    capture(core, ctx, "sharedtoken 提供了统一的新证据。", key="TEST-rc35/turn")
+    _finish_source_work(core)
+    naps = []
+    monkeypatch.setattr(worker.time, "sleep", naps.append)
+
+    core.drain_worker(ctx, max_items=32, remaining_seconds=10, consolidation=Evaluator())
+
+    assert naps.count(worker.PAGE_TURN_SECONDS) == 3, "one turn after each of the pass's three pages"
+    assert worker.PAGE_TURN_SECONDS >= 2 * 0.01, "at least two of a waiting writer's lease polls"
+
+
+def test_a_pass_stops_resuming_pages_once_their_time_is_spent(app, monkeypatch):
+    """A page on the shared store took 0.5-7 s under the writer lease (matching a long source against thousands of
+    candidates), so sixteen of them still held it for half a minute.  Past ``SOURCE_PAGE_SECONDS`` the pass leaves
+    the rest to the next one; the page that was running finishes."""
+    core, ctx = app
+    monkeypatch.setattr(worker, "SOURCE_PAGE_SECONDS", 0.0)
+    count = SOURCE_MATCH_LIMIT * 4 + 4
+    _candidates(core, ctx, count)
+    trigger = capture(core, ctx, "sharedtoken 提供了统一的新证据。", key="TEST-rc35/time")
+    _finish_source_work(core)
+    assert _trigger(core, trigger.ref) == (SOURCE_MATCH_LIMIT, 1)
+
+    core.drain_worker(ctx, max_items=32, remaining_seconds=10, consolidation=Evaluator())
+
+    assert _trigger(core, trigger.ref) == (SOURCE_MATCH_LIMIT * 2, 1), "one page, then the time is spent"
+
+
 def test_a_pass_resumes_at_most_its_page_allowance(app, monkeypatch):
     core, ctx = app
     monkeypatch.setattr(worker, "SOURCE_PAGES_PER_PASS", 2)
@@ -120,3 +234,22 @@ def test_a_pass_resumes_at_most_its_page_allowance(app, monkeypatch):
     core.drain_worker(ctx, max_items=32, remaining_seconds=10, consolidation=Evaluator())
     assert _trigger(core, trigger.ref) == (count, 0)
     assert _pending_pages(core, ctx) == 0
+
+
+def test_a_page_another_drain_linked_first_does_not_close_the_trigger(app):
+    """Two drains read the same page; the first links it, the second finds every link taken.  Closing on that
+    empty page left the candidates past it without this source: the second write finds the next page itself."""
+    core, ctx = app
+    count = SOURCE_MATCH_LIMIT * 3 + 4
+    _candidates(core, ctx, count)
+    trigger = capture(core, ctx, "sharedtoken 提供了统一的新证据。", key="TEST-rc35/race")
+    with core.storage.read(ctx) as tx:
+        first = tx.candidates.next_source_page()
+    with core.storage.read(ctx) as tx:
+        second = tx.candidates.next_source_page()
+    assert first == second
+    with core.storage.write(ctx) as tx:
+        assert tx.candidates.resume_source_pages(now=core.clock.utc_now(), page=first) == SOURCE_MATCH_LIMIT
+    with core.storage.write(ctx) as tx:
+        assert tx.candidates.resume_source_pages(now=core.clock.utc_now(), page=second) == SOURCE_MATCH_LIMIT
+    assert _trigger(core, trigger.ref) == (SOURCE_MATCH_LIMIT * 3, 1)

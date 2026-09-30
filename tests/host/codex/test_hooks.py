@@ -301,6 +301,73 @@ def test_interrupt_and_session_end_are_host_generated_without_model_calls(handle
     assert origins == ["host_generated", "host_generated"]
 
 
+def test_a_recall_that_found_the_store_unreadable_says_so(handler, installed):
+    """A recall whose store could not be read returned an empty packet that read as nothing found: an entry's server
+    answering so was taken over the hook's own recall (review of rc11)."""
+    _hook, project_root, config = handler
+    _, core, clock, _ = installed
+
+    class Unreadable:
+        def __getattr__(self, name):
+            return getattr(core, name)
+
+        def recall_packet(self, context, request, *, current_source_refs=(), deadline_seconds=2.0):
+            packet = core.recall_packet(context, request, current_source_refs=current_source_refs,
+                                        deadline_seconds=deadline_seconds)
+            return {**packet, "status": "unavailable", "items": [],
+                    "gaps": [*packet.get("gaps", ()), "sqlite_unavailable:DatabaseError"]}
+
+    guarded = CodexHookHandler(config, core=Unreadable(), clock=clock)
+    guarded.handle_payload(_payload(project_root, "UserPromptSubmit", prompt="TEST 读不到的库。"))
+    assert (guarded.diagnostics.last_reason, guarded.diagnostics.recall_error_detail) == (
+        "recall_incomplete", "sqlite_unavailable:DatabaseError")
+
+
+def test_a_recall_whose_read_did_not_finish_ranks_as_without_its_vector_search(handler, installed):
+    """A recall whose time ran out at its release, with its vector search run, came back empty and still ranked as one
+    with vectors: a hook's own such answer beat the entry's server's finished one, and a server's was final (reviews of
+    rc11)."""
+    _hook, project_root, config = handler
+    _, core, clock, _ = installed
+
+    class Released:
+        def __getattr__(self, name):
+            return getattr(core, name)
+
+        def recall_packet(self, context, request, *, current_source_refs=(), deadline_seconds=2.0):
+            packet = core.recall_packet(context, request, current_source_refs=current_source_refs,
+                                        deadline_seconds=deadline_seconds)
+            return {**packet, "status": "unavailable", "items": [], "gaps": ["deadline_exceeded_release_fence"]}
+
+    guarded = CodexHookHandler(config, core=Released(), clock=clock)
+    guarded.handle_payload(_payload(project_root, "UserPromptSubmit", prompt="TEST 读到一半的库。"))
+    assert (guarded.diagnostics.last_reason, guarded.diagnostics.recall_vectors) == ("recall_incomplete", False)
+
+
+def test_a_recall_whose_time_ran_out_after_its_packet_ranks_as_without_its_vector_search(handler, installed):
+    """A recall whose packet was whole, vector search included, but whose time ran out before it was rendered came
+    back empty and still ranked as one with its vector search (review of rc11)."""
+    _hook, project_root, config = handler
+    _, core, clock, _ = installed
+
+    class Late:
+        def __getattr__(self, name):
+            return getattr(core, name)
+
+        def recall_packet(self, context, request, *, current_source_refs=(), deadline_seconds=2.0):
+            packet = core.recall_packet(context, request, current_source_refs=current_source_refs,
+                                        deadline_seconds=deadline_seconds)
+            clock._mono += 100.0  # the hook's time is up once the packet is back
+            return {**packet, "gaps": []}  # whole, its vector search run
+
+    guarded = CodexHookHandler(config, core=Late(), clock=clock)
+    try:
+        guarded.handle_payload(_payload(project_root, "UserPromptSubmit", prompt="TEST 时间用完了。"))
+    finally:
+        clock._mono -= 100.0
+    assert (guarded.diagnostics.last_reason, guarded.diagnostics.recall_vectors) == ("deadline_exceeded", False)
+
+
 def test_missing_public_fields_do_not_capture(handler, installed):
     hook, project_root, config = handler
     payload = _payload(project_root, "UserPromptSubmit")
@@ -320,24 +387,42 @@ def test_missing_turn_id_records_capability_gap_not_default_turn(handler, instal
         assert db.execute("SELECT count(*) FROM source_events").fetchone()[0] == 0
 
 
-def test_capture_failure_surfaces_without_recall(handler, installed):
+@pytest.mark.parametrize("receipt", [
+    ("unavailable", "unknown", "STORAGE_UNAVAILABLE"),   # the write failed
+    ("queued", "queued", None),                          # the writer was busy: the message waits in the inbox
+])
+def test_a_turn_whose_capture_did_not_commit_is_still_recalled(handler, installed, receipt):
     hook, project_root, config = handler
     _, core, clock, _ = installed
+    from scope_recall.contracts import TrustedContext
+    from scope_recall.core.capture import CaptureReceipt
 
-    class FailingCore:
+    trusted = TrustedContext(core.config.binding, "TEST-session-1", config.scope_ids, "human_direct")
+    core.record_event(trusted, source_event(content="TEST 白色偏好", source_event_key="busy-seed/1"),
+                      scope_id=config.audience_scopes["project"], remaining_seconds=5)
+    disposition, durability, code = receipt
+    fences: list[tuple[str, ...]] = []
+
+    class BusyCore:
         def __getattr__(self, name):
             return getattr(core, name)
 
         def record_host_event(self, *args, **kwargs):
-            from scope_recall.core.capture import CaptureReceipt
+            return CaptureReceipt(disposition, (), durability, "pending", "pending", error_code=code)
 
-            return CaptureReceipt("unavailable", (), "unknown", "unknown", "unknown", error_code="STORAGE_UNAVAILABLE")
+        def recall_packet(self, context, request, *, current_source_refs=(), deadline_seconds=2.0):
+            fences.append(current_source_refs)
+            return {
+                "protocol_version": "1.1", "request_id": request["request_id"], "status": "ok", "memory_epoch": 1,
+                "items": [recall_item(content="TEST 白色偏好")], "gaps": [], "diagnostic_ref": None,
+                "answerability": "supported", "coverage": "partial", "unmet_needs": [],
+            }
 
-        def recall_packet(self, *args, **kwargs):
-            raise AssertionError("recall after capture failure")
-
-    failing = CodexHookHandler(config, core=FailingCore(), clock=clock)
-    assert failing.handle_payload(_payload(project_root, "UserPromptSubmit", prompt="hello")) == {}
+    busy = CodexHookHandler(config, core=BusyCore(), clock=clock)
+    result = busy.handle_payload(_payload(project_root, "UserPromptSubmit", prompt="继续 TEST 项目"))
+    assert fences == [()]
+    assert "TEST 白色偏好" in result["hookSpecificOutput"]["additionalContext"]
+    assert busy.diagnostics.capture_durability == durability
 
 
 def test_attachment_without_authorization_records_gap(handler, installed):

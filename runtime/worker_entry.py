@@ -68,6 +68,18 @@ def _is_actionable(error_code: object) -> bool:
     return retry_class(error_code) != "terminal"
 
 
+def _ingress_report(ingress) -> tuple[dict[str, int], list[str]]:
+    """What a pass says of the capture inbox rows it replayed.  A row put off (``capture_inbox._DEFERRED``) is not
+    stored yet, and one given up (``capture_inbox._GAVE_UP``) waits for ``retry-failures --apply``: each is a gap."""
+    counts = {"ingress_deferred": sum(r.error_code == "DEFERRED" for r in ingress),
+              "ingress_given_up": sum(r.error_code == "GAVE_UP" for r in ingress),
+              "ingress_replayed": sum(r.durability == "persisted" for r in ingress),
+              "ingress_cancelled": sum(r.disposition == "cancelled" for r in ingress)}
+    gaps = [gap for gap, key in (("capture_gap:durable_ingress_deferred", "ingress_deferred"),
+                                 ("capture_gap:durable_ingress_given_up", "ingress_given_up")) if counts[key]]
+    return counts, gaps
+
+
 def _receipt_payload(config: RuntimeInstanceConfig, receipt: Any, capability_gaps: list[str]) -> dict[str, Any]:
     items = [
         {
@@ -210,7 +222,7 @@ def _persist_worker_status_unlocked(config: RuntimeInstanceConfig, payload: dict
     if isinstance(payload.get("worker_error"), str) and payload["worker_error"].strip():
         safe["worker_error"] = payload["worker_error"].strip()[:200]
     safe["unavailable_work_types"] = [str(value)[:32] for value in payload.get("unavailable_work_types", ())][:4]
-    for key in ("ingress_replayed", "ingress_cancelled", "source_only"):
+    for key in ("ingress_replayed", "ingress_cancelled", "ingress_deferred", "ingress_given_up", "source_only"):
         if type(payload.get(key)) is int:
             safe[key] = payload[key]
     safe["items"] = [{key: item[key] for key in ("work_id", "work_type", "disposition", "state", "error_code", "error_detail") if key in item}
@@ -329,9 +341,12 @@ def _drain_once(config: RuntimeInstanceConfig, instance: Any, deadline: float) -
     # the pass, and this one-hour lookback would throttle healthy models for an
     # hour after a provider switch.
     refusals = provider_refusals(getattr(instance.auxiliary, "ledger_path", None))
+    # No more than the pass's own budget: with no tick of the clock since the
+    # deadline was set (every 15.6 ms on Windows before Python 3.13), ``now +
+    # budget - now`` can round to a hair over it, which the drain refuses.
     receipt = instance.drain(max_items=reserved or config.max_items,
                              purge_only=reserved == 0,
-                             remaining_seconds=max(.001, deadline - time.monotonic()))
+                             remaining_seconds=min(config.drain_seconds, max(.001, deadline - time.monotonic())))
     # Purge never spends the optional enrichment budget.
     used = sum(item.work_type != "purge" for item in receipt.items)
     budget_state["used"] -= max(0, reserved - used)
@@ -343,10 +358,10 @@ def _drain_once(config: RuntimeInstanceConfig, instance: Any, deadline: float) -
     gaps = [*(getattr(instance.auxiliary, "capability_gaps", ()) or ()), *refusals, *holds, *background_gaps]
     if reserved == 0:
         gaps.append("daily_queue_budget")
+    counts, ingress_gaps = _ingress_report(instance.ingress_receipts)
+    gaps.extend(ingress_gaps)
     payload = _receipt_payload(config, receipt, gaps)
-    ingress = instance.ingress_receipts
-    payload["ingress_replayed"] = sum(r.durability == "persisted" for r in ingress)
-    payload["ingress_cancelled"] = sum(r.disposition == "cancelled" for r in ingress)
+    payload.update(counts)
     payload["source_only"] = sum(item.disposition == "source_only" for item in receipt.items)
     payload["daily_queue_used"] = budget_state["used"]
     # The admission counts scan every source's JSON and the queue age walks every

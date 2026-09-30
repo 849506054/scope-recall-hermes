@@ -8,7 +8,7 @@ import pytest
 
 from scope_recall.contracts import ContractError
 from scope_recall.core import CoreConfig, MemoryCore
-from scope_recall.core.admission import ADMISSION_KEY, AdmissionDecision, AdmissionPolicy, classify, store_decision
+from scope_recall.core.admission import ADMISSION_KEY, AdmissionDecision, AdmissionPolicy, classify, pending_count, store_decision
 from v11_support import context, source_event
 
 
@@ -30,6 +30,96 @@ def counts(app):
 
 def capture(app, ctx, key, text, **changes):
     return app.record_event(ctx, source_event(source_event_key=key, content=text, **changes), scope_id="TEST-scope", remaining_seconds=10)
+
+
+def test_nothing_deferred_takes_no_writer_lease(tmp_path, monkeypatch):
+    """Finding that nothing is deferred scans every source; under the writer lease that held every worker pass on
+    the shared store for 9.8 s (2026-09-27) with nothing deferred, and captures waiting for the lease failed."""
+    app, ctx = app_at(tmp_path)
+    capture(app, ctx, "TEST-plain", "TEST an ordinary source that is not deferred")
+    writes = []
+    storage_type = type(app.storage)
+    real_write = storage_type.write
+    monkeypatch.setattr(storage_type, "write", lambda self, *args, **kwargs: writes.append(1) or real_write(self, *args, **kwargs))
+    assert app.resume_deferred(ctx, remaining_seconds=10) == ()
+    assert writes == []
+
+
+def _count_writes(app, monkeypatch) -> list[int]:
+    writes: list[int] = []
+    storage_type = type(app.storage)
+    real_write = storage_type.write
+    monkeypatch.setattr(storage_type, "write", lambda self, *args, **kwargs: writes.append(1) or real_write(self, *args, **kwargs))
+    return writes
+
+
+def test_a_deferred_source_with_no_room_takes_no_writer_lease(tmp_path, monkeypatch):
+    """One source deferred and the queue still full: the refill's page was chosen under the writer lease, a scan of
+    every source, on every pass, and chose nothing.  It is chosen in a read now; an empty page writes nothing."""
+    app, ctx = app_at(tmp_path, AdmissionPolicy(max_pending_work=2, important_reserve=2))
+    capture(app, ctx, "TEST-first", "TEST plain substantive source")
+    deferred = capture(app, ctx, "TEST-deferred", "TEST second substantive source")
+    capture(app, ctx, "TEST-priority", "记住：TEST 选择蓝色")
+    assert deferred.admission == ("admission_deferred:queue_capacity",)
+    writes = _count_writes(app, monkeypatch)
+    assert app.resume_deferred(ctx, remaining_seconds=10) == ()
+    assert writes == []
+
+
+def test_an_older_revision_s_deferred_marker_starts_no_page_scan(tmp_path, monkeypatch):
+    """Nothing clears a marker a newer revision left behind, and the probe did not ask for the newest revision
+    as the page does: one such marker started the page's scan of every source on every pass, selecting nothing."""
+    from scope_recall.core import admission
+
+    app, ctx = app_at(tmp_path)
+    first = capture(app, ctx, "TEST-revised", "TEST the first words of a revised source")
+    capture(app, ctx, "TEST-revised", "TEST the second words of a revised source", source_revision=2)
+    with app.storage.write(ctx, remaining_seconds=10) as tx:
+        store_decision(tx, first.event_refs[0].ref, 1, AdmissionDecision("deferred", "queue_capacity", False))
+    pages, real_page = [], admission._deferred_page
+    monkeypatch.setattr(admission, "_deferred_page", lambda *args: pages.append(1) or real_page(*args))
+    assert app.resume_deferred(ctx, remaining_seconds=10) == ()
+    assert pages == [], "a superseded marker started the page scan"
+
+
+def test_an_older_revision_s_deferred_marker_takes_no_writer_lease(tmp_path, monkeypatch):
+    """A marker left on a revision a newer one replaced is never selected, so it held the lease on every pass."""
+    app, ctx = app_at(tmp_path)
+    first = capture(app, ctx, "TEST-revised", "TEST the first words of a revised source")
+    capture(app, ctx, "TEST-revised", "TEST the second words of a revised source", source_revision=2)
+    with app.storage.write(ctx, remaining_seconds=10) as tx:
+        store_decision(tx, first.event_refs[0].ref, 1, AdmissionDecision("deferred", "queue_capacity", False))
+    writes = _count_writes(app, monkeypatch)
+    assert app.resume_deferred(ctx, remaining_seconds=10) == ()
+    assert writes == []
+
+
+def test_pending_count_uses_ready_index_without_crossing_project_or_branch(tmp_path):
+    app, ctx = app_at(tmp_path)
+    for n in range(8):
+        capture(app, ctx, f"TEST-done-{n}", f"TEST old source {n}")
+    with app.storage.write(ctx) as tx:
+        tx._check(write=True).execute("UPDATE work_items SET state='done'")
+    capture(app, ctx, "TEST-pending", "TEST pending source")
+    capture(app, ctx, "TEST-leased", "TEST leased source")
+    with app.storage.write(ctx) as tx:
+        tx._check(write=True).execute(
+            "UPDATE work_items SET state='leased' WHERE subject_ref=(SELECT event_id FROM source_events WHERE source_event_key='TEST-leased' LIMIT 1)"
+        )
+    other = replace(ctx, project_id="TEST-project", branch_id="TEST-branch")
+    capture(app, other, "TEST-other", "TEST other project source")
+    with app.storage.read(ctx) as tx:
+        conn = tx._check()
+        statements = []
+        conn.set_trace_callback(lambda sql: statements.append(sql) if "INDEXED BY work_ready" in sql else None)
+        try:
+            assert pending_count(tx, "TEST-scope", ceiling=3, work_type="embed") == 2
+            assert pending_count(tx, "TEST-scope", ceiling=1, work_type="consolidate") == 1
+        finally:
+            conn.set_trace_callback(None)
+        assert len(statements) == 2
+        plan = conn.execute("EXPLAIN QUERY PLAN " + statements[0]).fetchall()
+        assert any("USING INDEX work_ready" in row[3] for row in plan)
 
 
 @pytest.mark.parametrize("text", ["好", "好的！", "谢谢", "OK.", "got it", "hello"])

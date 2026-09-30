@@ -58,6 +58,39 @@ def is_task_notification(prompt: str) -> bool:
     return prompt.lstrip().startswith(TASK_NOTIFICATION_PREFIX)
 
 
+#: How Codex opens the prompt it sends through the same hook as a message to ask the model what the owner might do
+#: next.  The owner never wrote it: stored as theirs it put 11,000 to 15,000 characters of Codex's instructions
+#: among their messages, claims were drawn from it as if they had said them, and its recall failed on its length.
+_CODEX_SUGGESTIONS_PROMPT = re.compile(r"\bhyperpersonali[sz]ed\s+suggestions?\b", re.IGNORECASE)
+_CODEX_SUGGESTIONS_HEADINGS = re.compile(r"^#{1,2}[ \t]*(?:overview|rules|examples|bad examples|response format)[ \t]*$",
+                                         re.IGNORECASE | re.MULTILINE)
+
+
+def is_codex_suggestions_prompt(prompt: str) -> bool:
+    """Whether a prompt is Codex asking the model for suggestions, not the owner's words.
+
+    Told by its whole frame, not by one phrase: it opens with a heading, names its "hyperpersonalized suggestions"
+    in its first lines, runs to 11,000-15,000 characters and carries at least three of its own headings (Overview,
+    Rules, Examples, Bad examples, Response format).  A note of the owner's about it, even a long one, is their words.
+    """
+    text = prompt.lstrip()
+    if not text.startswith("#") or len(text) < 8000 or _CODEX_SUGGESTIONS_PROMPT.search(text[:600]) is None:
+        return False
+    return len({heading.strip("# \t").lower() for heading in _CODEX_SUGGESTIONS_HEADINGS.findall(text)}) >= 3
+
+
+def is_codex_suggestions_reply(message: str) -> bool:
+    """Whether a reply is the model's answer to that request: a JSON object holding only a list of suggestions."""
+    text = message.strip()
+    if not text.startswith("{") or len(text) > _MAX_TOOL_CHARS:
+        return False
+    try:
+        value = json.loads(text)
+    except (ValueError, RecursionError):
+        return False
+    return isinstance(value, dict) and set(value) == {"suggestions"} and isinstance(value["suggestions"], list)
+
+
 def user_prompt_source_event(
     *,
     installation_id: str,
@@ -250,3 +283,36 @@ def authorized_attachment_refs(payload: dict[str, Any]) -> tuple[list[str], tupl
     if not attachments:
         return [], ()
     return [], ("attachment_gap:host_authorization_unverified",)
+
+
+#: A lone surrogate: what a client writes for half of a broken emoji (JavaScript's ``JSON.stringify`` escapes it as
+#: ``\\ud83d``).  Python keeps it in a string and cannot encode it, so a prompt or a reply holding one was refused
+#: whole (``INPUT_INVALID``) and a record line holding one was skipped: the message was lost for one character.
+_LONE_SURROGATE = re.compile("[\ud800-\udfff]")
+
+
+def without_lone_surrogates(value):
+    """``value`` with every lone surrogate in its strings replaced by U+FFFD, the character that stands for one.
+
+    It walks the value with a stack of its own: walked by calling itself, a payload nested deeper than the
+    interpreter allows (a tool's output, 499 levels on Python 3.11) ended the hook (review of rc11)."""
+    if isinstance(value, str):
+        return _LONE_SURROGATE.sub("\ufffd", value)
+    if not isinstance(value, (dict, list)):
+        return value
+    top: dict | list = {} if isinstance(value, dict) else []
+    pending = [(value, top)]
+    while pending:
+        source, target = pending.pop()
+        for key, item in (source.items() if isinstance(source, dict) else enumerate(source)):
+            if isinstance(item, str):
+                item = _LONE_SURROGATE.sub("\ufffd", item)
+            elif isinstance(item, (dict, list)):
+                copy: dict | list = {} if isinstance(item, dict) else []
+                pending.append((item, copy))
+                item = copy
+            if isinstance(target, dict):
+                target[_LONE_SURROGATE.sub("\ufffd", key) if isinstance(key, str) else key] = item
+            else:
+                target.append(item)
+    return top

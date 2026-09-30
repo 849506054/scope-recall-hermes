@@ -27,10 +27,62 @@ _PURGE_METADATA_KEYS = (
 )
 #: Lance index types under which ``id = '...'`` is an indexed probe, not a scan.
 _SCALAR_INDEX_TYPES = frozenset({"bitmap", "btree", "label_list", "scalar"})
+#: What a nearest-neighbour search returns: the columns ``adapters.lance`` reads from a hit.  With every column the
+#: 3,072 floats of each of 40 hits crossed the helper's pipe as JSON on every search, and nothing read them.
+_HIT_COLUMNS = ["id", "scope_id", "source", "target", "_distance"]
+#: A search through the index re-ranks this many times its limit by exact distance, and probes every partition
+#: (LanceDB takes the partitions there are), so the index only makes each comparison cheaper and never decides which
+#: rows are compared.  On the pilot's 78,000 vectors of 3,072 dimensions: 10-40 ms against 748 ms, and in 6,600
+#: checks against the exact scan under three entries' filters (one a single scope) no nearest row was missed.  An exact scan ignores both.
+_REFINE_FACTOR = 5
+_ALL_PARTITIONS = 100_000
+#: Rows from which a table gets its nearest-neighbour index (``ensure_vector_index``).  Below this an exact scan
+#: costs about 100 ms, and an index would only be one more thing to keep current.
+VECTOR_INDEX_MIN_ROWS = 10_000
+#: Index segments above which the index is built again as one.  Each compaction that indexes new rows adds a
+#: segment and nothing merged them: at 120 segments a search over 78,000 vectors took 78 ms warm instead of 47, at
+#: 301 over 20,000 it took 297 ms instead of 16.
+MAX_INDEX_SEGMENTS = 16
 
 
 def _sql_quote(value: str) -> str:
     return "'" + str(value).replace("'", "''") + "'"
+
+
+def _indexes_vector(index: Any) -> bool:
+    return [str(name).strip() for name in (getattr(index, "columns", None) or ())] == ["vector"]
+
+
+def _is_ivf_sq(index: Any) -> bool:
+    return str(getattr(index, "index_type", "") or "").replace("_", "").lower() == "ivfsq"
+
+
+def _segments(table: Any, index: Any) -> int:
+    """How many segments the index has; 1 when LanceDB does not say."""
+    try:
+        return int(getattr(table.index_stats(getattr(index, "name", "vector_idx")), "num_indices", 1) or 1)
+    except Exception:  # noqa: BLE001 - a count it cannot read is no reason to rebuild
+        return 1
+
+
+def _create_vector_index(table: Any, metric: str, *, replace: bool) -> None:
+    """IVF over 8-bit quantized vectors, by whichever API the installed LanceDB has.
+
+    Not HNSW: half the pilot's rows share their vector with another row (the same words in several scopes and
+    revisions), and over such duplicates the graph left rows unreachable.  It missed 10 of 600 nearest rows and
+    once returned 2 rows for 10, whatever its search width.
+    """
+    try:
+        from lancedb.index import IvfSq
+    except ImportError:
+        IvfSq = None
+    if IvfSq is not None:
+        try:
+            table.create_index("vector", config=IvfSq(distance_type=metric), replace=replace)
+            return
+        except TypeError:
+            pass  # LanceDB 0.30 has no ``config``; the keyword form below builds the same index.
+    table.create_index(metric=metric, vector_column_name="vector", index_type="IVF_SQ", replace=replace)
 
 
 def _covers_id_only(index: Any) -> bool:
@@ -342,6 +394,9 @@ class LanceVectorStore(VectorStore):
         reads Lance version history, every writer takes the lock held below,
         and every reader follows the table forward.
 
+        The same call keeps the nearest-neighbour index current: LanceDB's
+        optimize adds the rows written since the index was built to it.
+
         Returns the footprint before and after so the caller can report what
         the pass reclaimed rather than merely that it ran.
         """
@@ -350,6 +405,38 @@ class LanceVectorStore(VectorStore):
             self._fresh_table().optimize(cleanup_older_than=timedelta(seconds=0), delete_unverified=True)
         after = self._physical_footprint()
         return {f"{key}_before": value for key, value in before.items()} | after
+
+    def ensure_vector_index(self, *, min_rows: int = VECTOR_INDEX_MIN_ROWS,
+                            timeout_seconds: float | None = None, build: bool = True) -> dict[str, Any]:
+        """Build the nearest-neighbour index once the table is large enough to need one.  Idempotent.
+
+        Without it every search reads every vector: 750 ms over 78,000 of them.  A Claude Code or Codex hook starts
+        its helper for each prompt, and with that on top the vector search never finished inside the recall's
+        budget, so those hosts' automatic recall answered from words alone.  ``compact`` keeps the index current.
+        ``timeout_seconds`` bounds the helper's wait in ``ProcessLanceVectorStore``; in process the caller has
+        already sized the build to its time (``runtime/vector_upkeep.index_if_due``).  ``build=False`` only reports
+        what the index needs (``needs_build``, ``needs_rebuild``), so that a caller sizes only a build that is due.
+        """
+        if type(min_rows) is not int or min_rows < 1:
+            raise ValueError("min_rows must be a positive integer")
+        with self.physical_write_lock(timeout_seconds=30.0):
+            table = self._fresh_table()
+            existing = [index for index in table.list_indices() or () if _indexes_vector(index)]
+            current = next((index for index in existing if _is_ivf_sq(index)), None)
+            segments = _segments(table, current) if current is not None else None
+            if segments is not None and segments <= MAX_INDEX_SEGMENTS:
+                return {"outcome": "present", "segments": segments}
+            rows = int(table.count_rows())
+            if rows < min_rows and not existing:
+                return {"outcome": "below_threshold", "rows": rows}
+            if not build:
+                return {"outcome": "needs_rebuild" if existing else "needs_build", "rows": rows,
+                        **({"segments": segments} if segments is not None else {})}
+            # A vector index of another kind (an HNSW one built by hand on the pilot) is replaced.
+            started = time.monotonic()
+            _create_vector_index(table, self.metric, replace=bool(existing))
+            return {"outcome": "rebuilt" if existing else "built", "rows": rows,
+                    "seconds": round(time.monotonic() - started, 3)}
 
     def _physical_footprint(self) -> dict[str, int]:
         # Read straight off the filesystem: the doctor must report the same
@@ -400,7 +487,8 @@ class LanceVectorStore(VectorStore):
     def search(self, vector: list[float], *, scope_id: str, limit: int) -> list[dict[str, Any]]:
         if not vector:
             return []
-        query = self._fresh_table().search(vector).metric(self.metric).where(f"scope_id = {_sql_quote(scope_id)}")
+        query = (self._fresh_table().search(vector).metric(self.metric).where(f"scope_id = {_sql_quote(scope_id)}")
+                 .select(_HIT_COLUMNS).nprobes(_ALL_PARTITIONS).refine_factor(_REFINE_FACTOR))
         return query.limit(int(limit)).to_list()
 
     def search_scopes(self, vector: list[float], *, scope_ids: Iterable[str], limit: int) -> list[dict[str, Any]]:
@@ -409,7 +497,8 @@ class LanceVectorStore(VectorStore):
         if not vector or not listed:
             return []
         where = f"scope_id IN ({', '.join(_sql_quote(scope_id) for scope_id in listed)})"
-        query = self._fresh_table().search(vector).metric(self.metric).where(where, prefilter=True)
+        query = (self._fresh_table().search(vector).metric(self.metric).where(where, prefilter=True)
+                 .select(_HIT_COLUMNS).nprobes(_ALL_PARTITIONS).refine_factor(_REFINE_FACTOR))
         return query.limit(int(limit)).to_list()
 
     def count_rows(self) -> int:

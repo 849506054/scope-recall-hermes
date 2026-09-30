@@ -6,6 +6,7 @@ a client attached to a shared store, Codex or Claude Code.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 import time
@@ -40,6 +41,10 @@ def main(argv: list[str] | None = None) -> int:
     # Start the trusted wall-clock budget before configuration/runtime loading;
     # model or hook payload fields never participate in this timestamp.
     hook_started_at = time.monotonic()
+    raw = sys.stdin.buffer.read(65537)
+    # Started whether or not the entry's server is asked: the hook recalls itself when the server has not answered in
+    # time, and without a helper started here that recall ran by words alone (review of rc11).
+    _prestart_vector_helper(raw)
     location = (args.config if args.config is not None else args.home).expanduser()
     if not location.is_absolute():
         sys.stderr.write("CODEX_HOOK:config_path_not_absolute\n")
@@ -51,7 +56,7 @@ def main(argv: list[str] | None = None) -> int:
         emit_result({})
         return 0
     if args.env_file is not None:
-        # A hook must answer inside its 2 s budget whatever happens; a missing key
+        # A hook must answer inside its budget whatever happens; a missing key
         # only costs the semantic channel, so the failure is logged and not fatal.
         env_file = args.env_file.expanduser()
         if not env_file.is_absolute():
@@ -83,14 +88,46 @@ def main(argv: list[str] | None = None) -> int:
         sys.stderr.write("CODEX_HOOK:config_unavailable\n")
         emit_result({})
         return 0
-    raw = sys.stdin.buffer.read(65537)
     if len(raw) > 65536:
         sys.stderr.write("CODEX_HOOK:input_too_large\n")
         emit_result({})
         return 0
+    # A client attached to a shared store runs the entry's MCP server for as long as it is open, and that server
+    # answers the prompt's recall with its vector search warm (``local_endpoint``).  The prompt is stored here.
+    recaller = None
+    if args.config is None and runtime_config is None:
+        from .local_endpoint import Recaller
+
+        recaller = Recaller(location, args.host)
+        handler.resident_recall = recaller
     result = handler.handle_bytes(raw)
     emit_result(result, diagnostics=handler.diagnostics)
+    if recaller is not None:
+        outcome = getattr(handler, "resident_outcome", None) or recaller.outcome
+        if outcome is not None:
+            sys.stderr.write(f"CODEX_RECALL_RESIDENT:{outcome}\n")
     return 0
+
+
+def _prestart_vector_helper(raw: bytes) -> None:
+    """Start the vector search's helper while the prompt is being stored (``vector.process_store.prestart``).
+
+    Each hook is a new process, and a helper started when the recall reached its vector search spent the rest of
+    the recall's budget importing LanceDB: Claude Code and Codex recalled from words alone.
+    """
+    if sys.platform != "win32" or len(raw) > 65536:
+        return
+    try:
+        payload = json.loads(raw)
+    except (ValueError, RecursionError):
+        return
+    if not isinstance(payload, dict) or payload.get("hook_event_name") != "UserPromptSubmit":
+        return
+    try:
+        from ...vector.process_store import prestart
+        prestart()
+    except OSError:
+        sys.stderr.write("CODEX_HOOK:vector_prestart_failed\n")
 
 
 if __name__ == "__main__":

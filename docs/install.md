@@ -8,7 +8,7 @@ uses too. This guide installs Hermes and Codex with a store of their own; Claude
 Code installs only as an entry of a shared store, and Codex can join one too
 (section 11).
 
-> **Status.** This guide covers 3.1 to 3.3. Releases are on PyPI and on the
+> **Status.** This guide covers 3.1 to 3.4. Releases are on PyPI and on the
 > GitHub releases page; a checkout between releases carries a candidate version
 > and is installed by building its wheel. The distribution name is
 > `hermes-scope-recall`, the Python import is `scope_recall`, and the host plugin
@@ -275,7 +275,9 @@ The Core data directory is `<instance-root>\scope-recall\`, holding
 `memory.sqlite3` and, once configured, a `vectors\` companion directory. Hermes
 tools exposed by the adapter are `recall`, `inspect`, `profile`, `entity`,
 `trace`, `revise`, `forget` and `status`, and it subscribes to the host hooks
-`pre_llm_call`, `post_tool_call` and `api_request_error`.
+`pre_llm_call`, `post_tool_call`, `post_llm_call` and `api_request_error`.
+`post_llm_call` is read at the end of a turn for what the assistant showed
+between its tool calls; Hermes hands the memory provider only the answer.
 
 ## 5. Install the Codex MCP path
 
@@ -325,7 +327,10 @@ to purely lexical. Usually the same file is passed to `autostart enable`.
 The installer owns these files exclusively. Do not hand-edit them or add your own
 scripts to that directory: the next `plan-install` will report them as
 `edited prior file` or `unrelated plugin file` and refuse. Change the installer if
-you need different behaviour.
+you need different behaviour. A skill (`SKILL.md`) an agent edited is the one
+exception: while the package's copy of it is the one installed before, the install
+keeps the edit (`kept` in the plan) and installs the rest; once a release changes
+that skill, the edit is a conflict again.
 
 Six native hook events are registered, each invoking
 `scope_recall.adapters.codex.hook_entry` through the isolated interpreter with a
@@ -385,6 +390,49 @@ The four gaps that yield `attention` rather than `degraded` are
 `vector_threshold_unconfigured`, `work_failed_terminal_only`, `work_needs_review`
 and `worker_capability_unavailable`. Everything else forces `degraded`.
 
+Each store under `index_metadata.vector_stores` names its nearest-neighbour index
+in `index_outcome`. The worker builds the index once the store holds 10,000
+vectors, at the start of a pass that has the time for the build: about 8 s for
+78,000 vectors of 3,072 dimensions. It is IVF over 8-bit quantized vectors, and a
+search probes every partition and re-ranks its nearest candidates exactly, so it
+finds what an exact scan finds, in about 40 ms instead of 750. A vector index of
+another kind is replaced (`rebuilt`). The same outcome is in
+`vectors/<space>/index-state.json`.
+
+| `index_outcome` | Meaning |
+|-----------------|---------|
+| `built`, `rebuilt` or `present` | The store has its index; compaction keeps it current. |
+| `below_threshold` | Fewer than 10,000 vectors; an exact scan is quick enough. |
+| `deferred` | The build did not fit the pass; a later pass with more time builds it. |
+| `failed` | The build failed; it is tried again six hours later. |
+| `started` | A build began and no outcome was recorded (the pass was ended); tried again six hours later. |
+| none | No pass has looked yet. |
+
+Without the index a search reads every vector. A Claude Code or Codex hook starts
+its search helper fresh for each prompt, so on a large store its automatic recall
+answers from words alone.
+
+Each store also says how far the worker got in giving an import's history the
+embeddings its old store never had (`embed_backfill_outcome`, with
+`last_embed_backfill_at` and `embed_backfill_queued_total`, the embeddings queued
+so far). Every pass tops the embedding queue up with the next of the owner's
+messages, replies, documents and notes that an import brought in without one:
+to 64 embeddings waiting, or to half a pass (16 at the default 32 items) while a
+candidate evaluation the pass would take is ready, since the worker takes
+embeddings first. Once none is left it looks again a day later. Each worker keeps
+its place in `vectors/<space>/embed-backfill-<partition>.json`. Where several
+workers share a store (a local install keeps one for each project and branch),
+the outcome is a failed one's, else the latest; a worker's file that nobody has
+looked at for two days is left out of it.
+
+| `embed_backfill_outcome` | Meaning |
+|--------------------------|---------|
+| `progress` | A page was queued; the next pass goes on from there. |
+| `held` | The queue was full: 64 embeddings waiting (captured messages' or the previous page's), or half a pass while a candidate evaluation the pass would take was ready; nothing was queued. |
+| `finished` | No import is left without one; looked at again after a day. |
+| `failed` | The page could not be read (`embed_backfill_error` names the error); that worker tries again at every pass. Those memories are found by their words until it passes. |
+| none | No pass has looked yet, or the store has no embedding route. |
+
 ### A healthy report
 
 Abridged — the real output has about fifty fields and more `checks` rows. These
@@ -407,6 +455,7 @@ are the ones to read first, from a healthy Hermes install:
   "needs_review_work": 0,
   "capture_inbox": 0,
   "capture_inbox_blocked": 0,
+  "capture_inbox_given_up": 0,
   "checks": [
     {"name": "host_registration", "result": "registered"},
     {"name": "adapter_binding", "result": "ok"},
@@ -457,7 +506,7 @@ Things that look wrong in a healthy report and are not:
 | `work_failed_terminal_only` / `work_needs_review` | All failures are by design, or were already retried once. `attention`. | Inspect them; `--include-terminal` re-runs them only if you mean to. |
 | `work_backlog_stalled` | Work is pending and the worker has not succeeded for more than twice `supervisor_seconds`. | The worker is not running. See the next section. |
 | `worker_capability_unavailable` | Work is pending and the last pass reported work types it could not do. `attention`. | Usually a missing model route, credential or budget. |
-| `capture_ingress_blocked` | Inbox rows carry a real error code. Always `degraded`. | Read `capture_inbox_blocked` and the recent work errors. |
+| `capture_ingress_blocked` | Inbox rows carry a real error code, or wait for their next try. Always `degraded`. | Read `capture_inbox_blocked` and the recent work errors. A row whose stored capture a replay could not check again is tried after a minute, doubling to an hour; when its 24th try again fails it is given up and counted in `capture_inbox_given_up`. `retry-failures` without `--apply` counts them by what gave them up (`inbox_by_kind`); fix that, then `retry-failures --apply` returns them to the replay. |
 | `autostart_registration_missing` | The control file says enabled, but the scheduled task is gone. | Re-run `autostart enable`. |
 | `autostart_configuration_invalid` | `runtime-autostart.json` is unusable, or points at a config that will not load or does not match the binding. | Re-run `autostart enable` with the correct `--config`. |
 | `ledger_missing:<file>` | An external route is approved but its budget ledger file does not exist. | Create the ledger — see [configuration.md](configuration.md). |
@@ -538,7 +587,16 @@ scope-recall retry-failures --config /path/to/instance-root/scope-recall/runtime
 ```
 
 Without `--apply` nothing is written. `--include-terminal` also re-runs failures
-that are terminal by design.
+that are terminal by design. The same command returns to the replay the captures
+the inbox gave up after their tries (`inbox_given_up` in its output, and what gave
+them up in `inbox_by_kind`; without `--apply` it only counts them), each with its
+tries counted anew (one given up while it was being given a new key goes back to that
+step). It reaches the rows of the partition its config replays, while
+doctor's `capture_inbox_given_up` counts the whole store: in a shared store, run it
+with the shared worker's config (`<root>\runtime-config.json`), since an entry's own
+config reaches only that entry's scopes. Run it after going back to an earlier
+release and forward again: a capture the earlier release could not read may have
+been given up meanwhile.
 
 Since 3.2.0 a tool output is kept and embedded, found by its words and by
 meaning, but no longer consolidated into claims: what an agent read or ran is

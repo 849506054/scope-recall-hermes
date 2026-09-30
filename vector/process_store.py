@@ -7,6 +7,7 @@ an uncertain physical outcome stays owned by the idempotent vector outbox.
 """
 from __future__ import annotations
 
+import atexit
 import json
 import math
 import os
@@ -29,7 +30,7 @@ MAX_LANCE_FRAME_BYTES = 64 * 1024 * 1024
 LANCE_WORKER_METHODS = frozenset({
     "is_available", "open", "open_existing", "upsert_records", "fenced_upsert_records",
     "delete_by_ids", "contains_id", "list_ids", "list_records", "search", "search_scopes", "count_rows",
-    "compact", "purge_governed_members",
+    "compact", "ensure_vector_index", "purge_governed_members",
 })
 # Lance's Rust object writer appends table/data/temp components to the root and
 # uses ordinary Win32 paths, so the extended-length prefix does not help.  The
@@ -102,6 +103,68 @@ def _worker_command() -> list[str]:
     # PYTHONPATH; isolated mode keeps a source-tree directory such as
     # ``packaging`` from shadowing the wheel installed in the interpreter.
     return [sys.executable, "-I", "-B", str(Path(__file__).resolve().parents[1] / "_lance_worker.py")]
+
+
+def _spawn_helper() -> subprocess.Popen:
+    return subprocess.Popen(
+        _worker_command(),
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        **python_subprocess_options(),
+    )
+
+
+#: A helper started before any store asked for one (``prestart``), for the next store that starts a helper.
+_spare: subprocess.Popen | None = None
+_spare_lock = threading.Lock()
+_keep_spare = False
+
+
+def prestart(*, keep: bool = False) -> None:
+    """Start a helper now, for the next store that starts one to take.
+
+    A helper spends about 2 s importing LanceDB before it answers.  A Claude Code or Codex hook is a new process
+    for every prompt, and a helper started when its recall reached the vector search was not ready before that
+    search's budget ran out: those hosts' automatic recall answered from words alone.  Started when the hook
+    starts, the import runs while the message is stored and the words are searched.  ``keep`` is for a server
+    that runs on: each helper taken is replaced at once, so the next request finds one ready.
+    """
+    global _spare, _keep_spare
+    with _spare_lock:
+        _keep_spare = _keep_spare or keep
+        if _spare is None or _spare.poll() is not None:
+            _spare = _spawn_helper()
+
+
+def discard_spare() -> None:
+    """Let a spare that was never taken go: without its input it exits once its import is done."""
+    global _spare, _keep_spare
+    with _spare_lock:
+        spare, _spare, _keep_spare = _spare, None, False
+    if spare is not None:
+        for stream in (spare.stdin, spare.stdout):
+            if stream is not None:
+                stream.close()
+
+
+atexit.register(discard_spare)
+
+
+def _take_spare() -> subprocess.Popen | None:
+    global _spare
+    with _spare_lock:
+        spare, _spare = _spare, None
+        if _keep_spare:
+            try:
+                _spare = _spawn_helper()
+            except OSError:
+                _spare = None  # the next take starts one; the spare taken here is still good
+    if spare is not None and spare.poll() is not None:
+        # It is gone already (its import failed): the store starts its own and meets the same failure there.
+        for stream in (spare.stdin, spare.stdout):
+            if stream is not None:
+                stream.close()
+        return None
+    return spare
 
 
 def _budget_exhausted() -> bool:
@@ -314,11 +377,7 @@ class ProcessLanceVectorStore(VectorStore):
     def _start(self) -> None:
         if self._teardown is not None:
             raise _helper_teardown_pending()
-        self._process = subprocess.Popen(
-            _worker_command(),
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-            **python_subprocess_options(),
-        )
+        self._process = _take_spare() or _spawn_helper()
         self._finalizer = weakref.finalize(self, _stop_worker, self._process)
         self._reader = threading.Thread(
             target=_read_worker_frames, args=(self._process.stdout, self._responses),
@@ -383,7 +442,8 @@ class ProcessLanceVectorStore(VectorStore):
         self._open("open_existing")
 
     def open_existing_with_work(self, work: Callable[[], Any]) -> None:
-        """Overlap the read-only native open with caller-owned bounded work."""
+        """Overlap the read-only native open with caller-owned bounded work; work that returns False failed, and the
+        open is then taken only if it has come (parked for the next request if not)."""
         if not callable(work):
             raise TypeError("open work must be callable")
         if not (self.db_path / f"{self.table_name}.lance").is_dir():
@@ -463,18 +523,21 @@ class ProcessLanceVectorStore(VectorStore):
                 response = self._fenced_exchange(request_id, encoded, nonce, guard)
             else:
                 self._send_request_frame(encoded)
+                work_failed = False
                 if during_wait is not None:
                     try:
-                        during_wait()
+                        # Work that failed in its own way says so with False: its caller has nothing to search with,
+                        # so the open is taken only if it has come, and parked for the next request otherwise.
+                        work_failed = during_wait() is False
                     except BaseException:
                         overlap_failed = True
                         self._detach_helper(failed=True)
                         raise
                 response = self._receive_response_locked(
-                    request_id, only_if_ready=during_wait is not None and _budget_exhausted(),
+                    request_id, only_if_ready=during_wait is not None and (work_failed or _budget_exhausted()),
                 )
         except _RequestBudgetExpired:
-            self._park_pending_response(request_id)
+            self._park_pending_response(request_id, method)
             if during_wait is not None:
                 return None
             raise
@@ -583,13 +646,15 @@ class ProcessLanceVectorStore(VectorStore):
             raise RuntimeError("native vector worker exited or returned an invalid frame")
         return response
 
-    def _park_pending_response(self, request_id: int) -> None:
+    def _park_pending_response(self, request_id: int, method: str) -> None:
         """Remember the frame a caller stopped waiting for; the helper stays up."""
         self._pending_response_id = request_id
+        self._pending_response_method = method
         self._pending_response_since = time.monotonic()
 
     def _clear_pending_response(self) -> None:
         self._pending_response_id: int | None = None
+        self._pending_response_method: str | None = None
         self._pending_response_since: float | None = None
 
     def _drain_pending_response_locked(self) -> None:
@@ -597,21 +662,33 @@ class ProcessLanceVectorStore(VectorStore):
         request_id = self._pending_response_id
         if request_id is None:
             return
-        if time.monotonic() - self._pending_response_since > self._pending_response_timeout:
+        # A frame nobody asked for since it was parked may have come in long ago.  A kept recall handler asked again
+        # minutes after its first, cold search took that answer for a wedged helper, closed the helper, and recalled
+        # the next prompt cold as well (worker_unresponsive).  Only a frame that has still not come is a wedge.
+        stale = time.monotonic() - self._pending_response_since > self._pending_response_timeout
+        try:
+            response = self._receive_response_locked(request_id, only_if_ready=stale)
+        except _RequestBudgetExpired:
+            if not stale:
+                raise
             # Every caller since the frame was parked has spent its budget on
             # it: that is a wedged helper, not a slow one.
             self._detach_helper(failed=True)
             raise RuntimeError(
                 "native vector worker unresponsive; SQLite truth is intact and unacknowledged outbox work remains pending"
-            )
-        try:
-            self._receive_response_locked(request_id)
-        except _RequestBudgetExpired:
-            raise
+            ) from None
         except (OSError, ValueError, queue.Empty, RuntimeError) as exc:
             self._detach_helper(failed=True)
             raise _worker_failed() from exc
+        method = self._pending_response_method
         self._clear_pending_response()
+        if not response.get("ok") and method in ("open", "open_existing"):
+            # A table open that ran out of its caller's time and then failed in the helper leaves no open table, and
+            # every later search said so until the host restarted: the store is closed for the next request to
+            # reopen.  Any other late failure (a purge out of its own time, say) was that request's; the helper holds
+            # its table and goes on.
+            self._detach_helper(failed=True)
+            self._response_result(response)
 
     @staticmethod
     def _response_result(response: dict[str, Any]) -> Any:
@@ -683,5 +760,18 @@ class ProcessLanceVectorStore(VectorStore):
         """Forward a bounded compaction to the helper that owns the table."""
         return dict(self._call("compact"))
 
+    def ensure_vector_index(self, *, min_rows: int, timeout_seconds: float, build: bool = True) -> dict[str, Any]:
+        """Forward the index build, waiting for it up to ``timeout_seconds``: it can take longer than a request."""
+        if type(timeout_seconds) not in (int, float) or not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
+            raise ValueError("timeout_seconds must be positive and finite")
+        with self._helper_locked():
+            usual = self._request_timeout
+            self._request_timeout = max(usual, float(timeout_seconds))
+            try:
+                return dict(self._invoke_locked("ensure_vector_index", min_rows=min_rows, build=bool(build)))
+            finally:
+                self._request_timeout = usual
 
-__all__ = ["LANCE_WORKER_METHODS", "MAX_LANCE_FRAME_BYTES", "NativeVectorPathError", "ProcessLanceVectorStore"]
+
+__all__ = ["LANCE_WORKER_METHODS", "MAX_LANCE_FRAME_BYTES", "NativeVectorPathError", "ProcessLanceVectorStore",
+           "discard_spare", "prestart"]

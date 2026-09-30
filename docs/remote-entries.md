@@ -1,0 +1,132 @@
+# A client on another machine
+
+Claude Code or Codex on a second machine (a work computer) can be an entry of the shared store on this
+one. Its memories are the store's, recalled by every entry with the owner's grants, and each recalled item
+names the entry it came in through, so "Work Claude Code" stays apart from this machine's Claude Code.
+
+Nothing of the store moves. The client machine runs a small forwarder and holds only the entry's token:
+each hook goes to the entry's server here over HTTP, and this machine's handler records it, as it does for a
+local client. A Claude Code client reads its own session record on its machine and sends what the record
+shows being said, never the record itself; the server opens no path a request names. The entry's MCP tools
+are served over streamable HTTP. Tool calls and tool output are not recorded: the remote plugin does not
+forward them, where a local Codex client records its tool calls.
+
+The server listens on one private address this machine has on a network both machines are in (a tailnet),
+never on every interface, and refuses any request without the entry's token. The token is made on the client
+machine and stays there; this machine keeps its SHA-256.
+
+## On this machine
+
+1. Attach an entry for each client, as for a local one, with its own home and a name to tell it apart:
+
+   ```text
+   scope-recall attach --host claude-code --instance-root D:\ScopeRecall\work-claude-code --root D:\ScopeRecall\shared --entry work-claude-code --display-name "Work Claude Code" --grants-like all --capture-like desk
+   ```
+
+2. Record where it is served and the digest the client printed (step 3 below):
+
+   ```text
+   python -m scope_recall.adapters.codex.remote_server configure --home D:\ScopeRecall\work-claude-code --host claude-code --listen 100.64.0.10 --port 18765 --token-sha256 <hex>
+   ```
+
+3. Serve it from an environment that has the `codex` extra, at logon and again when it stops. `--env-file`
+   names the file holding the embedding key the runtime config declares; it is read in place:
+
+   ```text
+   python -m scope_recall.adapters.codex.remote_server serve --home D:\ScopeRecall\work-claude-code --host claude-code --env-file <file>
+   ```
+
+   The server keeps one handler for its prompts' recall, with its LanceDB table open and its embedding
+   worker connected, while each request's own handler stores the hook (as the entry's MCP server on this
+   machine does for the hooks here: [shared-store.md](shared-store.md)).
+
+   The server has no console. Each hook it handles (its event, the handler's reason, the capture's error code
+   when it failed, how far a record was stored, the time taken with the shares of making its handler, the
+   capture, attaching the handler's runtime and closing it (the rest is the recall), and for a prompt how its
+   kept recall went: `warm recall answered`, `busy`, `slow`, `late`,
+   `without_vectors:<gap>` or `failed:<reason>`), each request refused for want of the token and its own
+   errors go to `<home>\scope-recall\remote-server.log`, kept to about 1 MB with two older copies.
+
+   On Windows start it with a `pythonw.exe` that opens no console, such as the one in a virtual environment
+   made by `python -m venv`. uv 0.12.1 writes `Scripts\pythonw.exe` as a copy of its console launcher: the
+   server then runs in a console that Windows Terminal shows as a window, and closing that window stops it.
+
+4. Let the client machine reach the port: an inbound firewall rule for that port, from the client's private
+   address only.
+
+Each entry has its own port and its own server process. A server runs the installed package, so it is
+stopped with the other processes on the store for an upgrade (`package-upgrade`) and started after it.
+
+## On the client machine
+
+1. Install the package in a virtual environment. Claude Code must be 2.1.196 or later: a prompt from an
+   earlier one carries no prompt id and is refused. Claude Code runs a hook through a shell, so its
+   interpreter and `client.json` must be on paths of ASCII letters, digits and `._-/:` only; `install`
+   refuses others.
+2. Write `client.json` with absolute paths:
+
+   ```json
+   {"url": "http://100.64.0.10:18765", "host": "claude-code", "token_file": "C:/Users/me/.scope-recall-remote/claude-code/token", "state_dir": "C:/Users/me/.scope-recall-remote/claude-code/state"}
+   ```
+
+3. Make the token and give its digest to this machine's step 2. Only the digest is printed:
+
+   ```text
+   python -m scope_recall.adapters.codex.remote_client token --config <client.json>
+   ```
+
+4. Write the plugin:
+
+   ```text
+   python -m scope_recall.adapters.codex.remote_client install --config <client.json> --plugin-dir <dir>
+   ```
+
+   Claude Code: `<dir>` is `~/.claude/skills/scope-recall`; it loads in the next session. Codex: `<dir>` is
+   `~/plugins/scope-recall-codex`, listed in the personal marketplace (`~/.agents/plugins/marketplace.json`)
+   and enabled in Codex, which then asks you to approve its hooks.
+
+   The plugin's `.mcp.json` carries the token too, as the header the host sends to `/mcp`; like the token file
+   it stays in your profile.
+
+## When the server cannot be reached
+
+A hook whose connection has not opened in 3 s gives up and answers with nothing; for a minute after that no
+hook tries, so while the server is away a prompt is held up once a minute at most, and it has no recall.
+A Claude Code session's record carries what was said to that session's next Stop that reaches the server,
+and the cursor on the client moves only as far as the server stored; what a session had not sent when it
+ended stays unsent, and a message the store was too busy to take when its hook came (the server log says
+`not stored`) is stored from the record at the next Stop. A Codex hook is written to a spool on the client
+before it is sent and removed once the server has answered for it; what stays is sent, with the moment it
+happened, by a process a later hook starts once the server answers again. A hook sent twice is the same source,
+not two. A hook whose message the busy store could not take stays in the spool (the server log says `not stored,
+to be sent again`), and one the server refuses for good (HTTP 400 or 413: malformed, too large) is dropped
+rather than kept, since it would be refused again and would stop every later flush. The spool keeps 256 hooks
+and drops its oldest past that. What did not get through, what the spool sent and what it dropped is logged in
+the client's `state_dir\remote-client.log`.
+
+A message is dated by the client's clock, the moment its hook ran there, which is what makes a hook sent again
+the same source. When a request's latest time is more than a minute ahead of this machine's, every time in it
+moves back by that lead, so the latest is this machine's now and a turn keeps its order: a recall finds nothing
+dated after its now, so a message dated a day ahead would have stayed hidden for a day (a hook that such a client
+sends twice may then be stored twice). When it was stored, when its work falls due and a recall's now are
+this machine's clock, so a client clock that runs fast or slow does not hold back the work on its messages.
+
+The client connects to the server itself and never through a proxy: `HTTP_PROXY` or a system proxy on the
+client machine is for the internet and cannot reach the tailnet address. Claude Code's and Codex's own MCP
+connection to `/mcp` follows their proxy settings, so the server's address must be in the client machine's
+`NO_PROXY` (an address, not only a range: not every client reads `100.64.0.0/10`).
+
+## A new client machine
+
+The entry belongs to the store, not to the machine. On the new machine repeat the client steps with a new
+token, and on this machine run `configure` again with its digest and restart the server: the old token stops
+working and the entry's memories stay under its name. A firewall rule that names the old machine's address
+needs the new one.
+
+## Limits
+
+Over a relayed path a request takes one to three round trips of the network: 0.4-1.2 s through a Tailscale relay
+on 2026-09-27, about 50 ms direct. A prompt's hook waits at most 15 s, as a local one does, and the server's
+work on it at most the entry's `hook_processing_seconds` (6 s unless set lower); both are ceilings, and the
+prompt goes on as soon as recall is done. Codex allows SessionEnd and Interrupt at most 3 s, so on a slow path
+those may time out; the hook is already in the spool then, and is sent from there.

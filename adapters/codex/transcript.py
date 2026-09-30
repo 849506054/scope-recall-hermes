@@ -27,6 +27,8 @@ import json
 import os
 from pathlib import Path
 
+from .boundary import without_lone_surrogates
+
 #: How much of the record one read goes through.  A long session's first read spans several turns.
 READ_BYTES = 16 * 1024 * 1024
 #: The record's opening bytes identify it; a record rewritten under the same name starts over.
@@ -35,12 +37,13 @@ _HEAD_BYTES = 4096
 
 @dataclass(frozen=True)
 class Said:
-    """One message as shown: the record's id for it, whose it is, what it says and when."""
+    """One visible message and its host identity, if the record supplies one."""
 
     entry_id: str
     role: str
     text: str
     occurred_at: str
+    prompt_id: str | None = None
 
 
 def _human(origin: object) -> bool:
@@ -96,7 +99,58 @@ def said(row: object) -> Said | None:
         role, text = "assistant", _text(message.get("content"))
     else:
         return None
-    return Said(entry_id.strip(), role, text, occurred_at) if text.strip() else None
+    if not text.strip():
+        return None
+    # Half of a broken emoji is kept as U+FFFD, with the rest of the message (``boundary.without_lone_surrogates``);
+    # the line was skipped and the message lost.  An entry id that cannot be encoded still skips its line.
+    text = without_lone_surrogates(text)
+    try:
+        entry_id.encode("utf-8")
+    except UnicodeEncodeError:
+        return None
+    prompt_id = row.get("promptId") if role == "user" else None
+    if type(prompt_id) is not str or not prompt_id.strip() or len(prompt_id) > 240:
+        prompt_id = None
+    else:
+        try:
+            prompt_id.encode("utf-8")
+        except UnicodeEncodeError:
+            # An id the store cannot bind would stop every later read at this line; the message is still
+            # matched by its words and moment.
+            prompt_id = None
+    return Said(entry_id.strip(), role, text, occurred_at, prompt_id.strip() if prompt_id else None)
+
+
+#: The longest message a client on another machine may send in one read (characters).
+WIRE_TEXT_LIMIT = 1_000_000
+
+
+def said_to_wire(entry: Said) -> dict[str, object]:
+    """One message, as a client on another machine sends it to its entry's server."""
+    return {"entry_id": entry.entry_id, "role": entry.role, "text": entry.text,
+            "occurred_at": entry.occurred_at, "prompt_id": entry.prompt_id}
+
+
+def said_from_wire(value: object) -> Said | None:
+    """The message a client sent, held to what ``said`` itself would have produced, or None."""
+    if not isinstance(value, dict):
+        return None
+    entry_id, role, text = value.get("entry_id"), value.get("role"), value.get("text")
+    occurred_at, prompt_id = _stamp(value.get("occurred_at")), value.get("prompt_id")
+    if (type(entry_id) is not str or not entry_id.strip() or len(entry_id) > 100 or role not in ("user", "assistant")
+            or type(text) is not str or not text.strip() or len(text) > WIRE_TEXT_LIMIT or occurred_at is None):
+        return None
+    if prompt_id is not None and (role != "user" or type(prompt_id) is not str or not prompt_id.strip()
+                                  or len(prompt_id) > 240):
+        return None
+    text = without_lone_surrogates(text)
+    try:
+        entry_id.encode("utf-8")
+        if prompt_id is not None:
+            prompt_id.encode("utf-8")
+    except UnicodeEncodeError:
+        return None
+    return Said(entry_id.strip(), role, text, occurred_at, prompt_id.strip() if prompt_id else None)
 
 
 def record_path(value: object, session_id: str) -> Path | None:
@@ -125,7 +179,8 @@ def read(path: Path, offset: int, *, limit: int = READ_BYTES) -> list[tuple[int,
             position += len(line)
             try:
                 row = json.loads(line)
-            except ValueError:
+            except (ValueError, RecursionError):
+                # A line nested past what the parser takes failed every later Stop of the session (review of rc11).
                 row = None
             lines.append((position, said(row)))
     return lines

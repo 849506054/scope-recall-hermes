@@ -1,15 +1,15 @@
-# Scope Recall 3.3 autonomous memory
+# Scope Recall 3.4 autonomous memory
 
 Scope Recall v3 is a bounded local memory core with SQLite as the authority and rebuildable vector companions. It provides host adapters for Hermes, Codex and Claude Code (the last two share one adapter of hooks and an MCP server), with the MCP tools when the optional `codex` extra is installed. The public package is `hermes-scope-recall`; the Python import is `scope_recall`; the host wrapper identity remains `scope-recall`.
 
-This is `3.3.0`. Hermes, Codex and Claude Code can keep one memory: each attaches to a shared
+This checkout is `3.4.2`, in which Claude Code and Codex on another machine can join the shared store too ([docs/remote-entries.md](docs/remote-entries.md)). Hermes, Codex and Claude Code can keep one memory: each attaches to a shared
 store as an entry, what the owner tells one of them another can recall, and each memory says
 which agent it came in through ([docs/shared-store.md](docs/shared-store.md)). Hermes agents
 could share a store from 3.2.0; Codex and Claude Code join in 3.3.0. An agent that is not
 attached keeps its own store. A tool's output is still kept and found, but no longer turned
-into facts. The notes are the `[3.3.0]` section of [CHANGELOG.md](CHANGELOG.md); upgrading
-from `3.2.x` is `pip install -U`, `apply-install` and a host restart, and the store's schema
-does not change. From `3.1.x` the store moves to schema 1110 the first time it is opened,
+into facts. The notes are the `[3.4.2]`, `[3.4.1]` and `[3.4.0]` sections of [CHANGELOG.md](CHANGELOG.md); upgrading
+from `3.4.x`, `3.3.x` or `3.2.x` is `pip install -U`, `apply-install` and a host restart, and the store's
+schema does not change. From `3.1.x` the store moves to schema 1110 the first time it is opened,
 after which a 3.1 process cannot open it.
 3.1 is a rebuild rather than a patch on 2.0: production
 code went from 141,044 lines to 48,289, memory now accumulates evidence before a
@@ -20,17 +20,16 @@ migration procedure for a 2.0.1 memory database. SQLite remains the only fact
 authority; host adapters share the same contracts.
 
 **What is not verified.** `scripts/check.py --tier release` runs about 2,300 tests with
-none failing, but reports `missing_gates: ["model"]`. That gate wants a P18
-formal acceptance receipt: denominators of 120 independent core items and 240
-paired variants, evidence marked `real`, a method adjudication accepted by a
-party independent of whoever wrote the code, and an independent semantic scorer.
-The P18 machinery is in this tree; the evaluation corpus is not. **3.1.0 shipped
-without that receipt, and so has every release since, 3.3.0 included.** Every
-accuracy figure in the notes was measured by us, on our own corpora, by hand,
-and there is no regression suite you or we can re-run
-automatically -- that is the first item in *What is not finished*. Read a green
-test count as exactly that, never as a passing release gate. The integration
-(about 2,120 tests) and packaging (about 150) tiers both exit 0 with none failing.
+none failing. They check contracts, storage and the hosts' wiring; none of them
+measures recall quality. Every accuracy figure in the notes was measured by us, on
+our own corpora, by hand, and there is no regression suite you or we can re-run
+automatically -- that is the first item in *What is not finished*. A formal
+model-evaluation gate (P18) was declared for that and never completed: it needed an
+evaluation corpus and a scorer independent of the authors, which this project does
+not have, so every release from 3.1.0 to 3.3.0 reported it missing. 3.4.0 removes it
+rather than keep a gate nobody can pass. Read a green test count as exactly that.
+The integration (about 2,330 tests) and packaging (about 135) tiers both exit 0 with
+none failing.
 
 ## For agents: install or upgrade on the user's behalf
 
@@ -55,8 +54,8 @@ The package is `hermes-scope-recall` on PyPI. Install it into the same isolated 
 environment the host uses:
 
 ```text
-python -m pip install hermes-scope-recall==3.3.0
-python -m pip install "hermes-scope-recall[codex]==3.3.0"
+python -m pip install hermes-scope-recall==3.4.2
+python -m pip install "hermes-scope-recall[codex]==3.4.2"
 ```
 
 This fork's `3.2.7` build is installed from a wheel file built out of this branch
@@ -64,7 +63,7 @@ This fork's `3.2.7` build is installed from a wheel file built out of this branc
 upstream's `3.2.0`.
 
 The same wheel and sdist are attached to the
-[GitHub Release](https://github.com/410979729/scope-recall-hermes/releases/tag/v3.3.0)
+[GitHub Release](https://github.com/410979729/scope-recall-hermes/releases/tag/v3.4.2)
 alongside `SHA256SUMS` and `RELEASE-PROVENANCE.json`, for an offline install
 (`python -m pip install "<path-to-wheel>"`). To build it yourself from this checkout instead:
 

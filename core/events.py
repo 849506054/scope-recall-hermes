@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import functools
 import hashlib
 import re
 import unicodedata
@@ -55,17 +56,22 @@ def prepare_capture(value: SourceEvent | dict | str | bytes, context: TrustedCon
         raise ContractError("INPUT_INVALID", "nested_oversize_segment")
     # Stable ordinal chunks preserve every character. Hashing the occurrence
     # key keeps generated keys bounded; content never supplies identity.
-    prefix = "segmented-" + hashlib.sha256(raw["source_event_key"].encode("utf-8")).hexdigest()
     total = (len(filtered) + MAX_SEGMENT_CHARS - 1) // MAX_SEGMENT_CHARS
     events = []
     for index in range(total):
-        event = {**raw, "source_event_key": f"{prefix}/{index}",
+        event = {**raw, "source_event_key": segment_key(raw["source_event_key"], index),
                  "content": filtered[index*MAX_SEGMENT_CHARS:(index+1)*MAX_SEGMENT_CHARS],
                  "capture_state": state,
                  "segment": {"group_key": raw["source_event_key"], "index": index,
                              "total": total, "truncated": bool(gaps)}}
         events.append(validate_capture(event, context))
     return PreparedCapture(tuple(events), gaps)
+
+
+def segment_key(group_key: str, index: int) -> str:
+    """The key of part ``index`` of a long message whose key is ``group_key`` (``prepare_capture``): bounded, and
+    derived from the message's key alone, so a part is found by its message's key."""
+    return f"segmented-{hashlib.sha256(group_key.encode('utf-8')).hexdigest()}/{index}"
 
 
 def stored_content_digest(content: str) -> str:
@@ -106,10 +112,23 @@ def lexical_terms(text: str) -> tuple[str, ...]:
     return tuple(sorted(t for t in terms if 0 < len(t) <= 240))
 
 
+#: Terms a query searches for.  A longer query keeps the ones it reaches first: refused whole, a prompt of about 150
+#: Chinese characters (129 distinct bigrams and up) got no recall at all, by words or by meaning, and nothing said so.
+MAX_QUERY_TERMS = 128
+
+
 def query_terms(query: str) -> tuple[str, ...]:
     if type(query) is not str or len(query) > 8192:
         raise ContractError("INPUT_INVALID", "query")
+    return _query_terms(query)
+
+
+@functools.lru_cache(maxsize=64)
+def _query_terms(query: str) -> tuple[str, ...]:
+    """A recall asks for its query's terms 150 to 190 times: for a long varied prompt that was 4.3 s of 4.6."""
     terms = lexical_terms(query)
-    if len(terms) > 128:
-        raise ContractError("INPUT_INVALID", "query_terms")
+    if len(terms) > MAX_QUERY_TERMS:
+        normalized = unicodedata.normalize("NFKC", query).casefold()
+        first = sorted(terms, key=lambda term: (normalized.find(term), term))[:MAX_QUERY_TERMS]
+        terms = tuple(sorted(first))
     return terms

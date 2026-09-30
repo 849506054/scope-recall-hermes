@@ -1003,3 +1003,126 @@ def test_a_repeat_queued_before_the_limit_is_answered_without_the_model(app):
     assert evaluator.calls == 2
     third = next(row for row in evaluations if row["evaluation_id"] == evaluation_id)
     assert third["reason"] == "repeat_without_restatement" and third["model_attempted_at"] is None
+
+
+def _first_verdict_then_two_sources(core, ctx):
+    """A first verdict of "not enough", then one more first-hand source: the second question carries two."""
+    core.drain_worker(ctx, max_items=8, remaining_seconds=10, consolidation=Evaluator())
+    assert _new_first_hand_evidence(core, ctx, "entity-blue property-blue 今天又讨论了一次。", "TEST-rc10/second") == 1
+    _lifecycle, evaluations, _work = _candidate_rows(core)
+    assert len(json.loads(evaluations[-1]["evidence_refs_json"])) == 2
+
+
+def test_a_verdict_that_leaves_out_or_miscopies_a_supplied_source_still_counts(app):
+    """Which sources a question carried is the evaluation's record, not something the model must repeat.  Asked to
+    echo every supplied ref, it left one out or miscopied a 70-character id in 5.2% of the pilot's evaluations with
+    nine or more sources, and each such verdict failed for good as ``candidate_source_refs``."""
+    core, ctx = app
+    saved, _source, proposal, _registration = _candidate(core, ctx)
+    _finish_source_work(core)
+    _first_verdict_then_two_sources(core, ctx)
+
+    class Sloppy(Evaluator):
+        def evaluate_candidate(self, candidate, sources, *, remaining_seconds, **_repair):
+            value = json.loads(super().evaluate_candidate(candidate, sources, remaining_seconds=remaining_seconds))
+            first = value["source_refs"][0]
+            # One supplied source left out, and the other miscopied by one character.
+            value["source_refs"] = [first[:12] + ("0" if first[12] != "0" else "1") + first[13:]]
+            return json.dumps(value, ensure_ascii=False)
+
+    evaluator = Sloppy(proposal)
+    core.drain_worker(ctx, max_items=8, remaining_seconds=10, consolidation=evaluator)
+    assert evaluator.calls == 1
+    assert core.current_claim(ctx, saved.ref).state == "active"
+    _lifecycle, evaluations, _work = _candidate_rows(core)
+    assert evaluations[-1]["state"] == "resolved"
+
+
+def test_a_verdict_citing_a_source_it_was_not_given_is_still_refused(app):
+    """What a verdict cites must be among the sources its question carried, whatever list it returns."""
+    core, ctx = app
+    saved, _source, _proposal, _registration = _candidate(core, ctx)
+    elsewhere = capture(core, ctx, "entity-blue property-blue 蓝色，另一处的记录。", key="TEST-rc10/not-supplied")
+    _finish_source_work(core)
+    outside = draft(elsewhere, "蓝色", subject="entity-blue", predicate="property-blue")
+
+    class Outside(Evaluator):
+        def evaluate_candidate(self, candidate, sources, *, remaining_seconds, **_repair):
+            value = json.loads(super().evaluate_candidate(candidate, sources, remaining_seconds=remaining_seconds))
+            value["source_refs"].append(f"{elsewhere.ref}@{elsewhere.revision}")
+            return json.dumps(value, ensure_ascii=False)
+
+    core.drain_worker(ctx, max_items=8, remaining_seconds=10, consolidation=Outside(outside))
+    current = core.current_claim(ctx, saved.ref)
+    assert current is None or current.state != "active"
+    with sqlite3.connect(core.storage.path) as conn:
+        fields = {row[0] for row in conn.execute(
+            "SELECT error_field FROM work_error_details WHERE stage='candidate_evaluation'")}
+    assert fields == {"evidence_undeclared_source"}, fields
+
+
+def test_evidence_that_cannot_pose_a_new_question_does_not_wake_a_candidate(app):
+    """Only first-hand testimony changes what a candidate is asked.  Any other evidence marked it pending and reset
+    its clock: 2,045 candidates on the pilot waited for an evaluation nothing would schedule, and a tool output
+    every few days kept them from going dormant."""
+    core, ctx = app
+    _candidate(core, ctx)
+    _finish_source_work(core)
+    core.drain_worker(ctx, max_items=8, remaining_seconds=10, consolidation=Evaluator())
+    lifecycle, _evaluations, _work = _candidate_rows(core)
+    before = (lifecycle[0]["processing_state"], lifecycle[0]["reason"], lifecycle[0]["last_evidence_at"])
+    assert before[0] == "waiting_evidence"
+    tool = capture(core, ctx, "TEST 工具输出：entity-blue property-blue 蓝色。", origin="tool_observation",
+                   key="TEST-rc10/tool-evidence")
+    with sqlite3.connect(core.storage.path) as conn:
+        linked = conn.execute("SELECT count(*) FROM candidate_evidence WHERE source_ref=?", (tool.ref,)).fetchone()[0]
+    assert linked == 1, "the evidence is kept for the next evaluation"
+    lifecycle, _evaluations, _work = _candidate_rows(core)
+    assert (lifecycle[0]["processing_state"], lifecycle[0]["reason"], lifecycle[0]["last_evidence_at"]) == before
+    # First-hand testimony still wakes it.
+    assert _new_first_hand_evidence(core, ctx, "entity-blue property-blue 今天又讨论了一次。", "TEST-rc10/said") == 1
+
+
+def test_a_tool_output_does_not_keep_a_quiet_candidate_from_going_dormant(app):
+    """A candidate with no first-hand evidence after its evaluation goes dormant by ``updated_at``, which in
+    3.4.0rc10 a tool output still set: one every few weeks kept it from ever going dormant."""
+    from datetime import datetime, timedelta
+
+    core, ctx = app
+    candidate, _source, _proposal, _registration = _candidate(core, ctx)
+    _finish_source_work(core)
+    core.drain_worker(ctx, max_items=8, remaining_seconds=10, consolidation=Evaluator())
+    start = datetime.fromisoformat(core.clock.utc_now().replace("Z", "+00:00"))
+    core.clock.now = (start + timedelta(days=20)).isoformat().replace("+00:00", "Z")
+    tool = capture(core, ctx, "TEST 工具输出：entity-blue property-blue 蓝色。", origin="tool_observation",
+                   key="TEST-rc10/tool-late")
+    conn = sqlite3.connect(core.storage.path)
+    try:
+        assert conn.execute("SELECT count(*) FROM candidate_evidence WHERE source_ref=?", (tool.ref,)).fetchone()[0]
+    finally:
+        conn.close()
+    core.clock.now = (start + timedelta(days=31)).isoformat().replace("+00:00", "Z")
+    core.drain_worker(ctx, max_items=8, remaining_seconds=10)
+    lifecycle, _evaluations, _work = _candidate_rows(core)
+    row = next(row for row in lifecycle if row["candidate_ref"] == candidate.ref)
+    assert (row["processing_state"], row["reason"]) == ("archived", "dormant_no_evidence")
+
+
+def test_a_pass_returns_a_candidate_left_pending_with_nothing_to_ask_to_waiting(app):
+    """What releases before 3.4.0rc10 left: pending on a question already asked, with nothing to schedule it."""
+    core, ctx = app
+    _candidate(core, ctx)
+    _finish_source_work(core)
+    core.drain_worker(ctx, max_items=8, remaining_seconds=10, consolidation=Evaluator())
+    with sqlite3.connect(core.storage.path) as conn:
+        conn.execute("UPDATE candidate_lifecycle SET processing_state='pending_evaluation',reason='new_evidence'")
+        conn.commit()
+    _settle_evidence(core)
+    evaluator = Evaluator()
+    core.drain_worker(ctx, max_items=8, remaining_seconds=10, consolidation=evaluator)
+    lifecycle, _evaluations, _work = _candidate_rows(core)
+    assert (lifecycle[0]["processing_state"], lifecycle[0]["reason"]) == ("waiting_evidence", "no_new_question")
+    assert evaluator.calls == 0
+    assert _new_first_hand_evidence(core, ctx, "entity-blue property-blue 今天又讨论了一次。", "TEST-rc10/after") == 1
+    core.drain_worker(ctx, max_items=8, remaining_seconds=10, consolidation=evaluator)
+    assert evaluator.calls == 1

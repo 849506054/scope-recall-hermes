@@ -33,8 +33,12 @@ from .evidence_question import (
 
 #: Truncated source triggers still owe a page of candidates, joined to their
 #: source so the audience filter can apply.
+#: Read inside the worker's page writes, so it starts from the few triggers: CROSS JOIN keeps SQLite's join
+#: order.  Left to choose, it started from ``source_events`` through its scope index and looked up a trigger for
+#: every source: 2.7 s and 3.5 s a page on the shared store on 2026-09-27 (8,819 triggers, 192 truncated), with
+#: the writer lease held, where this order takes 4-5 ms.
 _TRUNCATED_TRIGGERS = """FROM candidate_source_triggers t
-    JOIN source_events s ON s.event_id=t.source_ref AND s.source_revision=t.source_revision
+    CROSS JOIN source_events s ON s.event_id=t.source_ref AND s.source_revision=t.source_revision
     WHERE t.truncated=1 AND {context}"""
 
 
@@ -151,8 +155,13 @@ class CandidateIntake(CandidateTables):
         rule_version: str = RULE_VERSION,
         limit: int = SOURCE_MATCH_LIMIT,
         _resume: bool = False,
+        _matched: list[tuple[str, int]] | None = None,
     ) -> CandidateSourceTrigger:
-        """Wake a bounded set of indexed, same-audience candidates with this source."""
+        """Wake a bounded set of indexed, same-audience candidates with this source.
+
+        ``_matched`` is the page ``next_source_page`` chose in a read; each candidate on it is checked again
+        here, under the writer lease, before it takes the evidence.
+        """
         if type(limit) is not int or not 1 <= limit <= SOURCE_MATCH_LIMIT:
             raise ContractError("INPUT_INVALID", "candidate_match_limit")
         now = utc(observed_at)
@@ -169,23 +178,51 @@ class CandidateIntake(CandidateTables):
         if prior is not None and not (_resume and prior["truncated"]):
             return CandidateSourceTrigger(source_ref, source_revision, "duplicate", prior["matched_count"],
                                           prior["scheduled_count"], bool(prior["truncated"]))
-        rows = self._candidates_mentioned_by(source, limit + 1)
-        matched = scheduled = 0
-        for row in rows[:limit]:
-            candidate = self._tx.claims.version(row["candidate_ref"], row["candidate_revision"])
-            if candidate is None or candidate.current_revision != candidate.revision:
-                continue
-            if not self._add_evidence(candidate, source_ref, source_revision, now):
-                continue
-            matched += 1
-            conn.execute(
-                f"""UPDATE candidate_lifecycle SET processing_state='pending_evaluation',reason='new_evidence',
-                    last_evidence_at=?,updated_at=?,dormant_at=NULL
-                    WHERE candidate_ref=? AND candidate_revision=? AND {reachable_sql()}""",
-                (now, now, candidate.ref, candidate.revision),
-            )
-            _, queued = self._schedule_when_settled(candidate, now=now, rule_version=rule_version)
-            scheduled += int(queued)
+        # Only first-hand testimony can pose a new question (``question_digest``).  Other evidence is recorded for
+        # the next evaluation and changes nothing else about the candidate: marked pending and its clock reset,
+        # 2,045 candidates on the pilot waited for an evaluation nothing would schedule, and a tool output every
+        # few days kept them from ever going dormant.  Its ``updated_at`` stays too, which is the dormancy clock of
+        # a candidate with no first-hand evidence since it was evaluated.
+        first_hand = is_first_hand(evidence_text(source).origin)
+
+        def link(rows: list[tuple[str, int]], *, recheck: bool) -> tuple[int, int]:
+            matched = scheduled = 0
+            for candidate_ref, candidate_revision in rows[:limit]:
+                candidate = self._tx.claims.version(candidate_ref, candidate_revision)
+                if candidate is None or candidate.current_revision != candidate.revision:
+                    continue
+                if recheck:
+                    # Read before this write: it may have been archived, suppressed or resolved since.
+                    lifecycle = self._lifecycle_row(candidate.ref, candidate.revision)
+                    if (candidate.suppressed or lifecycle is None
+                            or not is_reachable(lifecycle["processing_state"], lifecycle["reason"])):
+                        continue
+                if not self._add_evidence(candidate, source_ref, source_revision, now):
+                    continue
+                matched += 1
+                if not first_hand:
+                    continue
+                conn.execute(
+                    f"""UPDATE candidate_lifecycle SET processing_state='pending_evaluation',reason='new_evidence',
+                        last_evidence_at=?,updated_at=?,dormant_at=NULL
+                        WHERE candidate_ref=? AND candidate_revision=? AND {reachable_sql()}""",
+                    (now, now, candidate.ref, candidate.revision),
+                )
+                _, queued = self._schedule_when_settled(candidate, now=now, rule_version=rule_version)
+                scheduled += int(queued)
+            return matched, scheduled
+
+        def here() -> list[tuple[str, int]]:
+            return [(row["candidate_ref"], row["candidate_revision"])
+                    for row in self._candidates_mentioned_by(source, limit + 1)]
+
+        rows = here() if _matched is None else _matched
+        matched, scheduled = link(rows, recheck=_matched is not None)
+        if _matched is not None and rows and not matched:
+            # Another drain linked this page between the read and this write.  Closing on it would leave the
+            # candidates past it without this source, so the next page is found here instead.
+            rows = here()
+            matched, scheduled = link(rows, recheck=False)
         # Evidence membership is the cursor, so a page that linked nothing puts
         # the same rows first in line again and resuming it can never finish.
         # Only a page that made progress keeps its remainder open.
@@ -416,24 +453,65 @@ class CandidateIntake(CandidateTables):
             f"SELECT count(*) {_TRUNCATED_TRIGGERS.format(context=context)}", params,
         ).fetchone()[0]
 
-    def resume_source_pages(self, *, now: str) -> int:
-        """Continue one bounded page using persisted evidence membership as cursor."""
+    def next_source_page(self) -> tuple[str, int, list[tuple[str, int]] | None] | None:
+        """The next page a truncated trigger owes, chosen in a read: its source and the candidates it names.
+
+        Finding the candidates is most of a page: every candidate that shares a term with the source is
+        joined, de-duplicated and sorted, and a source that is not first-hand is then read against them one
+        by one.  Inside the page's write that held the writer lease 0.5-7.4 s a page on the shared store
+        (median 1.3 s), and every hook that waited its second for the lease meanwhile lost its capture.
+        ``resume_source_pages(page=...)`` then links in a write of its own, checking each candidate again.
+        The candidates are ``None`` when the source is gone: that write closes the trigger.
+        """
         context, params = self._context("s.")
         row = self._read().execute(
             f"""SELECT t.source_ref,t.source_revision {_TRUNCATED_TRIGGERS.format(context=context)}
                 ORDER BY t.processed_at,t.source_ref,t.source_revision LIMIT 1""", params,
         ).fetchone()
         if row is None:
-            return 0
+            return None
+        source = self._tx.source(row["source_ref"], row["source_revision"])
+        current = self._tx.source_current(row["source_ref"])
+        if source is None or source.suppressed or current is None or current.revision != source.revision:
+            return row["source_ref"], row["source_revision"], None
+        return row["source_ref"], row["source_revision"], [
+            (match["candidate_ref"], match["candidate_revision"])
+            for match in self._candidates_mentioned_by(source, SOURCE_MATCH_LIMIT + 1)]
+
+    def resume_source_pages(self, *, now: str, page: tuple[str, int, list[tuple[str, int]] | None] | None = None) -> int:
+        """Continue one bounded page using persisted evidence membership as cursor.
+
+        With ``page`` (from ``next_source_page``) the candidates are the ones that read found; without it
+        they are found here, inside this write.
+        """
+        if page is None:
+            context, params = self._context("s.")
+            row = self._read().execute(
+                f"""SELECT t.source_ref,t.source_revision {_TRUNCATED_TRIGGERS.format(context=context)}
+                    ORDER BY t.processed_at,t.source_ref,t.source_revision LIMIT 1""", params,
+            ).fetchone()
+            if row is None:
+                return 0
+            source_ref, source_revision, matched = row["source_ref"], row["source_revision"], None
+        else:
+            # A source the read found gone comes back as ``None`` candidates, found again here: the source is
+            # checked first, so the trigger closes below.
+            source_ref, source_revision, matched = page
+            still = self._read().execute(
+                "SELECT truncated FROM candidate_source_triggers WHERE source_ref=? AND source_revision=?",
+                (source_ref, source_revision)).fetchone()
+            if still is None or not still["truncated"]:
+                return 0
         try:
-            return self.observe_source(row["source_ref"], row["source_revision"], observed_at=now, _resume=True).matched
+            return self.observe_source(source_ref, source_revision, observed_at=now, _resume=True,
+                                       _matched=matched).matched
         except ContractError as exc:
             if exc.code != "SOURCE_MISSING":
                 raise
             # Deleted, suppressed or superseded evidence cannot wake more claims.
             self._write().execute(
                 "UPDATE candidate_source_triggers SET truncated=0,processed_at=? WHERE source_ref=? AND source_revision=?",
-                (now, row["source_ref"], row["source_revision"]),
+                (now, source_ref, source_revision),
             )
             return 0
 

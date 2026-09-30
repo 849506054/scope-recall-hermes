@@ -16,6 +16,8 @@ from dataclasses import MISSING, asdict, dataclass, field, fields, replace
 from functools import partial
 import math
 from pathlib import Path
+import sqlite3
+import threading
 import time
 from typing import Any, Callable, Mapping
 
@@ -24,6 +26,7 @@ from ..core.composition import CoreConfig, MemoryCore
 from ..core.storage import SQLiteStorage
 from ..core.retrieval import SearchContext
 from ..core.deadline import RequestDeadline, using_request_deadline
+from ..core.index_rebuild import IMPORT_EMBED_QUEUE_CEILING
 from .auxiliary import AuxiliaryRuntimeConfig, build_auxiliary_runtime
 from .embedding_retry import embed_with_one_retry
 from .running_code import record_running_code
@@ -39,7 +42,7 @@ from .validation import (
 )
 from ..vector.qdrant_config import QdrantConfig
 from .vector_retention import expire_if_due
-from .vector_upkeep import compact_if_due
+from .vector_upkeep import backfill_if_due, compact_if_due, index_if_due
 
 
 _RUNTIME_ORIGINS: frozenset[Origin] = frozenset(
@@ -270,6 +273,55 @@ class RuntimeInstanceConfig:
         )
 
 
+#: Share of a recall's window its query embedding may take when it is asked for as the recall starts.  The rest is the
+#: vector search's own: an embedding that took all of it would leave the search nothing.
+QUERY_EMBEDDING_SHARE = 0.7
+
+
+class _QueryEmbedding:
+    """One query's embedding, asked for when its recall starts instead of after the SQLite channels.
+
+    Behind the exact, lexical, claim and recent channels the embedding had three quarters of what they left, about
+    2.2 s of a prompt's 4 s window: enough on a warm connection, not for the new one a prompt more than 30 s after the
+    last needs (the proxy's tunnel, TLS, then the provider).  On 2026-09-29 the work computer's server recalled 4 of 9
+    prompts by words alone that way (``AuxiliaryModelError:timeout``), and the owner's own prompts after a pause did
+    too.  Asked for as the recall starts, it runs beside those channels with its share of the whole window.
+    """
+
+    def __init__(self, query: str, deadline: float) -> None:
+        self.query = query
+        self.deadline = deadline
+        self._done = threading.Event()
+        self._vector: Any = None
+        self._error: BaseException | None = None
+
+    def run(self, embed: Callable[[str, float], Any]) -> None:
+        try:
+            deadline = RequestDeadline.from_absolute(self.deadline, now=time.monotonic())
+            with using_request_deadline(deadline):
+                budget = deadline.remaining()
+                if budget <= 0:
+                    raise TimeoutError("query embedding stage deadline exhausted")
+                # A connection that failed in milliseconds costs the whole
+                # semantic channel otherwise; a rejected request is not retried.
+                self._vector = embed_with_one_retry(lambda seconds: embed(self.query, seconds),
+                                                    budget_seconds=budget, remaining=deadline.remaining)
+        except BaseException as exc:  # the recall that waits for it reports it
+            self._error = exc
+        finally:
+            self._done.set()
+
+    def result(self, deadline: float) -> Any:
+        """The vector; the embedding's own failure; a timeout if it is still out at ``deadline``."""
+        if not self._done.wait(max(0.0, deadline - time.monotonic())):
+            from ..adapters.models import AuxiliaryModelError
+
+            raise AuxiliaryModelError("timeout")
+        if self._error is not None:
+            raise self._error
+        return self._vector
+
+
 class _LazyVectorPort:
     """Request-local vector facade for direct Core and Runtime calls.
 
@@ -283,13 +335,40 @@ class _LazyVectorPort:
     def __init__(self, instance: "RuntimeInstance") -> None:
         self._instance = instance
 
-    def search(self, context: SearchContext, *, limit: int, remaining_seconds: float):
+    def _query_embedder(self) -> Callable[[str, float], Any] | None:
+        from ..adapters.lance import LanceVectorPort
+
+        embedding = getattr(self._instance.auxiliary, "query_embedding", None)
+        if embedding is None:
+            return None
+        adapter = LanceVectorPort(None, embedding, expected_embedding_space=self._instance.config.embedding_space_id())
+        return adapter._embed_query
+
+    def prefetch_query(self, context: SearchContext) -> _QueryEmbedding | None:
+        """Ask for the query's embedding now, beside the SQLite channels; ``search`` takes it from there."""
+        if not isinstance(context, SearchContext) or self._instance.config.vector is None:
+            return None
+        embed = self._query_embedder()
+        if embed is None:
+            return None
+        now = time.monotonic()
+        window = context.deadline - now
+        if window <= 0.0:
+            return None
+        pending = _QueryEmbedding(context.query, now + window * QUERY_EMBEDDING_SHARE)
+        threading.Thread(target=pending.run, args=(embed,), name="scope-recall-query-embedding", daemon=True).start()
+        return pending
+
+    def search(self, context: SearchContext, *, limit: int, remaining_seconds: float,
+               prefetched: _QueryEmbedding | None = None):
         if not isinstance(context, SearchContext):
             raise TypeError("context must be SearchContext")
         if type(limit) is not int or not 1 <= limit <= 200:
             raise ValueError('limit must be between 1 and 200')
         if type(remaining_seconds) not in (int, float) or not math.isfinite(float(remaining_seconds)):
             raise ValueError('remaining_seconds must be finite')
+        if prefetched is not None and prefetched.query != context.query:
+            prefetched = None
         now = time.monotonic()
         remaining = min(float(remaining_seconds), context.deadline - now)
         if remaining <= 0.0:
@@ -298,35 +377,51 @@ class _LazyVectorPort:
         context = replace(context, deadline=effective_deadline)
         deadline = RequestDeadline.from_absolute(effective_deadline, now=now)
         prepared: list[tuple[str, Any]] = []
+        failed: list[Exception] = []
 
-        def embed_while_opening() -> None:
-            from ..adapters.lance import LanceVectorPort
-
-            embedding = getattr(self._instance.auxiliary, "query_embedding", None)
-            if embedding is None:
-                return
-            embedding_remaining = deadline.remaining()
-            if embedding_remaining <= 0:
-                raise TimeoutError("query embedding stage deadline exhausted")
-            adapter = LanceVectorPort(None, embedding,
-                                      expected_embedding_space=self._instance.config.embedding_space_id())
-            # A connection that failed in milliseconds costs the whole
-            # semantic channel otherwise; a rejected request is not retried.
-            vector = embed_with_one_retry(
-                lambda seconds: adapter._embed_query(context.query, seconds),
-                budget_seconds=embedding_remaining,
-                remaining=deadline.remaining,
-            )
-            prepared.append((context.query, vector))
+        def embed_while_opening() -> bool | None:
+            # The embedding's failure is this recall's to report.  Raised inside the open, it closed the helper as
+            # well, and the next prompt opened the table cold again; reported as False, the open is taken if it has
+            # come and parked for the next request if not, so a fast failure does not wait for the table either.
+            try:
+                if prefetched is not None:
+                    prepared.append((context.query, prefetched.result(effective_deadline)))
+                    return True
+                embed = self._query_embedder()
+                if embed is None:
+                    return None
+                embedding_remaining = deadline.remaining()
+                if embedding_remaining <= 0:
+                    raise TimeoutError("query embedding stage deadline exhausted")
+                prepared.append((context.query, embed_with_one_retry(
+                    lambda seconds: embed(context.query, seconds),
+                    budget_seconds=embedding_remaining,
+                    remaining=deadline.remaining,
+                )))
+                return True
+            except Exception as exc:
+                failed.append(exc)
+                return False
 
         with using_request_deadline(deadline):
             port = self._instance._ensure_vector_port(allow_create=False, deadline=effective_deadline,
                                                       during_open=embed_while_opening)
             if port is None:
                 return ()
+            if failed:
+                raise failed[0]
+            if deadline.remaining() <= 0.0:
+                # The helper is still opening the table: its answer waits for the next request, which a hook's
+                # process never makes.  Returned as nothing, this recall looked as if the search had found nothing
+                # and reported no gap; Claude Code and Codex lost their vector search this way unseen.
+                raise TimeoutError("native vector helper open deadline exhausted before the search")
+            if not prepared and prefetched is not None:
+                prepared.append((context.query, prefetched.result(effective_deadline)))
             remaining = min(remaining, deadline.remaining())
             if remaining <= 0.0:
-                return ()
+                # The embedding came back with no time left to search: the search would return nothing and say
+                # nothing, and the recall would look as if it had searched by meaning.
+                raise TimeoutError("native vector helper request deadline exhausted before the search")
             if prepared:
                 return port.search(context, limit=limit, remaining_seconds=remaining, _prepared_query=prepared[0])
             return port.search(context, limit=limit, remaining_seconds=remaining)
@@ -373,8 +468,12 @@ class RuntimeInstance:
     ingress_receipts: tuple[Any, ...] = ()
     #: Receipt of the vector compaction this drain ran, or ``None``.
     vector_compaction: dict | None = None
+    #: Receipt of the look this drain took at the nearest-neighbour index, or ``None``.
+    vector_index: dict | None = None
     #: Receipt of the vector retention pass this drain ran, or ``None``.
     vector_retention: dict | None = None
+    #: Receipt of the page of an import's embeddings this drain queued (``backfill_if_due``), or ``None``.
+    embed_backfill: dict | None = None
     #: Work types this drain left alone, each with the held model and when its
     #: hold ends (runtime/model_budget.py ``provider_holds``).
     provider_holds: dict = field(default_factory=dict)
@@ -410,6 +509,37 @@ class RuntimeInstance:
             raise
         self._compose_ports(resource)
         return self._vector_port
+
+    def warm_vector_store(self, seconds: float) -> bool:
+        """Open the existing companion store and search it once, off any prompt's time.
+
+        A recall handler kept across prompts (adapters/codex/local_endpoint.KeptRecaller) was made at its first
+        prompt: that prompt's recall started the helper, opened the table and read the index, and it recalled by
+        words alone (``helper_request_deadline``) after every start of its server, which for Claude Code is every
+        session.  Warmed when the server starts, the first prompt finds them ready.  It writes nothing.
+        """
+        self._ensure_open()
+        if self.config.vector is None or self._vector_factory is None:
+            return False
+        now = time.monotonic()
+        deadline = now + float(seconds)
+        with using_request_deadline(RequestDeadline.from_absolute(deadline, now=now)):
+            if self._ensure_vector_port(allow_create=False, deadline=deadline) is None:
+                return False
+            search_scopes = getattr(self._vector_store, "search_scopes", None)
+            trusted = self.config.context()
+            if not callable(search_scopes) or not trusted.allowed_scope_ids:
+                return True
+            from ..adapters.lance import physical_partition_scope_id
+
+            partition = physical_partition_scope_id(
+                agent_id=trusted.binding.agent_id, installation_id=trusted.binding.installation_id,
+                embedding_space=self.config.embedding_space_id(), logical_scope_id=min(trusted.allowed_scope_ids),
+                project_id=None, branch_id=None,
+            )
+            # Any vector reads the index the same way; what it finds is not looked at.
+            search_scopes([1.0] + [0.0] * (self.config.vector.dimensions - 1), scope_ids=[partition], limit=1)
+        return True
 
     def _compose_ports(self, resource: Any) -> None:
         """Core consumes ports that turn trusted SearchContext values into
@@ -466,7 +596,8 @@ class RuntimeInstance:
         strict_float("remaining_seconds", budget, minimum=.001, maximum=self.config.drain_seconds)
         deadline = time.monotonic() + budget
         ingress_gaps = self._replay_ingress(budget)
-        self.background_gaps = (*ingress_gaps, *self._open_vector_for_drain(deadline, budget))
+        vector_gaps = self._open_vector_for_drain(deadline, budget)
+        self.background_gaps = (*ingress_gaps, *vector_gaps)
         # Upkeep comes before the queue, not after it: on a busy instance the
         # budget is gone by the time the queue drains, so upkeep at the end is
         # upkeep that only ever runs when it is not needed.
@@ -480,14 +611,32 @@ class RuntimeInstance:
             available_seconds=max(0.0, deadline - time.monotonic()),
             reason=f"vectors_expired:{expired}" if expired else None,
         )
+        # A store this pass could not open says nothing about its index; a look now would be recorded as a
+        # failure and put off the build for hours.
+        self.vector_index = None if vector_gaps else index_if_due(
+            self._vector_store, self.config.vector,
+            available_seconds=max(0.0, deadline - time.monotonic()),
+        )
         from ..core.worker import WorkerConfig, drain_worker
+        from .model_budget import provider_holds
 
         model, candidate = self._consolidation_ports(consolidation)
+        self.provider_holds = {} if purge_only else provider_holds(self.config.auxiliary)
+        # An import's history in a person's roles gets the embedding its source store never queued, a page a pass
+        # and only while the queue is shallow (``core.index_rebuild.queue_import_embeddings``).  Embeddings are
+        # claimed before candidate evaluations, so while one is ready that this pass would claim, no more than half
+        # a pass of them is kept waiting: evaluations share every pass, and the backfill still moves when they
+        # cannot be done.  One without an evaluator, under a provider hold, or in a pass that only purges does not
+        # count.
+        evaluations = frozenset() if purge_only or candidate is None \
+            else frozenset({"evaluate_candidate"}) - frozenset(self.provider_holds)
+        page = self.config.max_items if max_items is None else max_items
+        self.embed_backfill = None if vector_gaps or (embed if embed is not None else self._default_embed) is None \
+            else backfill_if_due(self.core.storage, self.config.context(), self.config.vector, yield_to=evaluations,
+                                 yield_ceiling=min(IMPORT_EMBED_QUEUE_CEILING, max(1, page // 2)))
         limit = self.config.request_seconds
         effective_embed = embed if embed is not None else self._default_embed
         effective_purge = purge if purge is not None else self._default_purge
-        from .model_budget import provider_holds
-        self.provider_holds = {} if purge_only else provider_holds(self.config.auxiliary)
         return drain_worker(
             self.core.storage, self.core.clock, self.config.context(),
             config=WorkerConfig(owner_id=self.config.owner_id,
@@ -509,7 +658,7 @@ class RuntimeInstance:
 
     def _replay_ingress(self, budget: float) -> tuple[str, ...]:
         """Persist captured inbox payloads.  Ingress never spends the model-work budget."""
-        from ..core.capture_inbox import replay_inbox, resolve_conflicted_ingress
+        from ..core.capture_inbox import INGRESS_PENDING_GAP, replay_inbox, resolve_conflicted_ingress
 
         self.ingress_receipts = ()
         try:
@@ -519,16 +668,21 @@ class RuntimeInstance:
             options = dict(authorize=self._ingress_authorizer,
                            admission_policy=self.core.config.admission_policy,
                            remaining_seconds=min(2.0, budget / 4))
-            self.ingress_receipts = tuple(replay_inbox(self.core.storage, self.core.clock, context, **options))
-            # A key-collided capture is invisible to the replay above, which
-            # only retries failures that might clear by themselves; without
-            # this it stays in the inbox forever, captured but never stored.
-            self.ingress_receipts += tuple(
-                resolve_conflicted_ingress(self.core.storage, self.core.clock, context, **options)
-            )
-            return ()
         except (ContractError, OSError, RuntimeError, ValueError):
-            return ("capture_gap:durable_ingress_pending",)
+            return (INGRESS_PENDING_GAP,)
+        # A key-collided capture is invisible to the first replay, which only
+        # retries failures that might clear by themselves; without the second
+        # it stays in the inbox forever, captured but never stored.  Each runs
+        # whatever the other met: one that raised skipped the other.
+        pending = False
+        for replay in (replay_inbox, resolve_conflicted_ingress):
+            try:
+                self.ingress_receipts += tuple(replay(self.core.storage, self.core.clock, context, **options))
+            except (ContractError, OSError, RuntimeError, ValueError, sqlite3.Error):
+                pending = True
+        if pending or any(INGRESS_PENDING_GAP in receipt.gaps for receipt in self.ingress_receipts):
+            return (INGRESS_PENDING_GAP,)
+        return ()
 
     def _unauthorized_ingress_gaps(self, context: TrustedContext, budget: float) -> tuple[str, ...]:
         """Without an authorizer, pending ingress can only be reported, not replayed."""

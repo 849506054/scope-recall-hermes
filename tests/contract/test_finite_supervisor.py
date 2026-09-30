@@ -11,7 +11,7 @@ import time
 
 import pytest
 
-from scope_recall.contracts import InstanceBinding
+from scope_recall.contracts import InstanceBinding, TrustedContext
 from scope_recall.core import CoreConfig, MemoryCore
 from scope_recall.runtime.instance import RuntimeInstanceConfig
 from scope_recall.runtime.scheduling import SupervisorControl, next_wake, supervise
@@ -78,6 +78,43 @@ def test_next_due_preserves_audience_cooldown_budget_and_purge(tmp_path):
         tx._check(write=True).execute("UPDATE work_items SET state='failed',last_error_code='invalid_derivation'")
     plan=next_wake(cfg,now=NOW)
     assert plan.due_at is None and plan.reason=='failed_terminal' and plan.failed>0
+
+
+def test_an_inbox_row_a_replay_will_store_wakes_the_worker(tmp_path):
+    """The wake counted rows never tried and two passing failures, so a row an older release left as a bare
+    ``SOURCE_MISSING`` (replayed once more since 3.4.0rc10) waited for a pass something else started.  A key
+    collision wakes it too: its pass gives it a new key, and one its new key cannot store either is final
+    (``VERSION_CONFLICT:rekeyed``), which wakes nothing (reviews of rc10).  Nor does a row whose failure is final."""
+    from scope_recall.core import capture_inbox
+
+    from scope_recall._version import __version__
+
+    core, cfg, _path = fixture(tmp_path)
+    later = (NOW + timedelta(minutes=40)).strftime('%Y-%m-%dT%H:%M:%SZ')
+    # Put off until later, by any release and on either path: each wakes the worker when its time is up.  Given up:
+    # nothing, until an operator returns it.
+    codes = ('SOURCE_MISSING', 'VERSION_CONFLICT', 'VERSION_CONFLICT:rekeyed', 'SOURCE_MISSING:TEST-final',
+             f'DEFERRED|{__version__}|{later}|1|replay|IDENTITY_UNBOUND', f'DEFERRED|0.0.1|{later}|3|rekey|TypeError',
+             f'GAVE_UP|{__version__}|24|replay|TypeError', 'GAVE_UP|0.0.1|24|rekey|TypeError')
+    for index, code in enumerate(codes):
+        event = source_event(source_event_key=f'TEST-inbox-{index}', content=f'TEST 第{index}条。')
+        token, _prepared = capture_inbox.enqueue(core.storage, core.clock, cfg.context(), event,
+                                                 scope_id='TEST-a', host_scope=None)
+        with core.storage.write(cfg.context()) as tx:
+            tx._check(write=True).execute('UPDATE capture_inbox SET last_error_code=? WHERE token=?', (code, token))
+    # A row of another partition (here none at all) is not this worker's to replay: counted, it woke a pass that
+    # never took it (review of rc10).
+    elsewhere = TrustedContext(cfg.binding, 'TEST-session', frozenset({'TEST-a'}), 'human_direct')
+    capture_inbox.enqueue(core.storage, core.clock, elsewhere, source_event(
+        source_event_key='TEST-inbox-elsewhere', content='TEST 别处的一条。'), scope_id='TEST-a', host_scope=None)
+    plan = next_wake(cfg, now=NOW)
+    assert (plan.reason, plan.pending) == ('durable_capture_ingress', 2)
+    with core.storage.write(cfg.context()) as tx:
+        tx._check(write=True).execute("DELETE FROM capture_inbox WHERE last_error_code NOT LIKE 'DEFERRED|%'")
+    plan = next_wake(cfg, now=NOW)
+    assert (plan.reason, plan.due_at, plan.pending) == ('durable_capture_deferred', later, 0)
+    plan = next_wake(cfg, now=NOW + timedelta(minutes=41))
+    assert (plan.reason, plan.pending) == ('durable_capture_ingress', 2)
 
 
 def test_busy_day_counter_still_plans_and_both_readers_share_one_bound(tmp_path, monkeypatch):

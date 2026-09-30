@@ -257,3 +257,223 @@ def test_index_page_excludes_deleted_sources_and_is_idempotent(app):
             .fetchall()
         )
     assert [r[0] for r in after] == [r[0] for r in before]
+
+
+def _imported(core, ctx, text, *, role, key):
+    """A source an import brought in, and no embedding for it, as a store that never had one would leave it."""
+    import sqlite3
+
+    from scope_recall.contracts import ImportProvenance, import_source_fingerprint
+
+    original = ("human_direct" if role == "user" else "assistant_visible" if role == "assistant"
+                else "tool_observation" if role == "tool" else "origin_unknown")
+    event = source_event(source_event_key=key, source_revision=1, origin="imported", role=role, content=text,
+                         occurred_at="2026-07-01T12:00:00Z", time_precision="instant",
+                         source_original_origin=original)
+    importer = ImportProvenance(original, "a" * 64, frozenset({import_source_fingerprint(event)}))
+    saved = core.record_event(replace(ctx, actor_origin="imported", import_provenance=importer), event,
+                              scope_id="TEST-scope", remaining_seconds=10)
+    ref = saved.event_refs[0].ref
+    with sqlite3.connect(core.storage.path) as conn:
+        conn.execute("DELETE FROM work_items WHERE subject_ref=? AND work_type='embed'", (ref,))
+        conn.commit()
+    return ref
+
+
+def _embeds(core):
+    import sqlite3
+
+    with sqlite3.connect(core.storage.path) as conn:
+        return {row[0] for row in conn.execute("SELECT subject_ref FROM work_items WHERE work_type='embed'")}
+
+
+def test_an_import_s_history_gets_the_embedding_its_store_never_had(app):
+    """An import queued an embedding only where its source store had one: on the pilot tianshu's history, 1,928 of
+    the owner's messages, 6,552 replies and 3,009 notes, could be found by their words alone.  Tool output is left
+    out (200,000 imported outputs), and so is what the admission rules keep without one."""
+    from scope_recall.core.index_rebuild import queue_import_embeddings
+    from scope_recall.core.storage import SQLiteStorage
+
+    core, ctx = app
+    said = _imported(core, ctx, "TEST 家里的猫叫小橘。", role="user", key="TEST-import/said")
+    told = _imported(core, ctx, "TEST 好的，记住了，猫叫小橘。", role="assistant", key="TEST-import/told")
+    note = _imported(core, ctx, "TEST 旧笔记：小橘怕打雷。", role="unknown", key="TEST-import/note")
+    tool = _imported(core, ctx, "TEST ls 输出：a.txt b.txt", role="tool", key="TEST-import/tool")
+    ack = _imported(core, ctx, "好的", role="user", key="TEST-import/ack")
+    storage = SQLiteStorage(ctx.binding)
+    first = queue_import_embeddings(storage, ctx, limit=2)
+    assert first["scanned"] == 2 and not first["finished"] and not first["held"] and first["queued"] in (1, 2)
+    rest = queue_import_embeddings(storage, ctx, after_key=first["after_key"], limit=200)
+    assert rest["finished"]
+    assert {said, told, note} <= _embeds(core) and not {tool, ack} & _embeds(core)
+    # Looked at again from the start, nothing is queued twice and the acknowledgement is passed over again.
+    again = queue_import_embeddings(storage, ctx, limit=200)
+    assert again["queued"] == 0 and again["finished"]
+
+
+def test_the_backfill_queues_only_what_this_worker_embeds(app):
+    """An import in another project was queued where this worker neither counts nor claims it (84 of 84 in three
+    pages, the queue read empty); a deleted, a suppressed and a superseded import were never tested."""
+    import sqlite3
+
+    from scope_recall.core.index_rebuild import queue_import_embeddings
+    from scope_recall.core.storage import SQLiteStorage
+
+    core, ctx = app
+    said = _imported(core, ctx, "TEST 家里的猫叫小橘。", role="user", key="TEST-import/here")
+    elsewhere = _imported(core, ctx, "TEST 另一个项目里的话。", role="user", key="TEST-import/elsewhere")
+    deleted = _imported(core, ctx, "TEST 已经删掉的话。", role="user", key="TEST-import/deleted")
+    hidden = _imported(core, ctx, "TEST 被隐藏的话。", role="user", key="TEST-import/hidden")
+    old = _imported(core, ctx, "TEST 旧的说法。", role="user", key="TEST-import/revised")
+    conn = sqlite3.connect(core.storage.path)
+    try:
+        conn.execute("UPDATE source_events SET project_id='TEST-other-project' WHERE event_id=?", (elsewhere,))
+        conn.execute("UPDATE source_events SET read_blocked=1 WHERE event_id=?", (deleted,))
+        conn.execute("UPDATE source_events SET suppressed=1 WHERE event_id=?", (hidden,))
+        # A later revision of the same source: only it is current.
+        columns = [row[1] for row in conn.execute("PRAGMA table_info(source_events)")]
+        picked = ["source_revision+1" if name == "source_revision" else "NULL" if name == "source_id" else name
+                  for name in columns]
+        conn.execute(f"INSERT INTO source_events({','.join(columns)}) SELECT {','.join(picked)} FROM source_events"
+                     " WHERE event_id=?", (old,))
+        conn.commit()
+    finally:
+        conn.close()
+    storage = SQLiteStorage(ctx.binding)
+    after_key = None
+    for _ in range(10):
+        page = queue_import_embeddings(storage, ctx, after_key=after_key, limit=1)
+        after_key = page["after_key"]
+        if page["finished"]:
+            break
+    conn = sqlite3.connect(core.storage.path)
+    try:
+        queued = set(conn.execute("SELECT subject_ref,subject_revision FROM work_items WHERE work_type='embed'"))
+    finally:
+        conn.close()
+    assert (said, 1) in queued and (old, 2) in queued and (old, 1) not in queued
+    assert not {ref for ref, _revision in queued} & {elsewhere, deleted, hidden}
+    with storage.read(ctx) as tx:
+        assert tx.work.pending_depth("embed") == len(queued), "every queued embedding is one this worker claims"
+
+
+def test_each_worker_partition_keeps_its_own_backfill_place(app, tmp_path):
+    """One state file for the store let a worker with no imports of its own write ``finished`` for another worker's,
+    which then waited a day before queueing its imports (review of 3.4.0rc10)."""
+    import sqlite3
+    from datetime import datetime, timedelta, timezone
+    from types import SimpleNamespace
+
+    from scope_recall.core.storage import SQLiteStorage
+    from scope_recall.runtime.vector_upkeep import backfill_if_due
+
+    core, ctx = app
+    theirs = _imported(core, ctx, "TEST 另一个项目里的话。", role="user", key="TEST-import/project")
+    conn = sqlite3.connect(core.storage.path)
+    try:
+        conn.execute("UPDATE source_events SET project_id='TEST-project-p' WHERE event_id=?", (theirs,))
+        conn.commit()
+    finally:
+        conn.close()
+    vectors = SimpleNamespace(storage_dir=tmp_path)
+    storage = SQLiteStorage(ctx.binding)
+    now = datetime(2026, 9, 28, 12, tzinfo=timezone.utc)
+    assert backfill_if_due(storage, ctx, vectors, now=now)["outcome"] == "finished"
+    receipt = backfill_if_due(storage, replace(ctx, project_id="TEST-project-p"), vectors, now=now + timedelta(hours=1))
+    assert receipt is not None and receipt["queued"] == 1 and theirs in _embeds(core)
+
+
+def test_the_backfill_waits_while_captured_messages_wait_for_their_embeddings(app):
+    """A message captured now is never queued behind an import's history for its vector."""
+    import sqlite3
+
+    from scope_recall.core.index_rebuild import IMPORT_EMBED_QUEUE_CEILING, queue_import_embeddings
+    from scope_recall.core.storage import SQLiteStorage
+
+    core, ctx = app
+    said = _imported(core, ctx, "TEST 家里的猫叫小橘。", role="user", key="TEST-import/held")
+    with sqlite3.connect(core.storage.path) as conn:
+        for index in range(IMPORT_EMBED_QUEUE_CEILING):
+            conn.execute("""INSERT INTO work_items(work_type,subject_ref,subject_revision,scope_id,available_at)
+                VALUES ('embed',?,1,'TEST-scope','2026-09-28T00:00:00Z')""", (f"event-TEST-waiting-{index}",))
+        conn.commit()
+    page = queue_import_embeddings(SQLiteStorage(ctx.binding), ctx)
+    assert page["held"] and page["queued"] == 0 and page["after_key"] == ("", 0)
+    assert said not in _embeds(core)
+
+
+def test_the_drain_s_backfill_keeps_its_place_and_looks_again_after_a_day(app, tmp_path):
+    from datetime import datetime, timedelta, timezone
+    from types import SimpleNamespace
+
+    from scope_recall.core.storage import SQLiteStorage
+    from scope_recall.runtime.vector_upkeep import EMBED_BACKFILL_RECHECK, backfill_if_due
+
+    core, ctx = app
+    said = _imported(core, ctx, "TEST 家里的猫叫小橘。", role="user", key="TEST-import/drain")
+    vectors = SimpleNamespace(storage_dir=tmp_path)
+    storage = SQLiteStorage(ctx.binding)
+    now = datetime(2026, 9, 28, 12, tzinfo=timezone.utc)
+    receipt = backfill_if_due(storage, ctx, vectors, now=now)
+    assert receipt["outcome"] == "finished" and receipt["queued"] == 1 and said in _embeds(core)
+    assert backfill_if_due(storage, ctx, vectors, now=now + timedelta(hours=1)) is None
+    later = _imported(core, ctx, "TEST 后来又导入的一句话。", role="user", key="TEST-import/later")
+    looked = backfill_if_due(storage, ctx, vectors, now=now + EMBED_BACKFILL_RECHECK)
+    assert looked["outcome"] == "finished" and later in _embeds(core)
+    assert looked["queued_total"] == 2, "the total runs on across the daily looks"
+
+
+def test_the_backfill_leaves_room_for_candidate_evaluations(app, tmp_path):
+    """Embeddings are claimed before candidate evaluations, and the backfill kept a page of them waiting, so every
+    pass took embeddings alone: 251 evaluations waited on the pilot for the hours it ran (rc10).  Stopping for them
+    stopped it for as long as they could not be done (review of rc11).  While one it is told of is ready, it keeps
+    the queue to its yield ceiling and goes on; one not due yet changes nothing."""
+    import sqlite3
+    from types import SimpleNamespace
+
+    from scope_recall.core.index_rebuild import queue_import_embeddings
+    from scope_recall.core.storage import SQLiteStorage
+    from scope_recall.runtime.vector_upkeep import backfill_if_due
+
+    core, ctx = app
+    said = [_imported(core, ctx, f"TEST 导入的第{index}句话。", role="user", key=f"TEST-import/room-{index}")
+            for index in range(4)]
+    with sqlite3.connect(core.storage.path) as conn:
+        for ref, due in (("candidate-TEST-ready", "2026-09-28T00:00:00Z"), ("candidate-TEST-later", "2999-01-01T00:00:00Z")):
+            conn.execute("""INSERT INTO work_items(work_type,subject_ref,subject_revision,scope_id,available_at)
+                VALUES ('evaluate_candidate',?,1,'TEST-scope',?)""", (ref, due))
+        conn.commit()
+    storage = SQLiteStorage(ctx.binding)
+    evaluations = frozenset({"evaluate_candidate"})
+    page = queue_import_embeddings(storage, ctx, yield_to=evaluations, yield_ceiling=2)
+    assert (page["held"], page["queued"], page["finished"]) == (False, 2, False), page
+    assert sum(ref in _embeds(core) for ref in said) == 2
+    receipt = backfill_if_due(storage, ctx, SimpleNamespace(storage_dir=tmp_path), yield_to=evaluations,
+                              yield_ceiling=2)
+    assert (receipt["outcome"], receipt["queued"]) == ("held", 0), "the drain's upkeep passes it on"
+    with sqlite3.connect(core.storage.path) as conn:
+        conn.execute("UPDATE work_items SET state='done' WHERE subject_ref='candidate-TEST-ready'")
+        conn.commit()
+    page = queue_import_embeddings(storage, ctx, after_key=page["after_key"], yield_to=evaluations, yield_ceiling=2)
+    assert (page["queued"], page["finished"]) == (2, True) and all(ref in _embeds(core) for ref in said)
+
+
+def test_a_page_never_takes_the_embedding_queue_past_its_ceiling(app):
+    """The queue was measured before a page of 64 joined it, so up to 127 embeddings waited (review of rc11).  A page
+    now looks at no more sources than can join, and is not taken for the last because it looked at fewer."""
+    import sqlite3
+
+    from scope_recall.core.index_rebuild import IMPORT_EMBED_QUEUE_CEILING, queue_import_embeddings
+    from scope_recall.core.storage import SQLiteStorage
+
+    core, ctx = app
+    said = [_imported(core, ctx, f"TEST 导入的第{index}句。", role="user", key=f"TEST-import/over-{index}")
+            for index in range(3)]
+    with sqlite3.connect(core.storage.path) as conn:
+        for index in range(IMPORT_EMBED_QUEUE_CEILING - 1):
+            conn.execute("""INSERT INTO work_items(work_type,subject_ref,subject_revision,scope_id,available_at)
+                VALUES ('embed',?,1,'TEST-scope','2026-09-28T00:00:00Z')""", (f"event-TEST-waiting-{index}",))
+        conn.commit()
+    page = queue_import_embeddings(SQLiteStorage(ctx.binding), ctx)
+    assert (page["queued"], page["scanned"], page["finished"]) == (1, 1, False), page
+    assert sum(ref in _embeds(core) for ref in said) == 1

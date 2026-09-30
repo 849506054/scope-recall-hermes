@@ -57,6 +57,14 @@ _LEXICAL_DF_FRACTION = 0.10
 #: Floor so a young or small instance is never pruned: on a corpus of thirty
 #: sources, "10% of everything" is three, and ordinary words would vanish.
 _LEXICAL_DF_FLOOR = 64
+#: Postings the lexical statement may group, the kept terms' document
+#: frequencies added rarest first.  It groups every posting of every term, so its
+#: time follows this sum: on the shared store (2026-09-29) a 2,000-character
+#: prompt's 80 terms held 273,000 postings and took 9 s, longer than the prompt's
+#: whole recall, which then ran without its vector search as well.  The rarest
+#: terms separate the most, and a question's own few are never cut.
+_LEXICAL_POSTING_BUDGET = 20_000
+_LEXICAL_MIN_TERMS = 16
 
 
 def scope_digest(context) -> str:
@@ -119,7 +127,15 @@ def _has_first_hand_root(tx, evidence: Iterable[str]) -> bool:
 
 
 def _discriminating_terms(tx, terms: tuple[str, ...], keep: tuple[str, ...] = ()) -> tuple[str, ...]:
-    """Drop query terms too common to separate anything.
+    """The terms the lexical statement searches (``_searched_terms``)."""
+    return _searched_terms(tx, terms, keep)[0]
+
+
+def _searched_terms(tx, terms: tuple[str, ...],
+                    keep: tuple[str, ...] = ()) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """(the terms the lexical statement searches, those the posting budget left out of it).
+
+    Drop query terms too common to separate anything.
 
     Document frequency is read once for the query's own terms, which is a
     clustered range scan: ``lexical_projection`` is WITHOUT ROWID keyed on
@@ -134,13 +150,47 @@ def _discriminating_terms(tx, terms: tuple[str, ...], keep: tuple[str, ...] = ()
     conn = tx._check()
     frequencies = lexical_index.document_frequency(conn, terms)
     if not frequencies:
-        return terms
+        return terms, ()
     ceiling = _common_term_ceiling(conn)
     kept = tuple(term for term in terms if term in keep or frequencies.get(term, 0) < ceiling)
     if kept:
-        return kept
+        searched = _within_posting_budget(kept, frequencies, keep)
+        return searched, tuple(term for term in kept if term not in searched)
     rarest = min(frequencies.values())
-    return tuple(term for term in terms if frequencies.get(term, 0) == rarest) or terms
+    return tuple(term for term in terms if frequencies.get(term, 0) == rarest) or terms, ()
+
+
+def _within_posting_budget(terms: tuple[str, ...], frequencies: dict[str, int],
+                           keep: tuple[str, ...]) -> tuple[str, ...]:
+    """The rarest ``_LEXICAL_MIN_TERMS`` of the terms more than one source holds, and more of them while their
+    postings stay within ``_LEXICAL_POSTING_BUDGET``.  ``keep`` stays whatever it costs.  A term one source at most
+    holds costs a posting at most and stays, but takes none of the rarest places: the prompt is stored before its own
+    recall, and the words only it holds would have taken them all (review of 3.4.2).  The query's own order is kept."""
+    held = sorted((term for term in terms if term not in keep and frequencies.get(term, 0) > 1),
+                  key=lambda term: (frequencies[term], term))
+    if len(held) <= _LEXICAL_MIN_TERMS:
+        return terms
+    spent = sum(frequencies.get(term, 0) for term in set(keep).intersection(terms))
+    chosen: set[str] = set()
+    for term in held:
+        if len(chosen) >= _LEXICAL_MIN_TERMS and spent + frequencies[term] > _LEXICAL_POSTING_BUDGET:
+            break
+        chosen.add(term)
+        spent += frequencies[term]
+    return tuple(term for term in terms if term in chosen or term in keep or frequencies.get(term, 0) <= 1)
+
+
+def _held_terms(tx, source_ids: list[int], terms: tuple[str, ...]) -> dict[int, set[str]]:
+    """Which of ``terms`` each of these sources holds, in one look-up of the ``(source_id, term_id)`` index."""
+    rows = tx._check().execute(
+        f"SELECT p.source_id,t.term FROM lexical_postings p JOIN lexical_terms t ON t.term_id=p.term_id "
+        f"WHERE p.source_id IN ({_marks(tuple(source_ids))}) AND t.term IN ({_marks(terms)})",
+        (*source_ids, *terms),
+    ).fetchall()
+    held: dict[int, set[str]] = {}
+    for source_id, term in rows:
+        held.setdefault(source_id, set()).add(term)
+    return held
 
 
 def _common_term_ceiling(conn) -> int:
@@ -405,7 +455,7 @@ class RetrievalStorage:
         # never hydrated.
         requested = hard_identifiers(context.query)
         identifiers = tuple(term for term in terms if requested.intersection(hard_identifiers(term)))
-        terms = _discriminating_terms(tx, terms, keep=identifiers)
+        terms, cut = _searched_terms(tx, terms, keep=identifiers)
         # A synonym term matches as the query term it stands in for, so hits
         # and matched terms still count the query's own terms, once each.
         # Without a synonym the statement and its parameters are unchanged.
@@ -422,7 +472,7 @@ class RetrievalStorage:
             as_of = " AND (e.occurred_at IS NULL OR e.occurred_at<=?)"
             params.append(context.as_of)
         rows = tx._check().execute(
-            f"""SELECT e.event_id,e.source_revision,COUNT(DISTINCT {credit}) AS hits,
+            f"""SELECT e.event_id,e.source_revision,e.source_id,COUNT(DISTINCT {credit}) AS hits,
                        GROUP_CONCAT(DISTINCT hex({credit})) AS matched_term_hexes
                 FROM {lexical_index.JOIN}
                 WHERE t.term IN ({term_marks}) AND e.scope_id IN ({scope_marks})
@@ -442,21 +492,23 @@ class RetrievalStorage:
                 LIMIT ?""",
             (*credits, *credits, *params, *identifiers, limit),
         ).fetchall()
-        return tuple(
-            CandidateRef(
+        # The posting budget chose which rows the statement found; what a found row holds of the terms it left out
+        # still counts, as before: admission weighs a row's matches against the whole query (review of 3.4.2).
+        held = _held_terms(tx, [row["source_id"] for row in rows], cut) if cut and rows else {}
+        candidates = []
+        for index, row in enumerate(rows, 1):
+            matched = {bytes.fromhex(encoded).decode("utf-8") for encoded in row["matched_term_hexes"].split(",")}
+            matched.update(held.get(row["source_id"], ()))
+            candidates.append(CandidateRef(
                 "event",
                 row["event_id"],
                 row["source_revision"],
                 "lexical",
                 rank=index,
-                lexical_score=float(row["hits"]),
-                matched_query_terms=tuple(sorted(
-                    bytes.fromhex(encoded).decode("utf-8")
-                    for encoded in row["matched_term_hexes"].split(",")
-                )),
-            )
-            for index, row in enumerate(rows, 1)
-        )
+                lexical_score=float(len(matched)),
+                matched_query_terms=tuple(sorted(matched)),
+            ))
+        return tuple(candidates)
 
     def claims(self, tx, context: SearchContext, *, limit: int) -> tuple[CandidateRef, ...]:
         """Claims whose own statement answers the query.

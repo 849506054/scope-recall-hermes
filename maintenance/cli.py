@@ -27,18 +27,10 @@ def _optional_path(value: str | None, field: str) -> Path | None:
     return _path(value, field) if value else None
 
 
-def _interpreter(value: str, field: str) -> Path:
-    """Validate an interpreter through its real target but keep the path as given.
-
-    Resolving it records the base interpreter for a venv launcher, which starts
-    without the venv on ``sys.path`` and cannot import this package (#87) --
-    and makes the doctor probe an environment the host never runs.
-    """
-    return _require_interpreter(Path(value), field)
-
-
-def _optional_interpreter(value: str | None, field: str) -> Path | None:
-    return _interpreter(value, field) if value else None
+def _interpreter(value: str | None, field: str) -> Path | None:
+    """An interpreter path as given, never resolved: a POSIX venv's ``bin/python`` is a symlink to the base
+    interpreter, which cannot import this package (#87, #141).  The installer and the doctor check the chain."""
+    return _absolute(value, field, error=SystemExit) if value else None
 
 
 # Sub-commands with their own parser: the first token routes to them before the
@@ -482,7 +474,7 @@ def _doctor(args: argparse.Namespace) -> int:
     report = run_doctor(
         host=args.host,
         instance_root=_path(args.instance_root, "instance_root"),
-        python_executable=_optional_interpreter(args.python, "python"),
+        python_executable=_interpreter(args.python, "python"),
     )
     _emit(report.to_dict())
     return 0 if report.status == "ok" else 1

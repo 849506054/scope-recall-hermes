@@ -30,7 +30,7 @@ _AUTO_TOKEN = re.compile(r"(?:^|\|(?:prior:)?)auto_retry:([0-9]+)(?=\||$)")
 # Invalid derivations and rejected authority remain terminal and inspectable.
 AUTO_RECOVERABLE_ERRORS = frozenset({
     "model_unavailable", "model_timeout", "timeout", "network_error", "http_429",
-    "http_500", "http_502", "http_503", "http_504", "rate_limited",
+    "http_500", "http_502", "http_503", "http_504", "http_529", "rate_limited",
     "storage_unavailable", "STORAGE_UNAVAILABLE", "DEADLINE_EXCEEDED",
     "memory_epoch_changed", "lease_exhausted", "embedding_unavailable",
 })
@@ -39,8 +39,9 @@ AUTO_RECOVERABLE_ERRORS = frozenset({
 #: anyone says nothing about this payload -- unlike a timeout, which a large
 #: item can genuinely cause -- so the lease never got an attempt at all and the
 #: attempt is refunded.  Without the refund one four-hour provider outage pushed
-#: 195 items into ``failed`` at ``attempt=3`` apiece, each needing an operator.
-CAPACITY_REFUSALS = frozenset({"http_429", "rate_limited", "http_502", "http_503", "http_504"})
+#: 195 items into ``failed`` at ``attempt=3`` apiece, each needing an operator.  529 is a provider saying it is
+#: overloaded (MiniMax, Anthropic): one such answer failed a candidate evaluation for good on 2026-09-28.
+CAPACITY_REFUSALS = frozenset({"http_429", "rate_limited", "http_502", "http_503", "http_504", "http_529"})
 
 #: The provider declining the account rather than this request: payment
 #: required, key rejected, access forbidden.  No payload changes that answer, so
@@ -251,7 +252,9 @@ def _source_or_claim_context(tx, ref: str, revision: int) -> tuple[str, str | No
 
 
 def _purge_context(tx, ref: str, revision: int) -> tuple[str, str | None, str | None]:
-    scope_id = ref.split(":", 1)[-1]
+    from .delete_storage import purge_work_parts
+
+    _operation_id, scope_id = purge_work_parts(ref)
     tx._scope(scope_id)
     return scope_id, tx.context.project_id, tx.context.branch_id
 
@@ -315,7 +318,9 @@ def _projection_retry_reason(tx, ref: str, revision: int, *, current_epoch: int 
 
 def _purge_retry_reason(tx, ref: str, revision: int, *, current_epoch: int | None = None) -> str | None:
     try:
-        receipt = tx.deletions.receipt(ref.rsplit(":", 1)[0])
+        from .delete_storage import purge_work_parts
+
+        receipt = tx.deletions.receipt(purge_work_parts(ref)[0])
     except ContractError:
         receipt = None
     if receipt is None or receipt.get("mode") != "delete":
@@ -736,6 +741,7 @@ class WorkItems:
         Idempotent: every row is stamped with the schema generation that granted
         it, and a row already carrying this generation's stamp is skipped.
         """
+        from .capture_inbox import deferred_path
         from .failure_retry import selects, validate_page  # imports this module
 
         validate_page(limit)
@@ -764,6 +770,37 @@ class WorkItems:
             kind = str(code or "").rsplit("|", 1)[-1]
             report["by_kind"][kind] = report["by_kind"].get(kind, 0) + 1
             report["retried"] += 1
+        # Captures a replay gave up after its tries (``capture_inbox._GAVE_UP``) go back to it, their tries counted
+        # anew: whatever kept them out has been fixed, or they are given up again, visibly.  Only the partition this
+        # config's replay takes (``replay_inbox``): returned by what the config could see, a row of another went back
+        # to a replay that never takes it (review of rc10).
+        context = self._tx.context
+        scopes = sorted(context.allowed_scope_ids)
+        abandoned = conn.execute(
+            f"""SELECT token,last_error_code FROM capture_inbox WHERE last_error_code LIKE 'GAVE_UP|%'
+                AND scope_id IN ({_marks(scopes)}) AND project_id IS ? AND branch_id IS ?""",
+            (*scopes, context.project_id, context.branch_id)).fetchall()
+        report["inbox_given_up"] = len(abandoned)
+        report["inbox_by_kind"] = {}
+        for _token, code in abandoned:
+            kind = str(code).rsplit("|", 1)[-1]
+            report["inbox_by_kind"][kind] = report["inbox_by_kind"].get(kind, 0) + 1
+        # A capture an earlier release refused as ACCESS_DENIED, most often one under a deleted message's key, stayed
+        # in the inbox for good with doctor's capture_ingress_blocked up, and nothing but a hand could remove it.  The
+        # replay now cancels a copy of the deleted message and stores another message under a key of its own
+        # (``storage.Transaction.refuse_under_a_deleted_key``), so such rows go back to it once asked (review of rc13).
+        refused = conn.execute(
+            f"""SELECT token FROM capture_inbox WHERE last_error_code='ACCESS_DENIED'
+                AND scope_id IN ({_marks(scopes)}) AND project_id IS ? AND branch_id IS ?""",
+            (*scopes, context.project_id, context.branch_id)).fetchall()
+        report["inbox_refused"] = len(refused)
+        if not dry_run:
+            # One the rekey path gave up goes back to it: returned as never tried, the plain replay met the old
+            # collision, and a row it put off was matched by a delete through the key it had taken (review of rc10).
+            conn.executemany("UPDATE capture_inbox SET last_error_code=? WHERE token=?",
+                             [("VERSION_CONFLICT" if deferred_path(code) == "rekey" else None, token)
+                              for token, code in abandoned])
+            conn.executemany("UPDATE capture_inbox SET last_error_code=NULL WHERE token=?", [(row[0],) for row in refused])
         return report
 
     def _reopen_failed(self, work_id: int, work_type: str, code: object, *, now: str, automatic: bool = False) -> bool:

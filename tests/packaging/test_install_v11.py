@@ -257,6 +257,11 @@ def test_hook_command_quotes_spaces(tmp_path):
     assert "-I" in hook["command"]
     assert "-B" in hook["command"]
     assert "-m scope_recall.adapters.codex.hook_entry" in hook["command"]
+    from scope_recall.maintenance.install_codex import HOOK_TIMEOUTS
+
+    timeouts = {event: entries[0]["hooks"][0]["timeout"] for event, entries in hooks["hooks"].items()}
+    assert timeouts == HOOK_TIMEOUTS, "each event's own ceiling, not one 2 s for all"
+    assert timeouts["UserPromptSubmit"] == 15 and timeouts["PostToolUse"] == 2
 
 
 def test_preview_creates_nothing_and_codex_install_doctor_uninstall(tmp_path):
@@ -1545,36 +1550,29 @@ def test_plan_install_keeps_a_symlinked_interpreter_as_given(tmp_path):
     assert resolved != str(link) and all(resolved not in command for command in commands)
 
 
-def test_the_cli_keeps_a_symlinked_interpreter_as_given(tmp_path, capsys):
-    """#87 at the CLI boundary: ``--python`` reaches plan-install and doctor as given.
-
-    Resolving it records the base interpreter for a venv launcher -- one that
-    cannot import this package -- and makes the doctor probe an environment the
-    host never runs.
-    """
+def test_the_cli_passes_a_symlinked_interpreter_on_as_given(tmp_path, capsys):
+    """#141: the CLI resolved ``--python`` before the installer and the doctor saw it, so a POSIX venv's
+    ``bin/python`` reached both as the base interpreter.  The doctor then probed an interpreter that cannot
+    import this package and reported it missing, and the installer recorded that interpreter for the hooks, the
+    MCP launcher, the autostart task and the worker: #87 again, fixed below the CLI only."""
     from plugin_source import linked_interpreter
     from scope_recall.maintenance import cli as maintenance_cli
 
     link = linked_interpreter(tmp_path)
     if link is None:
         pytest.skip("no link to an interpreter can be created here")
-    assert link is not None
-    instance, plugin, project = _install_paths(tmp_path, host="hermes")
-    assert maintenance_cli.main([
-        "plan-install", "--host", "hermes", "--target-plugin-dir", str(plugin),
-        "--instance-root", str(instance), "--project-root", str(project),
-        "--agent-id", "TEST-cli-link", "--python", str(link),
-    ]) == 0
-    planned = json.loads(capsys.readouterr().out)
-    assert Path(planned["python_executable"]) == link
+    instance, plugin, project = _install_paths(tmp_path, host="codex")
+    install = ["--host", "codex", "--target-plugin-dir", str(plugin), "--instance-root", str(instance),
+               "--project-root", str(project), "--agent-id", "TEST-venv-link", "--python", str(link)]
+    assert maintenance_cli.main(["plan-install", *install]) == 0
+    assert json.loads(capsys.readouterr().out)["python_executable"] == str(link)
+    assert maintenance_cli.main(["apply-install", *install]) == 0
+    capsys.readouterr()
+    mcp = json.loads((plugin / ".mcp.json").read_text(encoding="utf-8"))
+    assert mcp["mcpServers"]["scope-recall"]["command"] == str(link)
 
-    maintenance_cli.main([
-        "doctor", "--host", "hermes", "--instance-root", str(instance), "--python", str(link),
-    ])
-    report = json.loads(capsys.readouterr().out)
-    assert report["python_executable"] == str(link)
-    print(json.dumps({"planned": planned["python_executable"], "doctor": report["python_executable"],
-                      "resolved": str(link.resolve())}, ensure_ascii=False))
+    maintenance_cli.main(["doctor", "--host", "codex", "--instance-root", str(instance), "--python", str(link)])
+    assert json.loads(capsys.readouterr().out)["python_executable"] == str(link)
 
 
 def test_a_released_wrapper_declares_its_core_and_a_candidate_declares_nothing():

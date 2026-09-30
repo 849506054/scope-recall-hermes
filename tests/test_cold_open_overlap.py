@@ -107,3 +107,89 @@ def test_failed_overlap_reaps_owned_process_and_fresh_request_isolated(tmp_path,
             s.open_existing_with_work(lambda:None)
             assert s._call('search',[],scope_id='PUBLIC',limit=1)=='search'
     finally:s.close()
+
+
+def test_an_open_that_failed_after_its_caller_stopped_waiting_is_reopened(tmp_path,monkeypatch):
+    """A table open that ran out of its caller's time and then failed in the helper left no open table, and the
+    parked answer was taken without a look: a long-running host said "not open" on every search until restarted."""
+    s=store(tmp_path,monkeypatch,error=True,delay=.2)
+    try:
+        with using_request_deadline(RequestDeadline.from_budget(.05)):
+            s.open_existing_with_work(lambda:None)
+        assert s._pending_response_id is not None and not s.requires_reopen
+        time.sleep(.3)
+        with pytest.raises(RuntimeError):
+            with using_request_deadline(RequestDeadline.from_budget(2)):
+                s._call('search',[],scope_id='PUBLIC',limit=1)
+        assert s.requires_reopen, "the next request opens the table again"
+    finally:s.close()
+
+
+def test_work_that_failed_takes_the_open_only_if_it_has_come(tmp_path,monkeypatch):
+    """A query embedding that failed at once waited for a slow table open (1.56 s against 0.02 s, review of 3.4.1).
+    With nothing to search with, the open is taken if it has come and parked for the next request if not."""
+    s=store(tmp_path,monkeypatch,delay=3.0)
+    try:
+        started=time.monotonic()
+        with using_request_deadline(RequestDeadline.from_budget(8)):
+            s.open_existing_with_work(lambda:False)
+        assert time.monotonic()-started<2.0, 'returned without waiting for the open'
+        worker=s._process
+        assert s._pending_response_id is not None and worker.poll() is None and not s.requires_reopen
+        with using_request_deadline(RequestDeadline.from_budget(10)):
+            assert s._call('search',[],scope_id='PUBLIC',limit=1)=='search'
+        assert s._process is worker
+    finally:s.close()
+
+
+def test_a_parked_answer_that_came_in_long_ago_is_taken_not_called_a_wedge(tmp_path,monkeypatch):
+    """A kept recall handler parked its first, cold search and was asked again minutes later: the helper had answered
+    long before, but the age alone called it wedged, closed it, and the next recall opened cold (worker_unresponsive)."""
+    s=store(tmp_path,monkeypatch,delay=.2)
+    try:
+        with using_request_deadline(RequestDeadline.from_budget(2)):
+            s.open_existing_with_work(lambda:None)
+        worker=s._process
+        with pytest.raises(Exception):
+            with using_request_deadline(RequestDeadline.from_budget(.05)):
+                s._call('search',[],scope_id='PUBLIC',limit=1)
+        assert s._pending_response_id is not None
+        time.sleep(.3)  # the helper answers the parked search
+        s._pending_response_since-=s._pending_response_timeout+1  # and it was parked longer ago than a wedge
+        with using_request_deadline(RequestDeadline.from_budget(2)):
+            assert s._call('search',[],scope_id='PUBLIC',limit=1)=='search'
+        assert s._process is worker and worker.poll() is None and not s.requires_reopen
+    finally:s.close()
+
+
+def test_a_parked_answer_that_never_came_is_still_a_wedge(tmp_path,monkeypatch):
+    s=store(tmp_path,monkeypatch,delay=.2)
+    try:
+        with using_request_deadline(RequestDeadline.from_budget(2)):
+            s.open_existing_with_work(lambda:None)
+        with pytest.raises(Exception):
+            with using_request_deadline(RequestDeadline.from_budget(.05)):
+                s._call('search',[],scope_id='PUBLIC',limit=1)
+        s._pending_response_since-=s._pending_response_timeout+1  # parked longer ago than a wedge, not yet answered
+        with pytest.raises(RuntimeError,match='unresponsive'):
+            with using_request_deadline(RequestDeadline.from_budget(2)):
+                s._call('search',[],scope_id='PUBLIC',limit=1)
+        assert s.requires_reopen
+    finally:s.close()
+
+
+def test_a_spare_helper_is_kept_even_when_its_replacement_cannot_start(monkeypatch):
+    spawned=[]
+    class Alive:
+        stdin=stdout=None
+        def poll(self):return None
+    def spawn():
+        if spawned:raise OSError('PUBLIC no more processes')
+        spawned.append(Alive());return spawned[-1]
+    monkeypatch.setattr(native,'_spawn_helper',spawn)
+    monkeypatch.setattr(native,'_spare',None)
+    monkeypatch.setattr(native,'_keep_spare',False)
+    native.prestart(keep=True)
+    assert native._take_spare() is spawned[0], "the spare taken is kept although no replacement could start"
+    assert native._spare is None
+    monkeypatch.setattr(native,'_keep_spare',False)

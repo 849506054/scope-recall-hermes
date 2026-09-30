@@ -5,6 +5,7 @@ from collections import Counter
 from dataclasses import dataclass
 from functools import partial
 import math
+import time
 
 from ..contracts import ContractError, TrustedContext
 from .admission import resume_deferred
@@ -68,6 +69,15 @@ _HOLDABLE_WORK_TYPES = frozenset({"consolidate", "embed", "evaluate_candidate"})
 #: one page a pass, a source matching a thousand candidates took sixty passes,
 #: started back to back, each paying a whole pass to link sixteen of them.
 SOURCE_PAGES_PER_PASS = 16
+#: Seconds a pass waits after each of those pages.  Each page is its own write, but the next one began at once,
+#: and a hook waiting for the writer lease polls every 10 ms (``core/storage.py``): it rarely landed in the gap,
+#: so it waited behind every page of the pass instead of one.  Two polls' worth lets it in.
+PAGE_TURN_SECONDS = 0.02
+#: Seconds of those pages a pass spends at most.  A page holds the writer lease while it matches its source
+#: against the candidates sharing a term: 0.5-7 s a page on the shared store on 2026-09-27 (thousands of
+#: candidates), so sixteen pages still held it for half a minute of each pass.  A small store's pages take
+#: milliseconds and all sixteen still fit.
+SOURCE_PAGE_SECONDS = 5.0
 #: Source embeddings one group may carry.  The adapter sends them as consecutive
 #: full provider requests (``adapters/models.py``: a hundred each), so this is
 #: how many items share one read, one group commit and one set of per-pass costs
@@ -158,15 +168,22 @@ def _resume_admission(storage, clock, context, config: WorkerConfig, started: fl
     """Wake deferred captures and settle candidate pages before any claim."""
     resume_deferred(storage, clock, context, config.admission_policy, limit=min(16, config.max_items),
                     remaining_seconds=min(1.0, _remaining(started, clock, budget)))
-    # One write per page, so a capture never waits behind more than one; the
-    # pages may take at most half of the pass.
+    # Each page is chosen in a read and linked in a write of its own, so a capture waits behind at most one
+    # page's links, never its matching; the pages may take at most half of the pass, and at most
+    # SOURCE_PAGE_SECONDS.
+    pages_started = time.monotonic()
     for _ in range(SOURCE_PAGES_PER_PASS):
         if _remaining(started, clock, budget) <= budget / 2:
             break
+        with storage.read(context, remaining_seconds=min(1.0, _remaining(started, clock, budget))) as tx:
+            page = tx.candidates.next_source_page()
+        if page is None:
+            break
         with storage.write(context, remaining_seconds=min(1.0, _remaining(started, clock, budget))) as tx:
-            if not tx.candidates.pending_source_pages():
-                break
-            tx.candidates.resume_source_pages(now=clock.utc_now())
+            tx.candidates.resume_source_pages(now=clock.utc_now(), page=page)
+        time.sleep(PAGE_TURN_SECONDS)
+        if time.monotonic() - pages_started >= SOURCE_PAGE_SECONDS:
+            break
     page = min(config.candidate_batch_limit, config.max_items)
     with storage.write(context, remaining_seconds=min(1.0, _remaining(started, clock, budget))) as tx:
         tx.candidates.backfill(now=clock.utc_now(), limit=page)
@@ -198,6 +215,10 @@ def _queued_work_types(storage, clock, context, started: float, budget: float, k
 #: Twelve passes' worth, an hour at the default wake, so an idle instance clears
 #: the ceiling before the next sweep.
 CANDIDATE_QUEUE_CEILING = PROCESS_BATCH_LIMIT * 12
+
+#: Stale pending candidates a pass returns to waiting for evidence, each checked again under the writer lease; the
+#: 2,045 on the pilot take about 64 passes.
+STALE_PENDING_PAGE = 32
 
 
 #: Seconds a pass may still spend handing untouched leases back once its budget
@@ -240,10 +261,22 @@ def _other_work_ready(storage, clock, context, started: float, budget: float, ki
 def _recover_failed_work(storage, clock, context, config: WorkerConfig, allowed: frozenset[str],
                          started: float, budget: float) -> int:
     """Grant bounded fresh attempts to failures a later fix or budget may have cured."""
+    settled: tuple = ()
+    stale: tuple = ()
+    if "evaluate_candidate" in allowed:
+        # Which settled candidates to queue is read before the write: finding them walks every candidate still
+        # settling, and under the writer lease that was 7.6 s of each pass on the shared store (2026-09-27).
+        with storage.read(context, remaining_seconds=_remaining(started, clock, budget)) as tx:
+            if tx.work.pending_depth("evaluate_candidate") < CANDIDATE_QUEUE_CEILING:
+                settled = tx.candidates.settled_to_schedule(
+                    now=clock.utc_now(), limit=min(config.candidate_batch_limit, config.max_items))
+            stale = tx.candidates.stale_pending(now=clock.utc_now(), limit=STALE_PENDING_PAGE)
     with storage.write(context, remaining_seconds=_remaining(started, clock, budget)) as tx:
         recovery_page = min(MAX_RECOVERY_PAGE, config.max_items)
         recovered = tx.work.recover_invalid_derivations(
             now=clock.utc_now(), allowed_work_types=allowed, limit=recovery_page)
+        # Corrections recorded with no claim to settle them (``close_unplaceable_updates``).
+        tx.claims.close_unplaceable_updates(limit=64)
         if "consolidate" in allowed:
             recovered += tx.work.recover_oversized_consolidations(
                 now=clock.utc_now(), formatter=consolidation_messages, limit=min(8, config.max_items))
@@ -255,9 +288,12 @@ def _recover_failed_work(storage, clock, context, config: WorkerConfig, allowed:
             # most what it can also evaluate, and stops queueing entirely once
             # the queue is deeper than passes can reach, so a backlog cannot
             # grow on its own: what is not queued now waits and is queued later.
-            if tx.work.pending_depth("evaluate_candidate") < CANDIDATE_QUEUE_CEILING:
+            if settled:
                 tx.candidates.schedule_settled_candidates(
-                    now=clock.utc_now(), limit=min(config.candidate_batch_limit, config.max_items))
+                    now=clock.utc_now(), limit=min(config.candidate_batch_limit, config.max_items), refs=settled)
+            # Pending with nothing new to ask, left by releases before 3.4.0rc10 (``stale_pending``).
+            if stale:
+                tx.candidates.settle_stale_pending(stale, now=clock.utc_now())
             recovered += tx.candidates.reschedule_budget_blocked_candidates(
                 now=clock.utc_now(), limit=min(8, config.max_items))
             # The candidate twin of recover_oversized_consolidations, which
@@ -273,6 +309,8 @@ def _recover_failed_work(storage, clock, context, config: WorkerConfig, allowed:
             now=clock.utc_now(), allowed_work_types=allowed,
             cooldown_seconds=config.auto_retry_cooldown_seconds,
             max_recoveries=config.max_auto_recoveries, limit=recovery_page)
+        if "purge" in allowed:
+            recovered += tx.deletions.requeue_unfinished_purges(now=clock.utc_now(), limit=min(8, config.max_items))
     return recovered
 
 
