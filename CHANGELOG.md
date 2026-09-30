@@ -2,6 +2,22 @@
 
 All notable changes to `scope-recall` will be documented in this file.
 
+## [3.4.4] - 2026-09-30
+
+**Fork release.** Two fork-side changes, both about seeing what a failing recall is doing.
+
+A vector gap named only the transport class: ``QdrantHTTPError`` stood for a timeout, a
+401 and a broken worker frame alike, and the exception is caught and discarded, so the
+name in the gap was the only place the fault survived.  The exception now carries the
+wire vocabulary ``core/vector_failure.py`` already reads, and a gap reads
+``QdrantHTTPError:timeout`` or ``QdrantHTTPError:http_status:401``.
+
+The Hermes prefetch logs its own timing when it needs to: on this instance a prefetch
+occasionally spends its whole five-second window and the packet says which phase ran out
+rather than what the work cost.  A line is written only when the recall passes three
+seconds or a phase reports ``deadline_exceeded_*``, so a healthy turn adds nothing.
+Temporary: it is removed once the window has been accounted for.
+
 ## [3.4.3] - 2026-09-30
 
 **Fork release** (upstream's own numbering stops at `3.4.2`; this fix is entirely in

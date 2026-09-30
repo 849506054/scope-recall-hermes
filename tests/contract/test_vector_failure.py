@@ -175,3 +175,19 @@ def test_a_refused_call_says_which_answer_the_provider_gave():
     assert vector_failure_label(AuxiliaryModelError("http_status")) == "AuxiliaryModelError:http_status"
     assert vector_failure_label(AuxiliaryModelError("http_status", detail="4x9")) == "AuxiliaryModelError:http_status"
     assert vector_failure_label(AuxiliaryModelError("timeout")) == "AuxiliaryModelError:timeout"
+
+
+def test_the_qdrant_transport_fault_says_its_wire_code():
+    """A recall lost to a timeout and a recall lost to a 401 read as the same bare class
+    until the transport exception carried the vocabulary the label looks for.  On this
+    instance that label is the only place the fault survives -- the exception is caught
+    and discarded, so a bare name means the fault is unrecoverable from anywhere."""
+    from scope_recall.core.vector_failure import vector_failure_label
+    from scope_recall.vector.qdrant_http import QdrantHTTPError
+
+    assert vector_failure_label(QdrantHTTPError("timeout")) == "QdrantHTTPError:timeout"
+    assert vector_failure_label(QdrantHTTPError("worker_protocol")) == "QdrantHTTPError:worker_protocol"
+    assert vector_failure_label(QdrantHTTPError("http_status", 401)) == "QdrantHTTPError:http_status:401"
+    # A code outside the wire vocabulary is normalized at construction, so the gap names
+    # one of the closed set rather than the text a caller passed in.
+    assert vector_failure_label(QdrantHTTPError("something_else")) == "QdrantHTTPError:worker_protocol"

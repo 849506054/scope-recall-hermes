@@ -26,6 +26,12 @@ class QdrantHTTPError(Exception):
     def __init__(self, code: str, status: int | None = None):
         self.code = code if type(code) is str and code in wire.ERROR_CODES else "worker_protocol"
         self.status = status if type(status) is int and 100 <= status <= 599 else None
+        # core/vector_failure.py reads ``error_type`` (and ``detail`` for an HTTP status) when
+        # it names a vector gap; without them every transport fault reached the operator as
+        # the bare class name, and a recall lost to a 401 and a recall lost to a timeout read
+        # the same.  Both values come from the wire vocabulary this class already holds.
+        self.error_type = self.code
+        self.detail = str(self.status) if self.status is not None else None
         super().__init__(self.code)
 
 

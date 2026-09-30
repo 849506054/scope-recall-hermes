@@ -587,12 +587,26 @@ class ScopeRecallHermesAdapter(HermesToolSurface, _MemoryProviderBase):  # pyrig
         recent = (self._current_task_message,) if self._current_task_message else ()
         context = identity.trusted_context(session_id=effective_session, recent_messages=recent)
         current_refs = tuple(self._current_source_refs)
+        # Temporary instrumentation (3.4.4): this instance's prefetch sometimes spends its
+        # whole 5 s window and the packet says only which phase ran out, not what the work
+        # cost.  Only the cases that need it speak, so a healthy turn adds no line.
+        timed = time.monotonic()
         packet = self._require_core().recall_packet(
             context,
             self._recall_request(query, effective_session),
             current_source_refs=current_refs,
         )
+        recall_seconds = time.monotonic() - timed
+        render_started = time.monotonic()
         preparation = self._require_core().prepare_recall_render(context, packet)
+        render_seconds = time.monotonic() - render_started
+        gaps = tuple(str(gap) for gap in (packet.get("gaps") or ()))
+        if recall_seconds > 3.0 or any(gap.startswith("deadline_exceeded_") for gap in gaps):
+            _log.warning(
+                "scope-recall: prefetch timing recall=%.2fs render=%.2fs total=%.2fs status=%s gaps=%s",
+                recall_seconds, render_seconds, time.monotonic() - timed,
+                packet.get("status"), ",".join(gaps[:10]),
+            )
         self._diagnostics.last_prefetch_request_id = packet["request_id"]
         self._diagnostics.last_render_ref = preparation.render_ref
         self._pre_llm_pending = False
