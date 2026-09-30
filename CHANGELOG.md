@@ -2,6 +2,15 @@
 
 All notable changes to `scope-recall` will be documented in this file.
 
+## [3.4.8] - 2026-09-30
+
+**Fork cleanup.** The phase timing added to account for this store's five-second window --
+3.4.4's prefetch line and 3.4.5's per-phase seconds -- is retired.  The window is accounted
+for: the semantic search ran last and lost its slice (3.4.6), and the lexical statement drove
+from the scope rather than the query's terms (3.4.7).  `RetrievalPipeline.search` returns to
+its 3.4.4 shape and the host adapter logs nothing of its own; the fixes those measurements
+produced stay.
+
 ## [3.4.7] - 2026-09-30
 
 **Fork fix.** The lexical statement's join order was left to the planner, and on a large
