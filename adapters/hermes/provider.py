@@ -602,10 +602,13 @@ class ScopeRecallHermesAdapter(HermesToolSurface, _MemoryProviderBase):  # pyrig
         render_seconds = time.monotonic() - render_started
         gaps = tuple(str(gap) for gap in (packet.get("gaps") or ()))
         if recall_seconds > 3.0 or any(gap.startswith("deadline_exceeded_") for gap in gaps):
+            pipeline = getattr(self._require_core(), "recall_pipeline", None)
+            phases = getattr(pipeline, "last_phase_seconds", ()) or ()
             _log.warning(
-                "scope-recall: prefetch timing recall=%.2fs render=%.2fs total=%.2fs status=%s gaps=%s",
+                "scope-recall: prefetch timing recall=%.2fs render=%.2fs total=%.2fs status=%s gaps=%s phases=%s",
                 recall_seconds, render_seconds, time.monotonic() - timed,
                 packet.get("status"), ",".join(gaps[:10]),
+                ",".join(f"{name}:{seconds:.2f}" for name, seconds in phases),
             )
         self._diagnostics.last_prefetch_request_id = packet["request_id"]
         self._diagnostics.last_render_ref = preparation.render_ref

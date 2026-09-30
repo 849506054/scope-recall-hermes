@@ -242,7 +242,9 @@ class RetrievalPipeline:
                 allowance = budget.allowance(channel, limit)
                 if allowance <= 0:
                     continue
+                _started = time.monotonic()
                 values = tuple(loader(tx, context, limit=allowance))
+                self._phase_done(channel, _started)
                 budget.spend(channel, len(values))
                 raw.extend(values)
         except ContractError:
@@ -252,7 +254,9 @@ class RetrievalPipeline:
         if self._remaining(context) <= 0:
             gaps.append("deadline_exceeded_collect")
             return admitted()
+        _started = time.monotonic()
         raw.extend(self._vector_candidates(context, gaps, budget=budget, prefetched=prefetched))
+        self._phase_done("vector", _started)
         return admitted()
 
     # -- hydration and admission ----------------------------------------------
@@ -494,20 +498,41 @@ class RetrievalPipeline:
         if self._remaining(working) <= 0:
             return _empty_result(working, "deadline_exceeded")
         gaps: list[str] = []
-        prefetched = self._prefetch_query(working)
+        # Temporary instrumentation (3.4.5): what each phase of this search cost, read by
+        # the host adapter's prefetch line.  Removed once the window is accounted for.
+        self._phases: list[tuple[str, float]] = []
+        self.last_phase_seconds: tuple[tuple[str, float], ...] = ()
         try:
-            with self.storage.read(working.trusted_context, remaining_seconds=max(self._remaining(working), 0.001)) as tx:
-                epoch = self.storage_reader.epoch(tx)
-                hydrated, seed_count = self._collect_rounds(tx, working, gaps, prefetched=prefetched)
-                self._hydrate_related(tx, working, hydrated, gaps)
-                ranked, query_items = self._select(tx, working, hydrated, gaps)
-                return self._result(working, epoch, ranked, query_items, gaps, seed_count, len(hydrated))
-        except ContractError as exc:
-            if exc.code == "DEADLINE_EXCEEDED":
-                return _empty_result(working, "deadline_exceeded")
-            return _empty_result(working, f"sqlite_unavailable:{exc.code}")
-        except Exception as exc:
-            return _empty_result(working, f"sqlite_unavailable:{type(exc).__name__}")
+            prefetched = self._prefetch_query(working)
+            try:
+                with self.storage.read(working.trusted_context, remaining_seconds=max(self._remaining(working), 0.001)) as tx:
+                    _started = time.monotonic()
+                    epoch = self.storage_reader.epoch(tx)
+                    self._phase_done("epoch", _started)
+                    _started = time.monotonic()
+                    hydrated, seed_count = self._collect_rounds(tx, working, gaps, prefetched=prefetched)
+                    self._phase_done("collect", _started)
+                    _started = time.monotonic()
+                    self._hydrate_related(tx, working, hydrated, gaps)
+                    self._phase_done("relation_hydrate", _started)
+                    _started = time.monotonic()
+                    ranked, query_items = self._select(tx, working, hydrated, gaps)
+                    self._phase_done("select", _started)
+                    return self._result(working, epoch, ranked, query_items, gaps, seed_count, len(hydrated))
+            except ContractError as exc:
+                if exc.code == "DEADLINE_EXCEEDED":
+                    return _empty_result(working, "deadline_exceeded")
+                return _empty_result(working, f"sqlite_unavailable:{exc.code}")
+            except Exception as exc:
+                return _empty_result(working, f"sqlite_unavailable:{type(exc).__name__}")
+        finally:
+            self.last_phase_seconds = tuple(self._phases)
+
+    def _phase_done(self, name: str, started: float) -> None:
+        """Record one phase's seconds; a no-op when this search did not open the list."""
+        phases = getattr(self, "_phases", None)
+        if phases is not None:
+            phases.append((name, time.monotonic() - started))
 
     def _collect_rounds(self, tx, working: SearchContext, gaps: list[str], *,
                         prefetched=None) -> tuple[list[tuple[CandidateRef, RetrievedObject]], int]:

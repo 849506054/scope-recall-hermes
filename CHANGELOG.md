@@ -2,6 +2,21 @@
 
 All notable changes to `scope-recall` will be documented in this file.
 
+## [3.4.5] - 2026-09-30
+
+**Fork release, temporary instrumentation.** 3.4.4's prefetch line says what the recall
+cost, not what it spent it on.  The pipeline now records each phase of the last search --
+``epoch``, the four local channels, ``vector``, ``collect``, ``relation_hydrate``,
+``select`` -- and the host adapter's line carries them.
+
+Measured on this instance (same store, same request shape): ``vector`` is the largest
+phase at 0.95-1.44 s of a 1.3-2.4 s search, and it is the query embedding's wait plus the
+search, which alone costs 0.10 s.  A gateway prefetch that spent 3.66 s of its five-second
+window therefore reached the search with almost nothing left, which is what the transport
+timeout in its gap meant.
+
+Temporary: it comes out with 3.4.4's line once the window is accounted for.
+
 ## [3.4.4] - 2026-09-30
 
 **Fork release.** Two fork-side changes, both about seeing what a failing recall is doing.
