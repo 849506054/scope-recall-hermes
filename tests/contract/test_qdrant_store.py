@@ -141,6 +141,10 @@ class Server:
         if parts[2:] == ["points", "query"]:
             scopes = body["filter"]["must"][0]["match"]["any"]
             assert body["filter"]["must"][0]["key"] == "scope_id"
+            # A search asks for the hit fields only: the stored vector and the text are read
+            # by no caller on this path (2,031 KB -> 39 KB for 40 hits, 2026-09-30).
+            assert body["with_vector"] is False and isinstance(body["with_payload"], list)
+            wanted = body["with_payload"]
             vector = body["query"]
             norm = math.hypot(*vector)
             selected = []
@@ -149,7 +153,17 @@ class Server:
                     score = sum(
                         left * right for left, right in zip(point["vector"], vector)
                     ) / (norm or 1)
-                    selected.append(deepcopy(point) | {"score": score})
+                    selected.append(
+                        {
+                            "id": point["id"],
+                            "score": score,
+                            "payload": {
+                                key: point["payload"][key]
+                                for key in wanted
+                                if key in point["payload"]
+                            },
+                        }
+                    )
             selected.sort(key=lambda point: -point["score"])
             return self.ok({"points": selected[: body["limit"]]})
         raise AssertionError((method, path, body))
@@ -431,8 +445,13 @@ def test_roundtrip_search_pagination_count_delete(setup):
         limit=3,
     )
     assert len(hits) == 3 and all(hit["_distance"] == pytest.approx(0) for hit in hits)
+    # A hit carries the fields the recall path reads and nothing else: asking for the
+    # stored vector and the text made the answer 2,031 KB where this shape answers 39 KB.
+    assert all(set(hit) == {"id", "scope_id", "target", "_distance"} for hit in hits)
     queries = [call for call in server.calls if "/query" in call[1]]
     assert len(queries) == 1
+    assert queries[0][2]["with_vector"] is False
+    assert queries[0][2]["with_payload"] == ["id", "scope_id", "target"]
     assert queries[0][2]["filter"]["must"][0]["match"]["any"] == [
         rows[0]["scope_id"],
         "unused",
@@ -917,7 +936,27 @@ def test_search_rejects_out_of_partition_results(setup):
     store.upsert_records([row(scope="private")])
     point = next(iter(server.collections[store.collection_name]["points"].values()))
     server.hook = lambda method, path, body: (
-        server.ok({"points": [point | {"score": 1}]}) if "/query" in path else None
+        server.ok({"points": [{
+            "id": point["id"],
+            "score": 1,
+            "payload": {key: point["payload"][key] for key in body["with_payload"]},
+        }]})
+        if "/query" in path
+        else None
+    )
+    with pytest.raises(ContractError):
+        store.search([3, 4], scope_id=row()["scope_id"], limit=1)
+
+
+def test_search_rejects_a_hit_that_is_not_what_was_asked_for(setup):
+    """A search asks for id, scope and metadata only; a server that answers with the whole
+    record (text, stored vector) is refused rather than passed on to the caller."""
+    store, server, _, _ = setup
+    store.open()
+    store.upsert_records([row()])
+    point = next(iter(server.collections[store.collection_name]["points"].values()))
+    server.hook = lambda method, path, body: (
+        server.ok({"points": [deepcopy(point) | {"score": 1}]}) if "/query" in path else None
     )
     with pytest.raises(ContractError):
         store.search([3, 4], scope_id=row()["scope_id"], limit=1)

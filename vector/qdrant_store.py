@@ -40,6 +40,13 @@ _BATCH_SIZE = 64
 _BATCH_BYTES = 4 * 1024 * 1024
 _MAX_POINT_BYTES = 1024 * 1024
 _PAGE_SIZE = 64
+#: Payload a recall hit is read for: the record id, its scope column, and the metadata JSON
+#: that carries identity and object binding.  Content, summary and the stored copy of the
+#: vector are read by no caller on this path -- asked for anyway, a 40-hit query answered
+#: with 2,031 KB against the production collection where the same search in this shape
+#: answers with 39 KB (2026-09-30), and the recall's vector budget paid for parsing the
+#: difference.
+_HIT_PAYLOAD = ("id", "scope_id", "target")
 
 
 def _invalid() -> ContractError:
@@ -594,6 +601,30 @@ class QdrantVectorStore(VectorStore):
         except (KeyError, TypeError, ValueError, OverflowError):
             raise _invalid() from None
 
+    def _hit(self, point: Any) -> dict:
+        """One search hit as the recall path reads it: id, scope and identity metadata only.
+
+        The stored vector is verified where a record is read back whole (``_decode``); a
+        search asks for neither it nor the text, so its answer stays a fraction of the
+        bytes and the caller's vector budget is spent on the search itself.  The shape is
+        checked here too: a hit that is not exactly what was asked for is refused rather
+        than passed on as a candidate.
+        """
+        try:
+            if type(point) is not dict:
+                raise ValueError
+            payload = point["payload"]
+            if type(payload) is not dict or set(payload) != set(_HIT_PAYLOAD):
+                raise ValueError
+            for name in _HIT_PAYLOAD:
+                if type(payload[name]) is not str or len(payload[name].encode("utf-8")) > _MAX_POINT_BYTES:
+                    raise ValueError
+            if type(point["id"]) is not str or point["id"] != self.point_id(payload["id"]):
+                raise ValueError
+            return dict(payload)
+        except (KeyError, TypeError, ValueError, OverflowError):
+            raise _invalid() from None
+
     def _retrieve(self, ids: list[str], deadline: float) -> dict[str, dict]:
         output: dict[str, dict] = {}
         for offset in range(0, len(ids), _BATCH_SIZE):
@@ -852,8 +883,8 @@ class QdrantVectorStore(VectorStore):
                 "query": values,
                 "filter": {"must": [{"key": "scope_id", "match": {"any": scopes}}]},
                 "limit": limit,
-                "with_payload": True,
-                "with_vector": True,
+                "with_payload": list(_HIT_PAYLOAD),
+                "with_vector": False,
             },
             deadline,
         )
@@ -867,7 +898,7 @@ class QdrantVectorStore(VectorStore):
         seen = set()
         for point in result["points"]:
             _check_budget(deadline)
-            row = self._decode(point)
+            row = self._hit(point)
             score = point.get("score")
             if (
                 row["id"] in seen

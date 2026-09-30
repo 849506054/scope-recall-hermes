@@ -2,6 +2,25 @@
 
 All notable changes to `scope-recall` will be documented in this file.
 
+## [3.4.3] - 2026-09-30
+
+**Fork release** (upstream's own numbering stops at `3.4.2`; this fix is entirely in
+fork code — `vector/qdrant_store.py` is ours).
+
+A similarity search asked for the stored vector *and* the full text of every hit, and no
+caller on that path reads either: against the production collection 40 hits answered with
+**2,031 KB**, where the same search in this shape answers with **39 KB** (measured
+2026-09-30). The vector is also stored in the payload, so each hit carried it twice. On
+this instance's 1–2 s vector budget, parsing the difference is what let the semantic
+channel run out of time and hand a recall back `vector_unavailable` while Qdrant itself
+answered 200 in 0.21–0.62 s.
+
+`QdrantVectorStore` now asks for the three fields the recall path reads (`id`,
+`scope_id`, `target`), refuses a hit that is not exactly what it asked for, and keeps
+verifying the whole record on the paths that read one back whole (retrieve, inventory,
+migration). Contract coverage asserts the request shape, the subset decode, and both
+refusals; the fake Qdrant honours `with_payload`/`with_vector` like the real service.
+
 ## [3.4.2] - 2026-09-29
 
 **Fork note.** This release is upstream's `3.4.2` with the remote Qdrant backend on top of it. Upstream 3.4.x fixes three things the fork had carried locally — the prompt's embedding asked for as the recall starts (the fork's `_StartedChannel`), `--python` passed on as given (#141), and Codex's hook budget — so those fork patches are retired here. What stays fork-own: the Qdrant store with its wiring and maintenance commands, and the doctor probes that measure a `PYTHONPATH` install.
