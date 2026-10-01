@@ -53,6 +53,10 @@ from .tool_surface import HermesToolSurface, _TOOL_NAMES, display_zone
 _log = logging.getLogger(__name__)
 
 _CAPTURE_TIMEOUT_S = 1.0
+#: Seconds without a recall after which the query route is warmed before the next one (``_warm_query_route``).
+_QUERY_ROUTE_WARM_AFTER_SECONDS = 60.0
+#: The warm-up's own budget: it is not a recall, and a route that will not answer within it is not warm.
+_QUERY_ROUTE_WARM_BUDGET_SECONDS = 8.0
 _BOUNDED_MESSAGE_SCAN = 8
 #: Turns whose opening message ``pre_llm_call`` stored, remembered across a compression's session switch.
 _USER_CAPTURED_TURNS = 64
@@ -208,6 +212,8 @@ class ScopeRecallHermesAdapter(HermesToolSurface, _MemoryProviderBase):  # pyrig
         self._diagnostics = AdapterDiagnostics()
         #: What the last worker launch attempt added to capability_gaps.
         self._worker_launch_gaps: tuple[str, ...] = ()
+        #: When the last recall ran, for ``_warm_query_route``: the route is warmed only after a gap.
+        self._last_prefetch_at = 0.0
         self._initialized = False
 
     @property
@@ -313,6 +319,8 @@ class ScopeRecallHermesAdapter(HermesToolSurface, _MemoryProviderBase):  # pyrig
             from .hooks import update_adapter_binding
 
             update_adapter_binding(self)
+
+        self._warm_query_route()
 
     def _require_identity(self) -> HermesIdentity:
         if self._identity is None or not self._initialized:
@@ -588,6 +596,30 @@ class ScopeRecallHermesAdapter(HermesToolSurface, _MemoryProviderBase):  # pyrig
             json.dumps(getattr(pipeline, "last_vector_failure", None), sort_keys=True),
         )
 
+    def _warm_query_route(self) -> None:
+        """Ask for the query embedding before the recall needs it, when the route may have gone cold.
+
+        The provider's connection through this machine's proxy goes cold over idle minutes, and the first embedding
+        after that cost 2.4-2.8 s of a 4 s recall window (measured 2026-10-02, three times, the collection answering
+        200 in 0.68 s); asked for on its own the same embedding costs 0.66 s and leaves the recall's own at 0.42 s.
+        Fire-and-forget, and only after a gap: a chatty exchange leaves the route warm by itself, and the recall
+        never waits for a warm-up.
+        """
+        if time.monotonic() - self._last_prefetch_at < _QUERY_ROUTE_WARM_AFTER_SECONDS:
+            return
+        runtime = getattr(self._host_runtime, "runtime", None)
+        embedder = getattr(getattr(runtime, "auxiliary", None), "query_embedding", None)
+        if embedder is None:
+            return
+
+        def warm() -> None:
+            try:
+                embedder.embed_query("warm", remaining_seconds=_QUERY_ROUTE_WARM_BUDGET_SECONDS)
+            except Exception:  # noqa: BLE001 - a warm-up that fails costs its budget and nothing else
+                pass
+
+        threading.Thread(target=warm, name="scope-recall-query-route-warmth", daemon=True).start()
+
     @_serialized_host_event
     def prefetch(self, query: str, *, session_id: str = "") -> str:
         identity = self._require_identity()
@@ -613,6 +645,7 @@ class ScopeRecallHermesAdapter(HermesToolSurface, _MemoryProviderBase):  # pyrig
             zone=display_zone(),
         )
         recall_seconds = time.monotonic() - timed
+        self._last_prefetch_at = time.monotonic()
         self._log_vector_loss(packet, recall_seconds)
         preparation = self._require_core().prepare_recall_render(context, packet)
         self._diagnostics.last_prefetch_request_id = packet["request_id"]

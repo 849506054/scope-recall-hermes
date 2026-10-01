@@ -5,6 +5,7 @@ from datetime import timedelta, timezone
 import json
 import logging
 import sys
+import time
 import types
 
 from scope_recall.adapters.hermes import bind_hermes_identity
@@ -108,6 +109,51 @@ def test_a_recall_that_kept_its_vector_channel_logs_nothing(adapter, initialize_
     with caplog.at_level(logging.WARNING, logger="scope_recall.adapters.hermes.provider"):
         provider.prefetch("继续 TEST 项目", session_id="")
     assert "vector channel lost" not in caplog.text
+
+
+def test_the_query_route_is_warmed_once_after_a_gap(adapter, monkeypatch):
+    """The first query embedding after idle costs seconds of a recall's window (measured 2026-10-02: 2.4-2.8 s of
+    4 s, the collection answering 200 in 0.68 s).  Asked for before the recall needs it, the same embedding costs
+    0.66 s and leaves the recall's own at 0.42 s.  Only after a gap: a chatty exchange leaves the route warm."""
+    provider, _clock = adapter
+    calls = []
+
+    class Embedder:
+        def embed_query(self, text, *, remaining_seconds):
+            calls.append((text, remaining_seconds))
+            return (0.1, 0.2)
+
+    runtime = types.SimpleNamespace(auxiliary=types.SimpleNamespace(query_embedding=Embedder()))
+    monkeypatch.setattr(provider, "_host_runtime", types.SimpleNamespace(runtime=runtime, close=lambda: None))
+
+    provider._last_prefetch_at = 0.0
+    provider._warm_query_route()
+    for _ in range(200):
+        if calls:
+            break
+        time.sleep(0.01)
+    assert calls and calls[0][0] == "warm", calls
+    assert calls[0][1] > 0
+
+    calls.clear()
+    provider._last_prefetch_at = time.monotonic()
+    provider._warm_query_route()
+    time.sleep(0.05)
+    assert calls == [], "a recall just ran: the route is warm"
+
+
+def test_a_warm_up_that_fails_is_not_the_recall_s_problem(adapter, monkeypatch):
+    provider, _clock = adapter
+
+    class Failing:
+        def embed_query(self, text, *, remaining_seconds):
+            raise RuntimeError("route down")
+
+    runtime = types.SimpleNamespace(auxiliary=types.SimpleNamespace(query_embedding=Failing()))
+    monkeypatch.setattr(provider, "_host_runtime", types.SimpleNamespace(runtime=runtime, close=lambda: None))
+    provider._last_prefetch_at = 0.0
+    provider._warm_query_route()  # raised nowhere: the warm-up is fire-and-forget
+    time.sleep(0.05)
 
 
 def test_prefetch_does_not_use_raw_callback_text_for_scope(adapter, initialize_kwargs):

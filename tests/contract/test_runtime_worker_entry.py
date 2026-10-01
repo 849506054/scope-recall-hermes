@@ -547,6 +547,42 @@ def test_a_cold_embedding_does_not_spend_the_searchs_share(tmp_path):
         instance.close()
 
 
+def test_a_prefetched_embedding_is_waited_for_until_its_own_deadline(tmp_path):
+    """The search waits for a prefetched embedding until the embedding's own deadline, not its own.
+
+    A provider that never answers must not hold the recall past the share the embedding was given: on 2026-10-02 a
+    cold embedding was cut at its 2.8 s share while the search, waiting with the recall's own 4 s deadline, kept the
+    round waiting for it.  Here the embedding's deadline is 0.2 s and the search's is 5 s.
+    """
+
+    class Embedding:
+        def embed_query(self, text, *, remaining_seconds):
+            return (0.1, 0.2)
+
+    class Never:
+        query = "TEST query"
+
+        def __init__(self):
+            self.deadline = time.monotonic() + 0.2
+
+        def result(self, deadline):
+            time.sleep(max(0.0, deadline - time.monotonic()))
+            raise TimeoutError("query embedding stage deadline exhausted")
+
+    store = _ScopedStore()
+    instance, binding = _vector_instance(tmp_path, store, Embedding())
+    port = instance.core.recall_pipeline.vector_port
+    try:
+        instance._ensure_vector_port(allow_create=False, deadline=time.monotonic() + 5.0)
+        started = time.monotonic()
+        with pytest.raises(TimeoutError, match="embedding stage deadline exhausted"):
+            port.search(_search_context(binding, 5.0), limit=1, remaining_seconds=5.0, prefetched=Never())
+        assert time.monotonic() - started < 1.0, "the search's own deadline is not the one the embedding is waited for by"
+        assert store.searches == []
+    finally:
+        instance.close()
+
+
 def test_warming_opens_the_store_and_searches_one_of_its_partitions(tmp_path):
     """A kept handler's first prompt opened the table and read the index inside its recall; warmed when the server
     starts, that prompt finds them ready."""

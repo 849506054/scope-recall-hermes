@@ -2,6 +2,31 @@
 
 All notable changes to `scope-recall` will be documented in this file.
 
+## [3.4.9.2] - 2026-10-01
+
+**Fork release.** The first query embedding after idle is asked for before the recall needs it, and the search waits
+for a prefetched embedding only as long as the embedding was given.
+
+Measured on this install (2026-10-02, three times): after a few idle minutes the recall's own embedding cost
+2.4-2.8 s of its 4 s window while the collection answered 200 in 0.68 s, and the recall came back without its
+semantic channel -- the accounting line 3.4.8.3 added is what showed where the window went.  Asked for on its own
+the same embedding costs 0.66 s and leaves the recall's own at 0.42 s, so the host adapter asks for one
+(`_warm_query_route`) when the last recall was more than a minute ago: fire-and-forget, never on the recall's path,
+and not at all in a chatty exchange, which leaves the route warm by itself.  What goes cold is this process's
+connection to the provider: a fresh process's request through the same proxy measures 0.57 s cold and a warm-up in
+another process does not help.
+
+`_embedding_wait` (runtime/instance.py) ends the search's wait for a prefetched embedding at the embedding's own
+deadline, so a provider that never answers no longer holds the recall for the search's share instead.
+
+### Upgrading from 3.4.9.1
+
+1. Stop the hosts and the Scope Recall worker, and take a `backup`.
+2. Install the 3.4.9.2 package, then run `plan-install` and `apply-install` for each host.
+3. Start the hosts again and run `doctor`.
+
+The store's schema is unchanged (1110).
+
 ## [3.4.9.1] - 2026-10-01
 
 **Fork release.** Upstream v3.4.9 is merged over v3.4.8 (16 files, +540/-53): a store left with no

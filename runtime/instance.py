@@ -519,7 +519,7 @@ class _LazyVectorPort:
             # come and parked for the next request if not, so a fast failure does not wait for the table either.
             try:
                 if prefetched is not None:
-                    prepared.append((context.query, prefetched.result(effective_deadline)))
+                    prepared.append((context.query, prefetched.result(_embedding_wait(prefetched, effective_deadline))))
                     return True
                 embed = self._query_embedder()
                 if embed is None:
@@ -552,7 +552,7 @@ class _LazyVectorPort:
                 # and reported no gap; Claude Code and Codex lost their vector search this way unseen.
                 raise TimeoutError("native vector helper open deadline exhausted before the search")
             if not prepared and prefetched is not None:
-                prepared.append((context.query, prefetched.result(effective_deadline)))
+                prepared.append((context.query, prefetched.result(_embedding_wait(prefetched, effective_deadline))))
             # The embedding's provider round trip is not the collection's answer to pay for: a search started with
             # the recall takes its share from the moment the embedding landed (``_QuerySearch.deadline_for``).
             run_deadline = effective_deadline if search is None else search.deadline_for(getattr(prefetched, "finished", None))
@@ -565,6 +565,18 @@ class _LazyVectorPort:
                 if prepared:
                     return port.search(context, limit=limit, remaining_seconds=remaining, _prepared_query=prepared[0])
                 return port.search(context, limit=limit, remaining_seconds=remaining)
+
+
+def _embedding_wait(prefetched: Any, fallback: float) -> float:
+    """When the search stops waiting for a prefetched embedding: the embedding's own deadline, when it has one.
+
+    A provider that never answers must not hold the search past the share the embedding was given; one that does
+    answer gives the search its own share from that moment (``_QuerySearch.deadline_for``).
+    """
+    deadline = getattr(prefetched, "deadline", None)
+    if isinstance(deadline, (int, float)) and not isinstance(deadline, bool) and deadline > 0:
+        return min(fallback, float(deadline))
+    return fallback
 
 
 def _open_store(resource: Any, *, allow_create: bool, deadline: float | None, during_open) -> None:
