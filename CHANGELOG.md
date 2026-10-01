@@ -2,92 +2,164 @@
 
 All notable changes to `scope-recall` will be documented in this file.
 
+## [3.4.8.1] - 2026-10-01
+
+**Fork release.** Upstream v3.4.7 and v3.4.8 are merged over the shared v3.4.2 baseline
+(33 commits, 35 files): a question that names a day is answered from that day
+(``recall_scope``), at most half the packet of the last copy's turn is raised above the best
+candidate said before it, an older copy found on the way leads to its turn, a message sent
+into a running turn waits for a key of its own, a candidate statement past the deadline is
+interrupted, and the lexical statement starts from the query's terms at both of its call
+sites.  Upstream's tree is taken whole; what follows the upstream sections is the fork's own
+surface.
+
+### Folded into upstream's tree
+
+- The lexical statement's ``CROSS JOIN`` pin (fork 3.4.7) and the contract test that guarded
+  it.  Upstream's ``WHERE ... AND +e.scope_id IN (...)`` keeps the scope filter from choosing
+  an index, in ``retrieval_storage.lexical`` and in ``storage.search_limit`` alike.  On this
+  instance's store the two forms are one plan: read-only against the live store (30 frequent
+  terms, 3 scopes, limit 40) upstream's form starts from
+  ``SEARCH t USING COVERING INDEX ... (term=?)`` and returns the same 40 rows in 1.72 s, the
+  fork's pin in 1.77 s, and the shared 3.4.2 form starts from
+  ``SEARCH e USING INDEX source_content (scope_id=?)`` and takes 5.80 s.
+- The phase timing instrumentation of fork 3.4.4 and 3.4.5, retired by upstream's 3.4.8
+  release commit, and the host adapter comment that described it.
+
+### Fork surface kept
+
+- ``vector/``: the Qdrant backend (``qdrant_config``, ``qdrant_http`` and its worker,
+  ``qdrant_mutation``, ``qdrant_store``), bound in ``runtime/instance.py`` and
+  ``runtime/resume_entry.py``, with ``maintenance/vector_migration.py``.
+- The semantic channel starts beside the local channels and is joined at its turn, with a
+  0.25 s grace for a helper that is still working (fork 3.4.6).
+- ``adapters/models.py``: the Voyage embedding path falls back where the host supplies no
+  usage.
+- ``maintenance/doctor.py``: the remote collection's facts, and the vector probe flags.
+- The fork's maintenance commands and its pip-less install path.
+
+### Numbering
+
+The fork line numbers itself as upstream plus a fourth digit (``3.4.8.1``) from this release
+on.  The fork's own 3.4.3 - 3.4.8 were released while upstream used those same numbers for a
+different tree, and a published version may not name a second one.
+
 ## [3.4.8] - 2026-09-30
 
-**Fork cleanup.** The phase timing added to account for this store's five-second window --
-3.4.4's prefetch line and 3.4.5's per-phase seconds -- is retired.  The window is accounted
-for: the semantic search ran last and lost its slice (3.4.6), and the lexical statement drove
-from the scope rather than the query's terms (3.4.7).  `RetrievalPipeline.search` returns to
-its 3.4.4 shape and the host adapter logs nothing of its own; the fixes those measurements
-produced stay.
+3.4.8 answers a question about what was said or done on a day, or by one entry of the shared store on a day, from that day's conversation. Any other message is recalled as on 3.4.7.
+
+### Recall
+
+- A message that names a day ("9月29日", "2026-09-29", "昨天", "昨晚"; one to three days) and otherwise only asks or requests what was said or done then ("聊了什么", "帮我看看做了哪些工作", "总结一下", "有什么进展", "what did we do yesterday") is answered from that day: the messages sent to the agents and the replies they showed, in the asker's audience, spread across the whole day, several named days taking turns. A short message that only acknowledges ("继续", "好的，继续吧", "按你说的做") is left out. When the message also names an entry of the shared store ("9月29日工作机 Claude Code 聊了什么"), only that entry's messages. Searched by its words alone, the date and the entry's name matched nothing useful: on a copy of the shared store, of 106 such questions (every entry and day of 09-16 to 09-29 with at least three messages of the owner, asked two ways), 4 found a message of the named entry from the named day. Now 106 do when asked from Claude Code and 104 when asked from yuheng (the rest are outside yuheng's audience), and 99% and 97% of what is delivered is from that entry and day. In seven more wordings of the same 53 entry-days, 371 of 371 and 364 of 371 do, against 16 on 3.4.7. The day questions were measured by words alone.
+- Any other message that names a day is recalled exactly as if it named none: a question about a subject ("9月2日发布的 3.4.2 修了什么", "继续昨天的任务"), which lost the answer said on another day, the current task or the claim that answered it; a question about what to do ("今天做什么") or where the work stopped ("昨天聊到哪了"), which the current task answers; a message that only mentions a day ("今天在吗"); a range of days ("9月28日到30日"), more than three, a day still to come, a placeholder date such as 9999-12-31; a message of more than 512 characters. Every recall of the owner's real questions and of two agents' older question sets answers exactly as on 3.4.7 by words alone; none of the 428 is read as a day question, so with vectors on they are answered as on 3.4.7 too. A time of day is not used: "昨天下午3点聊了什么" is answered from the whole day.
+- A day is the calendar day in the zone the host tells its model, the zone the recalled times are shown in: Hermes's `timezone` setting (else the machine's); for Codex and Claude Code, the machine's, with that day's daylight-saving offset; for a remote entry, the serving machine's.
+
+### Upgrading from 3.4.7
+
+1. Stop the hosts and the Scope Recall worker, and take a `backup`.
+2. Install the 3.4.8 package, then run `plan-install` and `apply-install` for each host.
+3. Start the hosts again and run `doctor`.
+
+The store's schema is unchanged (1110). Every change, with its details, is in [CHANGELOG.md](https://github.com/410979729/scope-recall-hermes/blob/v3.4.8/CHANGELOG.md).
+
 
 ## [3.4.7] - 2026-09-30
 
-**Fork fix.** The lexical statement's join order was left to the planner, and on a large
-index the planner drove it from ``source_events`` -- every version in the scope -- looking up
-postings per version: the term filter applied after the fact, so the posting budget bounded
-nothing and a real prompt cost seconds.
+3.4.7 puts what a question was told the last time it was asked above the best candidate of that time in its automatic recall, and gives the vector threshold a shared store needs in the shipped embedding space. Nothing else changes.
 
-Measured on this store (3M postings, 81k sources): a 648-character prompt took **3.86 s** in
-the statement alone (the document-frequency read that chooses terms: 0.02 s), the recall lost
-its collect deadline, and the semantic channel with it.  Pinned term-first with ``CROSS JOIN``
--- an inner join SQLite does not reorder -- the same statement returns the **same rows in
-0.19 s**, and end to end the recall went from 4.10 s with ``deadline_exceeded_collect`` to
-1.04 s with no deadline gap at all.
+### Recall
 
-A contract test captures the statement the channel runs and fails if the pin goes away.
+- A question asked again word for word leads to the replies its earlier copies received (3.4.4), and they came at a first rank's fixed score, below every candidate two channels agree on, as most are once vectors are on. The automatic recall now raises at most half the packet of the last copy's turn above the best candidate said up to that turn, the turn's other replies included: the replies a search channel ranked highest, then the turn's last reply when the turn was read to its end. Only the last copy's turn, so an answer that changed since is not put beside the one that replaced it. No more than that: an agent's turn opens with what it is about to do and names the subject as it works, and a turn cut by the window that reads it has not reached its answer. What was said after that turn keeps its place above them only when it ranks higher still: with vectors on, a newer statement both channels find stays above them when nothing said before the turn was found by both; by words alone an answer that changed usually comes before what replaced it. Recall in the other modes is unchanged.
+- On a copy of the shared store, the owner's 173 real questions asked again get their answer in the top five for 146 instead of 124 by words alone, and for 141 instead of 99 with vectors on at 0.70. By words alone 24 are gained and 2 lost: in both, the reply the benchmark counts as the answer, the first long reply of the turn, stands below the raised replies of the same turn, once sixth instead of fifth and once left out of the packet. With vectors on, over all 428 questions measured, 42 are gained and none is lost. Facts, rephrased questions, questions with no answer and two agents' older question sets are answered as before either way.
+
+### Configuration
+
+- `vector_threshold` on a shared store in the shipped embedding space: 0.70, where the configs hold the accepted 0.653, set by hand. Measured on 3.4.5 on a copy of the shared store of nine entries: at 0.653, two agents' sets of 20 questions that have no answer were each given an unrelated memory for 12 of them, and from 0.68 for 2, as by words alone. Over the 428 questions, 0.70 answers 23 more than 0.653 and one fewer, and 0.72 loses a fact an agent had been told. A store in another space, or with a threshold calibrated on it, keeps its own. See `docs/configuration.md`.
+
+### Upgrading from 3.4.6
+
+1. Stop the hosts and the Scope Recall worker, and take a `backup`.
+2. Install the 3.4.7 package, then run `plan-install` and `apply-install` for each host.
+3. On a shared store in the shipped embedding space whose runtime configs hold `vector_threshold` 0.653, set 0.70 in each entry's runtime config.
+4. Start the hosts again and run `doctor`.
+
+The store's schema is unchanged (1110). Every change, with its details, is in [CHANGELOG.md](https://github.com/410979729/scope-recall-hermes/blob/v3.4.7/CHANGELOG.md).
 
 ## [3.4.6] - 2026-09-30
 
-**Fork fix.** The semantic channel ran after the local ones, so its slice was what they
-left.  A host prefetch that spent 3.66 s of its five-second window handed the remote
-search 0.03 s, and the recall lost its meaning channel to a transport timeout -- 3.4.5's
-phase line named ``vector`` as the largest phase and the search as the thing that ran out.
+3.4.6 stops a message being lost when another message under the same key still waits in the capture inbox, as Codex's messages sent into a running turn were, and keeps such a message when the other one is deleted. Nothing else changes.
 
-The search now starts with collection, beside the local channels, and is joined when its
-turn comes: the recall costs the longer of the two instead of their sum, and the search
-keeps a slice of its own.  A contract test proves it with a local channel that spends
-0.45 s of a 0.5 s window: the search is handed 0.03 s before this change and 0.37 s after.
+### Capture
+
+- A message is no longer refused because another message under its key still waits in the capture inbox; this holds for every host. Codex gives a message sent into a running turn the id of the turn it joins, so it comes under the key of the turn's first message: it waits in the capture inbox, and the worker's next pass stores it under a key made from its words, about 45 s later. The inbox knew a capture by its key alone, so a third message sent into the turn before that pass found the second's place, was refused as a changed copy of it (`VERSION_CONFLICT`) and was lost. Comparing the Codex session records of both computers attached to the shared store with the store itself since 2026-09-28, six prompts were missing, each sent 3-5 s after another into the same turn (five the owner wrote, one the context of Codex's in-app browser), and no other. A capture's place in the inbox now depends on its words as well. A hook sent again with the same words, as a remote client does when the store was too busy to take it, still finds its own place and stores the message once; the same words sent twice into one turn before the next pass are kept once. Messages lost before 3.4.6 are not recovered; Codex's own session record still holds them.
+- A delete cancels a waiting capture that holds the deleted message (its words, one of its parts, a later version of it, or a part of it sent without its first), and keeps another message waiting under the deleted message's key, which is then stored under a key of its own, as it is when it comes after the delete. Every waiting capture of the deleted message's source group was cancelled, but one already being given a new key: a message still waiting under a Codex turn's key was lost with another message of the turn that was deleted.
+
+### Upgrading from 3.4.5
+
+1. Stop the hosts and the Scope Recall worker, and take a `backup`.
+2. Install the 3.4.6 package, then run `plan-install` and `apply-install` for each host.
+3. Start the hosts again and run `doctor`.
+
+The store's schema is unchanged (1110). Every change, with its details, is in [CHANGELOG.md](https://github.com/410979729/scope-recall-hermes/blob/v3.4.6/CHANGELOG.md).
 
 ## [3.4.5] - 2026-09-30
 
-**Fork release, temporary instrumentation.** 3.4.4's prefetch line says what the recall
-cost, not what it spent it on.  The pipeline now records each phase of the last search --
-``epoch``, the four local channels, ``vector``, ``collect``, ``relation_hydrate``,
-``select`` -- and the host adapter's line carries them.
+3.4.5 keeps a slow statement from holding up a recall, lets a recall's diagnostic ref be read, and stops `doctor` calling a busy worker failed. Nothing else changes.
 
-Measured on this instance (same store, same request shape): ``vector`` is the largest
-phase at 0.95-1.44 s of a 1.3-2.4 s search, and it is the query embedding's wait plus the
-search, which alone costs 0.10 s.  A gateway prefetch that spent 3.66 s of its five-second
-window therefore reached the search with almost nothing left, which is what the transport
-timeout in its gap meant.
+### Recall
 
-Temporary: it comes out with 3.4.4's line once the window is accounted for.
+- A candidate statement still running at the recall's deadline is interrupted: that channel gives nothing, the gap says `deadline_exceeded_collect`, and what the channels before it found still answers. A statement cannot see the deadline itself: before 3.4.3 the word search ran 18-21 s for a long Telegram message and the recall came back empty long after its deadline, the Hermes turn waiting for it. The deadline is looked at once every million steps of a statement, 10-60 ms apart: each look takes Python's lock back from the statement, and looked at a hundred times as often, a 25 ms statement took 1.4 s beside a busy thread. On a copy of the shared store every recall of the owner's real questions and of two agents' older question sets answers exactly as on 3.4.4, and its median time is unchanged; that was measured by words alone, the embedding provider's project being over its monthly spending cap.
+- `inspect` reads a recall packet's `diagnostic_ref` for the session that recalled: that recall's counts and gap codes, kept by the process that ran it for its last 64 recalls. It answered `SOURCE_MISSING` for every one; it still does for another session's ref, or for one that process no longer holds, such as one from a prompt hook. A remote entry's MCP tools share one server session, so there any of the entry's conversations reads the others' refs; each holds only counts and gap codes.
+
+### Maintenance
+
+- `doctor` no longer reports a worker pass that yielded as `worker_last_exit_failed`: exit 75 with status busy means another writer held the store, or another pass the worker lock, and the supervisor tries again after a pause. Any other non-zero exit still is a failure.
+
+### Upgrading from 3.4.4
+
+1. Stop the hosts and the Scope Recall worker, and take a `backup`.
+2. Install the 3.4.5 package, then run `plan-install` and `apply-install` for each host.
+3. Start the hosts again and run `doctor`.
+
+The store's schema is unchanged (1110). Every change, with its details, is in [CHANGELOG.md](https://github.com/410979729/scope-recall-hermes/blob/v3.4.5/CHANGELOG.md).
 
 ## [3.4.4] - 2026-09-30
 
-**Fork release.** Two fork-side changes, both about seeing what a failing recall is doing.
+3.4.4 gives a question asked again what it was told before, stops Hermes storing a turn's message twice, and keeps one recall channel off the whole work queue. Nothing else changes.
 
-A vector gap named only the transport class: ``QdrantHTTPError`` stood for a timeout, a
-401 and a broken worker frame alike, and the exception is caught and discarded, so the
-name in the gap was the only place the fault survived.  The exception now carries the
-wire vocabulary ``core/vector_failure.py`` already reads, and a gap reads
-``QdrantHTTPError:timeout`` or ``QdrantHTTPError:http_status:401``.
+### Recall
 
-The Hermes prefetch logs its own timing when it needs to: on this instance a prefetch
-occasionally spends its whole five-second window and the packet says which phase ran out
-rather than what the work cost.  A line is written only when the recall passes three
-seconds or a phase reports ``deadline_exceeded_*``, so a healthy turn adds nothing.
-Temporary: it is removed once the window has been accounted for.
+- A question asked again word for word is given what it was told before. The automatic recall leaves out an older copy of the current message, since the message already says it, and that copy was the only way to the answer it had received whenever the answer shares no word with the question. It now still leads to its turn's replies and is never delivered itself. A short message does not: one of fewer than five search terms, about six Chinese characters, such as "继续执行" or "按你说的做", brings back no old turn. On a copy of the shared store, over the owner's real questions of the last two weeks asked again on every agent, the answer is in the top five for 124 of 173 instead of 59, and none that was answered before is lost; facts, rephrased questions, questions with no answer and two agents' older question sets are answered exactly as before. All of it was measured by words alone: the embedding provider's project was over its monthly spending cap.
+- A turn's replies no longer stop at the same message stored again (see below): of the 125 Hermes turns of 2026-09-16 to 09-29 that were stored that way, 100 lead to their answers again; most of the rest were answered more than 30 minutes later, past the window a turn is read in.
+- The channel that offers the session's messages still waiting to be consolidated reads the pending queue, not every consolidation ever made, which the queue keeps: 6-12 ms of each recall on the shared store, growing with every consolidation, is now 0.1 ms, and with one scope it no longer reads every event of that scope.
+
+### Hermes capture
+
+- A session's hooks go to the memory provider that bound it last. When Hermes rebuilds an agent it had evicted, the new provider binds the same session while the old one stays registered, and the hooks could go to the old one: the turn's message was stored through it, and again, with the reply, through the new one. It happened on the first turn after each rebuild, 6 of 48 turns on two agents since 2026-09-28. Messages stored twice before 3.4.4 keep their second copy.
+
+### Upgrading from 3.4.3
+
+1. Stop the hosts and the Scope Recall worker, and take a `backup`.
+2. Install the 3.4.4 package, then run `plan-install` and `apply-install` for each host.
+3. Start the hosts again and run `doctor`.
+
+The store's schema is unchanged (1110). Every change, with its details, is in [CHANGELOG.md](https://github.com/410979729/scope-recall-hermes/blob/v3.4.4/CHANGELOG.md).
 
 ## [3.4.3] - 2026-09-30
 
-**Fork release** (upstream's own numbering stops at `3.4.2`; this fix is entirely in
-fork code — `vector/qdrant_store.py` is ours).
+3.4.3 keeps a long message's recall from stalling. For a long enough message the word search read every event of the conversation's audience one by one: on a copy of the shared store the word search for a Telegram message of 72 characters took 18-21 s, and its recall came back empty at every stage's deadline. In a sample of the owner's messages since 2026-09-16, 39 of the 92 over 80 characters on the five Hermes instances were planned that way. Nothing else changes.
 
-A similarity search asked for the stored vector *and* the full text of every hit, and no
-caller on that path reads either: against the production collection 40 hits answered with
-**2,031 KB**, where the same search in this shape answers with **39 KB** (measured
-2026-09-30). The vector is also stored in the payload, so each hit carried it twice. On
-this instance's 1–2 s vector budget, parsing the difference is what let the semantic
-channel run out of time and hand a recall back `vector_unavailable` while Qdrant itself
-answered 200 in 0.21–0.62 s.
+### Recall
 
-`QdrantVectorStore` now asks for the three fields the recall path reads (`id`,
-`scope_id`, `target`), refuses a hit that is not exactly what it asked for, and keeps
-verifying the whole record on the paths that read one back whole (retrieve, inventory,
-migration). Contract coverage asserts the request shape, the subset decode, and both
-refusals; the fake Qdrant honours `with_payload`/`with_vector` like the real service.
+- The word search starts from the message's search terms, never from its audience's scopes. A store keeps no statistics for SQLite's planner, which weighed the terms against the scopes by rule of thumb and, past about thirty terms with the five scopes of a Telegram conversation, started from the scopes instead. On the copy all 655 real prompts sampled now start from their terms, and the word search of the two questions that had stalled takes 0.3 s instead of 18-20 s and finds the same memories. The owner's questions of the last two weeks, asked again on each agent, lose no answer and gain those two. Two agents' older question sets are answered exactly as before by words alone, and with vectors for facts and questions with no answer; the vector runs of the other two sets were cut short by the embedding provider's spending cap.
+
+### Upgrading from 3.4.2
+
+1. Stop the hosts and the Scope Recall worker, and take a `backup`.
+2. Install the 3.4.3 package, then run `plan-install` and `apply-install` for each host.
+3. Start the hosts again and run `doctor`.
+
+The store's schema is unchanged (1110). Every change, with its details, is in [CHANGELOG.md](https://github.com/410979729/scope-recall-hermes/blob/v3.4.3/CHANGELOG.md).
 
 ## [3.4.2] - 2026-09-29
 
@@ -2213,3 +2285,94 @@ This is the first public release after `v1.4.0`; the GitHub release notes for `v
 - Added a `vector_only_min_score` gate so weak vector-only matches cannot auto-recall unrelated durable ops rows without lexical evidence.
 - Added alias-expanded SQL discovery so lexical-only recall still finds intended alias matches such as `response style` → `replies` without broad recency scans.
 - Added regression coverage for unrelated-query suppression, high-confidence semantic hits, relevant lexical hits, and alias-expanded discovery.
+
+## Fork release line: 3.4.3 - 3.4.8 (fork-only)
+
+Six fork releases on top of the shared v3.4.2 baseline, numbered while upstream released its
+own 3.4.3 - 3.4.8 in parallel; the sections above are upstream's tree.
+
+**Fork cleanup.** The phase timing added to account for this store's five-second window --
+3.4.4's prefetch line and 3.4.5's per-phase seconds -- is retired.  The window is accounted
+for: the semantic search ran last and lost its slice (3.4.6), and the lexical statement drove
+from the scope rather than the query's terms (3.4.7).  `RetrievalPipeline.search` returns to
+its 3.4.4 shape and the host adapter logs nothing of its own; the fixes those measurements
+produced stay.
+
+### [3.4.7] - 2026-09-30
+
+**Fork fix.** The lexical statement's join order was left to the planner, and on a large
+index the planner drove it from ``source_events`` -- every version in the scope -- looking up
+postings per version: the term filter applied after the fact, so the posting budget bounded
+nothing and a real prompt cost seconds.
+
+Measured on this store (3M postings, 81k sources): a 648-character prompt took **3.86 s** in
+the statement alone (the document-frequency read that chooses terms: 0.02 s), the recall lost
+its collect deadline, and the semantic channel with it.  Pinned term-first with ``CROSS JOIN``
+-- an inner join SQLite does not reorder -- the same statement returns the **same rows in
+0.19 s**, and end to end the recall went from 4.10 s with ``deadline_exceeded_collect`` to
+1.04 s with no deadline gap at all.
+
+A contract test captures the statement the channel runs and fails if the pin goes away.
+
+### [3.4.6] - 2026-09-30
+
+**Fork fix.** The semantic channel ran after the local ones, so its slice was what they
+left.  A host prefetch that spent 3.66 s of its five-second window handed the remote
+search 0.03 s, and the recall lost its meaning channel to a transport timeout -- 3.4.5's
+phase line named ``vector`` as the largest phase and the search as the thing that ran out.
+
+The search now starts with collection, beside the local channels, and is joined when its
+turn comes: the recall costs the longer of the two instead of their sum, and the search
+keeps a slice of its own.  A contract test proves it with a local channel that spends
+0.45 s of a 0.5 s window: the search is handed 0.03 s before this change and 0.37 s after.
+
+### [3.4.5] - 2026-09-30
+
+**Fork release, temporary instrumentation.** 3.4.4's prefetch line says what the recall
+cost, not what it spent it on.  The pipeline now records each phase of the last search --
+``epoch``, the four local channels, ``vector``, ``collect``, ``relation_hydrate``,
+``select`` -- and the host adapter's line carries them.
+
+Measured on this instance (same store, same request shape): ``vector`` is the largest
+phase at 0.95-1.44 s of a 1.3-2.4 s search, and it is the query embedding's wait plus the
+search, which alone costs 0.10 s.  A gateway prefetch that spent 3.66 s of its five-second
+window therefore reached the search with almost nothing left, which is what the transport
+timeout in its gap meant.
+
+Temporary: it comes out with 3.4.4's line once the window is accounted for.
+
+### [3.4.4] - 2026-09-30
+
+**Fork release.** Two fork-side changes, both about seeing what a failing recall is doing.
+
+A vector gap named only the transport class: ``QdrantHTTPError`` stood for a timeout, a
+401 and a broken worker frame alike, and the exception is caught and discarded, so the
+name in the gap was the only place the fault survived.  The exception now carries the
+wire vocabulary ``core/vector_failure.py`` already reads, and a gap reads
+``QdrantHTTPError:timeout`` or ``QdrantHTTPError:http_status:401``.
+
+The Hermes prefetch logs its own timing when it needs to: on this instance a prefetch
+occasionally spends its whole five-second window and the packet says which phase ran out
+rather than what the work cost.  A line is written only when the recall passes three
+seconds or a phase reports ``deadline_exceeded_*``, so a healthy turn adds nothing.
+Temporary: it is removed once the window has been accounted for.
+
+### [3.4.3] - 2026-09-30
+
+**Fork release** (upstream's own numbering stops at `3.4.2`; this fix is entirely in
+fork code — `vector/qdrant_store.py` is ours).
+
+A similarity search asked for the stored vector *and* the full text of every hit, and no
+caller on that path reads either: against the production collection 40 hits answered with
+**2,031 KB**, where the same search in this shape answers with **39 KB** (measured
+2026-09-30). The vector is also stored in the payload, so each hit carried it twice. On
+this instance's 1–2 s vector budget, parsing the difference is what let the semantic
+channel run out of time and hand a recall back `vector_unavailable` while Qdrant itself
+answered 200 in 0.21–0.62 s.
+
+`QdrantVectorStore` now asks for the three fields the recall path reads (`id`,
+`scope_id`, `target`), refuses a hit that is not exactly what it asked for, and keeps
+verifying the whole record on the paths that read one back whole (retrieve, inventory,
+migration). Contract coverage asserts the request shape, the subset decode, and both
+refusals; the fake Qdrant honours `with_payload`/`with_vector` like the real service.
+

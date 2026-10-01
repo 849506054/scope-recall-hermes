@@ -206,6 +206,162 @@ def test_P08_the_lexical_channel_keeps_its_terms_within_the_posting_budget(app, 
         assert retrieval_storage._discriminating_terms(tx, ("quarkonium", "gluonfield")) == ("quarkonium",)
 
 
+def test_P08_the_lexical_statement_starts_from_the_query_s_terms_however_many_there_are(app, monkeypatch):
+    """A store has no planner statistics, so SQLite weighs the query's terms against the audience's scopes by rule of
+    thumb, and past some thirty terms it started from the scope index instead: every event of the audience read, one
+    by one.  On the shared store a Telegram message of 72 characters took 21 s that way and its recall came back
+    empty at every stage's deadline; so did most messages over 80 characters on three instances (baseline of 3.4.2,
+    2026-09-30).  The scope filter never drives the statement, and what it finds is the same."""
+    from scope_recall.core import retrieval_storage
+
+    core, ctx = app
+    letters = "abcdefghijklmnopqrstuvwxyz"
+    words = [f"plan{first}{second}term" for first in letters[:8] for second in letters[:8]]
+    target = capture(core, ctx, " ".join(words[:12]) + " 计划目标。", key="TEST-p08/plan/target")
+    plans = []
+    lexical = retrieval_storage.RetrievalStorage.lexical
+
+    class Planned:
+        def __init__(self, conn):
+            self._conn = conn
+
+        def execute(self, sql, params=()):
+            if "GROUP_CONCAT(DISTINCT hex(" in sql:
+                plans.append(self._conn.execute("EXPLAIN QUERY PLAN " + sql, params).fetchall()[0][3])
+            return self._conn.execute(sql, params)
+
+    def planned(self, tx, context, *, limit):
+        check = tx._check
+        tx._check = lambda: Planned(check())
+        try:
+            return lexical(self, tx, context, limit=limit)
+        finally:
+            tx._check = check
+
+    monkeypatch.setattr(retrieval_storage.RetrievalStorage, "lexical", planned)
+    found = {}
+    for count in (4, 12, 24, 40, 64):
+        result = core.recall(ctx, recall_request(query=" ".join(words[:count]), mode="current"), deadline_seconds=10)
+        found[count] = target.ref in [item.ref for item in result.items]
+    assert len(plans) >= 5 and all(plan.startswith("SEARCH t ") for plan in plans), plans
+    assert found[4] and found[12], found
+
+
+def test_P08_the_recent_channel_reads_the_pending_queue_not_every_consolidation(app, monkeypatch):
+    """The recent channel offers this session's messages still waiting to be consolidated.  With no planner
+    statistics SQLite read every consolidate item by its work type, done ones included, which the queue keeps (3,070
+    on the shared store and growing), or with one scope every event of it.  It starts from the pending rows."""
+    import time as _time
+
+    from scope_recall.core import retrieval_storage
+    from scope_recall.core.retrieval import SearchContext
+
+    core, ctx = app
+    waiting = capture(core, ctx, "TEST 值班表明天换人。", key="TEST-p08/recent/waiting")
+    done = capture(core, ctx, "TEST 值班表上周换过。", key="TEST-p08/recent/done")
+    with core.storage.write(ctx, remaining_seconds=10) as tx:
+        for source in (waiting, done):
+            tx.enqueue_source(source.ref, source.revision, work_type="consolidate", available_at=core.clock.utc_now())
+        tx._check().execute("UPDATE work_items SET state='done' WHERE subject_ref=?", (done.ref,))
+    plans = []
+
+    class Planned:
+        def __init__(self, conn):
+            self._conn = conn
+
+        def execute(self, sql, params=()):
+            if "JOIN work_items w" in sql:
+                plans.append(self._conn.execute("EXPLAIN QUERY PLAN " + sql, params).fetchall()[0][3])
+            return self._conn.execute(sql, params)
+
+    context = SearchContext.from_request(recall_request(query="TEST 值班表", mode="current"), ctx,
+                                         now=core.clock.utc_now(), deadline=_time.monotonic() + 30)
+    with core.storage.read(ctx) as tx:
+        check = tx._check
+        monkeypatch.setattr(tx, "_check", lambda: Planned(check()))
+        found = [candidate.ref for candidate in retrieval_storage.RetrievalStorage().recent(tx, context, limit=8)]
+    assert found == [waiting.ref]
+    assert plans and plans[0].startswith("SEARCH w USING INDEX work_ready"), plans
+
+
+def test_P08_a_candidate_statement_past_the_deadline_is_interrupted(app, monkeypatch):
+    """A statement cannot see the recall's deadline: the lexical one ran 18-21 s for a long Telegram message on the
+    shared store (3.4.2), and the recall came back empty long after its deadline.  Past the deadline a candidate
+    statement is interrupted and the recall returns, saying so."""
+    import time as _time
+
+    from scope_recall.core import retrieval_storage
+
+    core, ctx = app
+    capture(core, ctx, "TEST 值班表明天换人。", key="TEST-p08/interrupt")
+
+    def slow(self, tx, context, *, limit):
+        tx._check().execute("WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n LIMIT 60000000) "
+                            "SELECT count(*) FROM n").fetchone()
+        return ()
+
+    monkeypatch.setattr(retrieval_storage.RetrievalStorage, "lexical", slow)
+    started = _time.monotonic()
+    result = core.recall(ctx, recall_request(query="TEST 值班表", mode="current"), deadline_seconds=0.5)
+    assert _time.monotonic() - started < 2.5
+    assert "deadline_exceeded_collect" in result.gaps
+    assert not [gap for gap in result.gaps if gap.startswith("sqlite_candidate_error")], result.gaps
+    # The interrupt ends with the statement: the next recall's statements run as before.
+    monkeypatch.undo()
+    assert core.recall(ctx, recall_request(query="TEST 值班表", mode="current"), deadline_seconds=5).items
+
+
+def test_P08_what_the_channels_before_an_interrupted_one_found_still_answers(app, monkeypatch):
+    """The exact ref is found before the lexical statement is interrupted, and is still delivered: the interrupt is
+    taken off once the candidate statements end, so hydration's own statements, past the deadline too, run to the
+    end.  Left on, the first of them was interrupted and the recall came back empty (review of 3.4.5)."""
+    from scope_recall.core import recall as recall_module, retrieval_storage
+
+    core, ctx = app
+    target = capture(core, ctx, "TEST 值班表明天换人。", key="TEST-p08/interrupt-exact")
+
+    def slow(self, tx, context, *, limit):
+        tx._check().execute("WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n LIMIT 60000000) "
+                            "SELECT count(*) FROM n").fetchone()
+        return ()
+
+    hydrate = retrieval_storage.RetrievalStorage.hydrate
+
+    def hydrate_after_a_statement(self, tx, candidate, context):
+        # Far more steps than the handler lets pass between two looks at the deadline.
+        tx._check().execute("WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n LIMIT 300000) "
+                            "SELECT count(*) FROM n").fetchone()
+        return hydrate(self, tx, candidate, context)
+
+    monkeypatch.setattr(recall_module, "_INTERRUPT_STEPS", 1_000)
+    monkeypatch.setattr(retrieval_storage.RetrievalStorage, "lexical", slow)
+    monkeypatch.setattr(retrieval_storage.RetrievalStorage, "hydrate", hydrate_after_a_statement)
+    request = recall_request(query="TEST 值班表", mode="current", focus_refs=[f"{target.ref}@{target.revision}"])
+    result = core.recall(ctx, request, deadline_seconds=0.5)
+    assert "deadline_exceeded_collect" in result.gaps, result.gaps
+    assert [item.ref for item in result.items] == [target.ref], result.gaps
+
+
+def test_P08_a_locked_store_past_the_deadline_is_reported_as_the_error(app, monkeypatch):
+    """Only the interrupt reads as the deadline: another statement error raised past it is still reported as that
+    error (review of 3.4.5)."""
+    import sqlite3
+    import time as _time
+
+    from scope_recall.core import retrieval_storage
+
+    core, ctx = app
+    capture(core, ctx, "TEST 值班表明天换人。", key="TEST-p08/locked")
+
+    def locked(self, tx, context, *, limit):
+        _time.sleep(0.6)
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(retrieval_storage.RetrievalStorage, "lexical", locked)
+    result = core.recall(ctx, recall_request(query="TEST 值班表", mode="current"), deadline_seconds=0.5)
+    assert "sqlite_candidate_error:OperationalError" in result.gaps, result.gaps
+
+
 def test_P08_lexical_never_prunes_a_common_hard_identifier(app):
     """Hydration still requires the identifier, so SQL must still search for it.
 

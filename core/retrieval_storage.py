@@ -23,6 +23,7 @@ from .delete_storage import canonical, retraction_after
 from .episodes import source_origin
 from . import lexical_index, lineage
 from .events import lexical_terms
+from .recall_scope import says_something
 from .recall_policy import (
     applicability,
     claim_embedding_text,
@@ -424,6 +425,41 @@ class CollectionPage:
 #: How long after a person's message its turn's replies may come, and how many are followed.
 TURN_REPLY_SECONDS = 1800
 TURN_REPLY_LIMIT = 3
+#: Rows of one named day (and entries) the scoped channel reads before it chooses (``RetrievalStorage.scoped``), in
+#: time order.  The shared store's busiest day was 861 messages of every entry, 542 of one; read only to 400 rows,
+#: it lost its evening.
+_SCOPED_SCAN_ROWS = 2000
+#: Characters of a scoped message an automatic packet (4,096 units, six items) can still deliver beside others.
+_SCOPED_ITEM_CHARS = 600
+#: Characters up to which a message is read for whether it says anything of its day (``recall_scope.says_something``):
+#: "继续", "好的，继续吧", "OK 继续执行" and "按你说的做" do not, and on a day of long prompts they filled the packet.
+_SCOPED_SHORT_CHARS = 20
+
+
+def _shares(counts: list[int], limit: int) -> list[int]:
+    """``limit`` slots split evenly between days holding ``counts`` messages, a day with fewer handing the rest on."""
+    shares = [0] * len(counts)
+    left = limit
+    open_days = [index for index, count in enumerate(counts) if count]
+    while left > 0 and open_days:
+        each = max(1, left // len(open_days))
+        for index in list(open_days):
+            given = min(each, counts[index] - shares[index], left)
+            shares[index] += given
+            left -= given
+            if shares[index] >= counts[index]:
+                open_days.remove(index)
+            if left <= 0:
+                break
+    return shares
+
+
+def _coarse_to_fine(items: list) -> list:
+    """``items``, in time order, reordered so that any first part of them spreads across all of them: the first, the
+    middle, the quarters, the eighths (the positions' bits read backwards).  Offered in time order, a packet of six
+    took a day's morning and left its afternoon out (review 5 of 3.4.8)."""
+    bits = max(1, (len(items) - 1).bit_length())
+    return [items[index] for index in sorted(range(len(items)), key=lambda index: int(f"{index:0{bits}b}"[::-1], 2))]
 
 
 class RetrievalStorage:
@@ -471,11 +507,15 @@ class RetrievalStorage:
         if context.as_of is not None:
             as_of = " AND (e.occurred_at IS NULL OR e.occurred_at<=?)"
             params.append(context.as_of)
+        # The statement starts from the query's terms.  A store keeps no planner statistics, so SQLite weighs the terms
+        # against the scopes by rule of thumb, and with a long enough query it started from the scope index instead:
+        # every event of the audience read one by one, 21 s for a Telegram message of 72 characters on the shared
+        # store, and the recall empty at its deadline.  ``+`` keeps the scope filter from choosing the index.
         rows = tx._check().execute(
             f"""SELECT e.event_id,e.source_revision,e.source_id,COUNT(DISTINCT {credit}) AS hits,
                        GROUP_CONCAT(DISTINCT hex({credit})) AS matched_term_hexes
                 FROM {lexical_index.JOIN}
-                WHERE t.term IN ({term_marks}) AND e.scope_id IN ({scope_marks})
+                WHERE t.term IN ({term_marks}) AND +e.scope_id IN ({scope_marks})
                   AND e.read_blocked=0 AND (e.project_id IS NULL OR e.project_id=?)
                   AND (e.branch_id IS NULL OR e.branch_id=?)
                   AND NOT EXISTS(SELECT 1 FROM object_blocks b WHERE b.object_kind='event'
@@ -589,16 +629,82 @@ class RetrievalStorage:
                 break
         return tuple(candidates)
 
+    def scoped(self, tx, context: SearchContext, *, limit: int) -> tuple[CandidateRef, ...]:
+        """The conversation of the days, and entries, that a question asking what was said then names
+        (``recall_scope``).
+
+        The person's own messages and the replies they were shown, in the question's audience, from the named days
+        (and entries), spread evenly across each day so it is seen whole rather than its last hour: the person's
+        messages of a length a packet can deliver beside others first, then their longer ones, then the replies.
+        A short message that says nothing ("继续", "好的，继续吧") is not offered.  The days share the slots evenly,
+        a day with fewer messages handing the rest on, and take turns in the order offered, so the first-named day
+        does not fill the packet.  Only lengths are read, and the text of short messages.
+        """
+        scope = context.scope
+        if scope is None or limit <= 0:
+            return ()
+        trusted = context.trusted_context
+        scopes = tuple(sorted(trusted.allowed_scope_ids))
+        entries = f"AND e.entry_id IN ({_marks(scope.entry_ids)})" if scope.entry_ids else ""
+        current = "" if context.mode in {"history", "as_of"} else "AND NOT EXISTS (SELECT 1 FROM source_events newer WHERE newer.source_group_key=e.source_group_key AND newer.source_revision>e.source_revision)"
+        as_of = "AND e.occurred_at<=?" if context.as_of is not None else ""
+        excluded = set(context.current_source_refs)
+        days = []
+        # One statement a day, so each reads the (scope, time) index for its own window.
+        for start, end in scope.windows:
+            rows = tx._check().execute(
+                f"""SELECT e.event_id,e.source_revision,e.role,length(e.content) AS size,
+                           CASE WHEN length(e.content)<=? THEN e.content END AS short FROM source_events e
+                    WHERE e.scope_id IN ({_marks(scopes)}) AND e.occurred_at>=? AND e.occurred_at<? {entries}
+                      AND e.role IN ('user','assistant')
+                      AND (e.origin IN ('human_direct','assistant_visible') OR (e.origin='imported'
+                           AND e.import_provenance_sha256 IS NOT NULL
+                           AND e.source_original_origin IN ('human_direct','assistant_visible')))
+                      AND e.read_blocked=0 AND e.suppressed=0
+                      AND (e.project_id IS NULL OR e.project_id=?) AND (e.branch_id IS NULL OR e.branch_id=?)
+                      AND NOT EXISTS(SELECT 1 FROM object_blocks b WHERE b.object_kind='event'
+                          AND b.object_ref=e.event_id AND (b.read_blocked=1 OR b.suppressed=1))
+                      {current} {as_of}
+                    ORDER BY e.occurred_at,e.rowid LIMIT ?""",
+                (_SCOPED_SHORT_CHARS, *scopes, start, end, *scope.entry_ids, trusted.project_id, trusted.branch_id,
+                 *((context.as_of,) if as_of else ()), _SCOPED_SCAN_ROWS),
+            ).fetchall()
+            rows = [row for row in rows if _source_key(row["event_id"], row["source_revision"]) not in excluded
+                    and (row["short"] is None or says_something(row["short"]))]
+            # A message longer than an automatic packet can hold beside others is left out of it whole (the compiler
+            # never slices content), and on the coding clients' days most messages are: offered first, they were
+            # dropped and other days' short items delivered instead.
+            days.append([[row for row in rows if row["role"] == "user" and row["size"] <= _SCOPED_ITEM_CHARS],
+                         [row for row in rows if row["role"] == "user" and row["size"] > _SCOPED_ITEM_CHARS],
+                         [row for row in rows if row["role"] == "assistant" and row["size"] <= _SCOPED_ITEM_CHARS]])
+        picks = []
+        for tiers, share in zip(days, _shares([sum(map(len, tiers)) for tiers in days], limit)):
+            day: list = []
+            for tier in tiers:
+                room = share - len(day)
+                if room <= 0:
+                    break
+                step = max(1.0, len(tier) / room)
+                day.extend(_coarse_to_fine([tier[int(position * step)] for position in range(min(room, len(tier)))]))
+            picks.append(day)
+        chosen = [day[turn] for turn in range(max(map(len, picks), default=0)) for day in picks if turn < len(day)]
+        return tuple(CandidateRef("event", row["event_id"], row["source_revision"], "scoped", rank=index)
+                     for index, row in enumerate(chosen[:limit], 1))
+
     def recent(self, tx, context: SearchContext, *, limit: int) -> tuple[CandidateRef, ...]:
         trusted = context.trusted_context
         scopes = tuple(sorted(trusted.allowed_scope_ids))
         excluded = set(context.current_source_refs)
+        # From the queue's pending rows (``work_ready``), never from every consolidation ever made: done items are
+        # kept, and with no planner statistics SQLite read all of them by their work type (3,070 on the shared store,
+        # growing with every consolidation) or, with one scope, every event of it.  ``+`` keeps those filters from
+        # choosing an index; the rows are the same.
         rows = tx._check().execute(
             f"""SELECT e.event_id,e.source_revision,e.content,e.recorded_at
                 FROM source_events e JOIN work_items w
                 ON w.subject_ref=e.event_id AND w.subject_revision=e.source_revision
-                WHERE w.work_type='consolidate' AND w.state IN ('pending','leased')
-                  AND e.session_id=? AND e.scope_id IN ({_marks(scopes)})
+                WHERE +w.work_type='consolidate' AND w.state IN ('pending','leased')
+                  AND e.session_id=? AND +e.scope_id IN ({_marks(scopes)})
                   AND (e.project_id IS NULL OR e.project_id=?)
                   AND (e.branch_id IS NULL OR e.branch_id=?)
                   AND e.read_blocked=0 AND e.suppressed=0
@@ -618,32 +724,72 @@ class RetrievalStorage:
         return tuple(result)
 
     def turn_replies(self, tx, candidate: CandidateRef) -> tuple[CandidateRef, ...]:
-        """What the assistant said back in the turn a person's message opened.
+        """What the assistant said back in the turn a person's message opened: the first ``TURN_REPLY_LIMIT`` of the
+        turn's replies (``_turn``)."""
+        conn = tx._check()
+        opening = self._opening(conn, candidate)
+        return self._turn(conn, *opening, limit=TURN_REPLY_LIMIT)[0] if opening is not None else ()
+
+    def latest_turn(self, tx, candidates, *, now: str) -> tuple[str, tuple[CandidateRef, ...], bool] | None:
+        """Of the turns the person's messages ``candidates`` opened, the latest that received a reply: when it opened
+        (UTC, ``canonical_time``), its replies, and whether they were read to the turn's end by ``now``.  The openings
+        are read first and the turns newest first, so older copies of a question cost one look-up each; equal times
+        fall back to capture order."""
+        conn = tx._check()
+        openings = [opening for candidate in candidates if (opening := self._opening(conn, candidate)) is not None]
+        for row, opened in sorted(openings, key=lambda opening: (opening[1], opening[0]["rowid"]), reverse=True):
+            replies, ended = self._turn(conn, row, opened, now=now)
+            if replies:
+                return opened, replies, ended
+        return None
+
+    @staticmethod
+    def _opening(conn, candidate: CandidateRef):
+        """The row of a person's message that opens a turn, and when (``canonical_time``); None for anything else."""
+        if candidate.kind != "event":
+            return None
+        row = conn.execute(
+            """SELECT rowid,scope_id,session_id,role,origin,occurred_at,content_sha256 FROM source_events
+               WHERE event_id=? AND source_revision=?""",
+            (candidate.ref, candidate.revision),
+        ).fetchone()
+        if row is None or row["role"] != "user" or row["origin"] != "human_direct" or not row["occurred_at"]:
+            return None
+        opened = canonical_time(row["occurred_at"])
+        return (row, opened) if opened is not None else None
+
+    @staticmethod
+    def _turn(conn, row, opened: str, *, limit: int | None = None,
+              now: str | None = None) -> tuple[tuple[CandidateRef, ...], bool]:
+        """A turn's replies, at most ``limit`` of them, and whether they were read to its end by ``now`` (never, when
+        cut at ``limit``, or with no reply or no ``now`` to judge by).
 
         Episode membership reaches a reply only through every event of its
         episode, in id order, so a recalled question used up the relation bound
         long before its own answer.  A turn's replies are the assistant's
         visible messages in the same scope and session after the message, in
-        capture order, until the person speaks again.  A gateway can capture a
-        whole turn under one timestamp, so equal times fall back to rowid.
+        capture order, until the person speaks again, within the first 64 rows
+        and ``TURN_REPLY_SECONDS``.  A gateway can capture a whole turn under
+        one timestamp, so equal times fall back to rowid.  The turn was read to
+        its end when the person spoke again within them, or when the rows ran
+        out, its window has closed, and what the session says in the window
+        after it, if anything, is the person's: an agent's turn of forty tool
+        calls went past the 64 rows, and its last reply read was not its answer
+        (review of 3.4.7), nor is the last of a turn still going on.  That look
+        is bounded to the next window, which the scope's time index reads in
+        order: unbounded, it read every later row of the scope (second review
+        of 3.4.7).
+
+        The same message stored again is not the person speaking again.  Until
+        3.4.4 a Hermes provider rebuilt with its agent stored a turn's message
+        a second time, with the reply, under the host's ordinal: 125 of the 209
+        Hermes turns of 2026-09-16..29 that seemed to have no reply were that,
+        and the first copy stopped at the second before reaching the answer.
         """
-        if candidate.kind != "event":
-            return ()
-        conn = tx._check()
-        row = conn.execute(
-            """SELECT rowid,scope_id,session_id,role,origin,occurred_at FROM source_events
-               WHERE event_id=? AND source_revision=?""",
-            (candidate.ref, candidate.revision),
-        ).fetchone()
-        if row is None or row["role"] != "user" or row["origin"] != "human_direct" or not row["occurred_at"]:
-            return ()
-        opened = canonical_time(row["occurred_at"])
-        if opened is None:
-            return ()
         window_end = (datetime.fromisoformat(opened) + timedelta(seconds=TURN_REPLY_SECONDS)).isoformat(
             timespec="microseconds").replace("+00:00", "Z")
         rows = conn.execute(
-            """SELECT event_id,source_revision,role,origin FROM source_events
+            """SELECT event_id,source_revision,role,origin,content_sha256 FROM source_events
                WHERE scope_id=? AND occurred_at>=? AND occurred_at<=? AND session_id=?
                  AND (occurred_at>? OR rowid>?) AND read_blocked=0 AND suppressed=0
                ORDER BY occurred_at,rowid LIMIT 64""",
@@ -652,13 +798,25 @@ class RetrievalStorage:
         replies: list[CandidateRef] = []
         for reply in rows:
             if reply["role"] == "user":
-                break
+                if reply["origin"] == "human_direct" and reply["content_sha256"] == row["content_sha256"]:
+                    continue
+                return tuple(replies), True
             if reply["role"] == "assistant" and reply["origin"] == "assistant_visible":
                 replies.append(CandidateRef("event", reply["event_id"], int(reply["source_revision"]), "relation",
                                             rank=len(replies) + 1, lexical_score=1.0))
-                if len(replies) >= TURN_REPLY_LIMIT:
-                    break
-        return tuple(replies)
+                if limit is not None and len(replies) >= limit:
+                    return tuple(replies), False
+        if limit is not None or len(rows) >= 64 or not replies or now is None or canonical_time(now) < canonical_time(
+                window_end):
+            return tuple(replies), False
+        following = (datetime.fromisoformat(opened) + timedelta(seconds=2 * TURN_REPLY_SECONDS)).isoformat(
+            timespec="microseconds").replace("+00:00", "Z")
+        after = conn.execute(
+            """SELECT role FROM source_events WHERE scope_id=? AND occurred_at>? AND occurred_at<=? AND session_id=?
+                 AND read_blocked=0 AND suppressed=0 ORDER BY occurred_at LIMIT 1""",
+            (row["scope_id"], window_end, following, row["session_id"]),
+        ).fetchone()
+        return tuple(replies), after is None or after["role"] == "user"
 
     def related(self, tx, candidate: CandidateRef, *, limit: int) -> tuple[CandidateRef, ...]:
         rows = lineage.related(tx._check(), candidate.kind, candidate.ref, limit=limit)

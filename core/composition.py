@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
-from datetime import datetime, timezone
+from datetime import datetime, timezone, tzinfo
 import math
 import time
 from typing import Protocol
@@ -13,6 +13,7 @@ from .file_lock import advisory_file_lock
 from .storage import SQLiteStorage, StoreStatus, StoredSource
 from .capture import CaptureReceipt, record_event
 from .admission import AdmissionPolicy
+from .recall_diagnostics import RECALL_DIAGNOSTIC_PREFIX
 from .retrieval import CandidateRef, SearchContext
 
 
@@ -134,7 +135,20 @@ class MemoryCore:
             return tx.source(ref, revision)
 
     def inspect_object(self, context: TrustedContext, ref: str, revision: int | None = None, *, limit: int = 24):
-        from .inspect_service import inspect_object
+        from .inspect_service import InspectedObject, inspect_object
+        if type(ref) is str and ref.startswith(RECALL_DIAGNOSTIC_PREFIX):
+            # A recall packet's ``diagnostic_ref`` names a record this process keeps for its last recalls
+            # (``recall_diagnostics``), never a stored object: looked up in the store it was always SOURCE_MISSING
+            # (yuheng's audit of 3.4.2).  Only the session that recalled reads it, and only counts and gap codes.
+            if revision not in (None, 1):
+                raise ContractError("INPUT_INVALID", "revision")
+            record = self.recall_diagnostics.get(ref)
+            if (record is None or record.installation_id != context.binding.installation_id
+                    or record.session_id != context.session_id):
+                # Gone from this process's last recalls, recalled by another process (a prompt hook), or not the
+                # caller's: all read the same.
+                raise ContractError("SOURCE_MISSING", "recall_diagnostic")
+            return InspectedObject("recall_diagnostic", record.ref, 1, record.to_public(), record.memory_epoch or 0)
         return inspect_object(self.storage, self.clock, context, ref, revision, limit=limit)
 
     def profile(self, context: TrustedContext, request):
@@ -188,7 +202,7 @@ class MemoryCore:
             return tx.said_in_session(scope_id, tuple(items), window_seconds=window_seconds)
 
     def recall(self, context: TrustedContext, request, *, current_source_refs: tuple[str, ...] = (), deadline_seconds: float | None = None,
-               background_without_evidence: bool = True):
+               background_without_evidence: bool = True, zone: tzinfo | None = None):
         """Run the sole read-only P08 pipeline for auto and tool callers.
 
         ``background_without_evidence`` is a trusted caller choice, never a
@@ -212,11 +226,12 @@ class MemoryCore:
             deadline=self.clock.monotonic() + effective_deadline,
             current_source_refs=tuple(current_source_refs),
             background_without_evidence=background_without_evidence,
+            zone=zone,
         )
         return self.recall_pipeline.search(search_context)
 
     def recall_packet(self, context: TrustedContext, request, *, current_source_refs: tuple[str, ...] = (), deadline_seconds: float | None = None,
-                      background_without_evidence: bool = True):
+                      background_without_evidence: bool = True, zone: tzinfo | None = None):
         """Retrieve once, compile once, and return the public RecallPacket contract.
 
         Explicit tool lookups pass ``background_without_evidence=False``: a
@@ -242,6 +257,7 @@ class MemoryCore:
             deadline=self.clock.monotonic() + effective_deadline,
             current_source_refs=tuple(current_source_refs),
             background_without_evidence=background_without_evidence,
+            zone=zone,
         )
         # Candidate collection is optional work. Reserve part of the original
         # deadline for the mandatory fresh SQLite release checks and rendering.

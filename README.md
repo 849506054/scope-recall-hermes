@@ -7,9 +7,10 @@ store as an entry, what the owner tells one of them another can recall, and each
 which agent it came in through ([docs/shared-store.md](docs/shared-store.md)). Hermes agents
 could share a store from 3.2.0; Codex and Claude Code join in 3.3.0. An agent that is not
 attached keeps its own store. A tool's output is still kept and found, but no longer turned
-into facts. The notes are the `[3.4.2]`, `[3.4.1]` and `[3.4.0]` sections of [CHANGELOG.md](CHANGELOG.md); upgrading
+into facts. The notes are the `[3.4.x]` sections of [CHANGELOG.md](CHANGELOG.md), newest first; upgrading
 from `3.4.x`, `3.3.x` or `3.2.x` is `pip install -U`, `apply-install` and a host restart, and the store's
-schema does not change. From `3.1.x` the store moves to schema 1110 the first time it is opened,
+schema does not change; on a shared store in the shipped embedding space, set `vector_threshold`
+from 0.653 to 0.70 by hand ([docs/configuration.md](docs/configuration.md#vector_threshold)). From `3.1.x` the store moves to schema 1110 the first time it is opened,
 after which a 3.1 process cannot open it.
 3.1 is a rebuild rather than a patch on 2.0: production
 code went from 141,044 lines to 48,289, memory now accumulates evidence before a
@@ -23,13 +24,7 @@ authority; host adapters share the same contracts.
 none failing. They check contracts, storage and the hosts' wiring; none of them
 measures recall quality. Every accuracy figure in the notes was measured by us, on
 our own corpora, by hand, and there is no regression suite you or we can re-run
-automatically -- that is the first item in *What is not finished*. A formal
-model-evaluation gate (P18) was declared for that and never completed: it needed an
-evaluation corpus and a scorer independent of the authors, which this project does
-not have, so every release from 3.1.0 to 3.3.0 reported it missing. 3.4.0 removes it
-rather than keep a gate nobody can pass. Read a green test count as exactly that.
-The integration (about 2,330 tests) and packaging (about 135) tiers both exit 0 with
-none failing.
+automatically -- that is the first item in *What is not finished*.
 
 ## For agents: install or upgrade on the user's behalf
 
@@ -54,8 +49,8 @@ The package is `hermes-scope-recall` on PyPI. Install it into the same isolated 
 environment the host uses:
 
 ```text
-python -m pip install hermes-scope-recall==3.4.2
-python -m pip install "hermes-scope-recall[codex]==3.4.2"
+python -m pip install hermes-scope-recall==3.4.8
+python -m pip install "hermes-scope-recall[codex]==3.4.8"
 ```
 
 This fork's `3.2.7` build is installed from a wheel file built out of this branch
@@ -63,7 +58,7 @@ This fork's `3.2.7` build is installed from a wheel file built out of this branc
 upstream's `3.2.0`.
 
 The same wheel and sdist are attached to the
-[GitHub Release](https://github.com/410979729/scope-recall-hermes/releases/tag/v3.4.2)
+[GitHub Release](https://github.com/410979729/scope-recall-hermes/releases/tag/v3.4.8)
 alongside `SHA256SUMS` and `RELEASE-PROVENANCE.json`, for an offline install
 (`python -m pip install "<path-to-wheel>"`). To build it yourself from this checkout instead:
 

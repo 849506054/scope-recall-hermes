@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from itertools import islice
+import sqlite3
 import threading
 import time
 import unicodedata
@@ -10,12 +11,14 @@ from typing import Any, Callable, Protocol
 
 from ..contracts import ContractError
 from .background_context import background_candidates, current_task_candidate
+from .claims import canonical_time
 from .coverage import note_truncation
 from .duplicate_collapse import DistinctContent, note_duplicates
 from .events import lexical_terms
 from .recall_budget import estimate_tokens, event_admission_order
 from .recall_needs import CHOICE_MARKERS, directed_followup_query, evidence_roots, mentions, unmet_needs
 from .recall_policy import RecallPolicy, asks_without_answering, identifiers_compatible, meaningful_query_terms, rrf_score
+from .recall_scope import asks_what_was_said, query_scope
 from .retrieval import (
     CandidateRef,
     CollectionQuery,
@@ -57,7 +60,26 @@ CLAIM_CANDIDATES = 16
 #: of the evidence it quoted.  At 0.6 a first-ranked one falls below a reply that
 #: ranked in the mid-teens, and still ranks as context when nothing answers.
 CONTEXT_ONLY_WEIGHT = 0.6
-_CHANNELS = ("exact", "lexical", "claim", "recent", "vector")
+#: Meaningful terms a query needs before an older copy of it leads to what that copy was told
+#: (``RetrievalPipeline._expand``).  A short command sent again asks nothing an old turn answered.  Chinese terms
+#: are overlapping character pairs, so "继续执行" holds three and "按你说的做" four, and three let both bring back
+#: every old turn they had opened (review of 3.4.4); five is about six characters.  Of the owner's prompts over
+#: two weeks, 33 of the 115 with fewer had an exact older copy; of the owner's real questions, 167 of 173 have five.
+ECHO_TURN_MIN_TERMS = 5
+#: SQLite virtual-machine steps between two looks at the recall's deadline while a candidate statement runs: one
+#: every 10-60 ms of statement time.  Each look takes the GIL back from the statement, and beside a busy thread (the
+#: MCP server's hook threads, a gateway's) waits for it: one every 10,000 steps made a 25 ms statement take 1.4 s
+#: (review of 3.4.5).
+_INTERRUPT_STEPS = 1_000_000
+_CHANNELS = ("scoped", "exact", "lexical", "claim", "recent", "vector")
+#: Messages the scoped channel offers: a day of one entry, for a question that asks what was said then
+#: (``recall_scope``).
+SCOPED_CANDIDATES = 12
+#: What a scoped candidate's fused score is multiplied by.  The question asked only what was said on its day: that
+#: day's messages go before a candidate one channel found elsewhere by the question's words or the entry's name,
+#: which on the shared store filled the packet ("Claude Code" is in thousands of other messages).  Three puts a
+#: first rank above any candidate two channels agree on at their first rank.
+SCOPED_WEIGHT = 3.0
 #: Vector admission reasons that are reported, and how; the rest are silent.
 _VECTOR_REJECTION_GAPS = {
     "embedding_space_mismatch": "vector_old_or_mismatched_space",
@@ -110,14 +132,16 @@ class ChannelBudget:
     """
 
     def __init__(self, limits: SearchLimits) -> None:
-        self.left = {"exact": limits.candidate_pool, "lexical": limits.candidate_pool,
+        self.left = {"scoped": SCOPED_CANDIDATES, "exact": limits.candidate_pool, "lexical": limits.candidate_pool,
                      "claim": min(CLAIM_CANDIDATES, limits.candidate_pool),
                      "recent": limits.recent_items, "vector": limits.vector_limit}
         self.total = sum(self.left.values())
         self.reserve = dict.fromkeys(_CHANNELS, 0)
 
     def hold(self, future_rounds: int) -> None:
-        self.reserve = {channel: min(future_rounds, self.left[channel]) for channel in _CHANNELS}
+        # A follow-up round never reads the day a question names (``RetrievalPipeline._collect_rounds``).
+        self.reserve = {channel: 0 if channel == "scoped" else min(future_rounds, self.left[channel])
+                        for channel in _CHANNELS}
 
     def allowance(self, channel: str, limit: int) -> int:
         free_total = self.total - sum(self.reserve.values())
@@ -146,6 +170,16 @@ def _statement_text(obj: RetrievedObject) -> str:
     if not isinstance(payload, dict):
         return obj.content
     return " ".join(str(payload.get(key, "")) for key in ("subject", "predicate", "value_text", "conditions"))
+
+
+def _said_after(obj: RetrievedObject, moment: str) -> bool:
+    """Whether ``obj`` was said after ``moment`` (``canonical_time``), as far as its time tells: an event's own, a
+    claim's newest evidence's.  Without one it is taken as said before."""
+    stamp = dict(obj.metadata).get("occurred_at")
+    try:
+        return (canonical_time(stamp) or "") > moment
+    except ContractError:
+        return False
 
 
 #: See ``RetrievalPipeline.RELATION_WEIGHT``.
@@ -232,8 +266,9 @@ class RetrievalPipeline:
             return False
         if candidate.source == "vector":
             return self.policy.vector_admission(candidate)[0]
-        if candidate.source in {"exact_ref", "relation", "claim_lexical"}:
-            # A claim candidate already passed its own statement rule in storage.
+        if candidate.source in {"exact_ref", "relation", "claim_lexical", "scoped"}:
+            # A claim candidate already passed its own statement rule in storage; a scoped one is a message of
+            # the day and entry the question names.
             return True
         return self.policy.lexical_admission(candidate, context.query, exact=False)[0]
 
@@ -247,6 +282,13 @@ class RetrievalPipeline:
         for _key, signals in sorted(by_key.items()):
             representative = min(signals, key=lambda item: (item.rank, item.source))
             fusion = rrf_score((item.rank for item in signals), k=self.policy.rrf_k)
+            scoped = [item for item in signals if item.source == "scoped"]
+            if scoped:
+                # A message of the day the question named stays one, whichever channel ranked it higher; a ref the
+                # caller named keeps its place first.
+                fusion *= SCOPED_WEIGHT
+                if representative.source != "exact_ref":
+                    representative = scoped[0]
             seeds.append(replace(representative, fusion_score=fusion))
         return tuple(seeds)
 
@@ -275,12 +317,25 @@ class RetrievalPipeline:
         vector_started = _StartedChannel(vector_work)
 
         channels = (
+            # First, so a slow statement after it cannot cost the one channel that reads what the question names.
+            ("scoped", getattr(self.storage_reader, "scoped", None) if context.scope is not None else None,
+             SCOPED_CANDIDATES),
             ("exact", self.storage_reader.exact, context.limits.candidate_pool),
             ("lexical", self.storage_reader.lexical, context.limits.candidate_pool),
             # A reader predating the claim channel simply offers no claims.
             ("claim", getattr(self.storage_reader, "claims", None), CLAIM_CANDIDATES),
             ("recent", self.storage_reader.recent, context.limits.recent_items),
         )
+        # A statement cannot see the recall's deadline: with no planner statistics the lexical one ran 18-21 s for a
+        # long Telegram message (fixed in 3.4.3), and the recall came back empty long after its deadline.  Past the
+        # deadline a channel's statement is interrupted: that channel gives nothing, the gap says so, and what the
+        # channels before it found still answers.  Only here: interrupted while hydrating, a recall would lose what
+        # it had already found.
+        check = getattr(tx, "_check", None)
+        conn = check() if callable(check) else None
+        interruptible = callable(getattr(conn, "set_progress_handler", None))
+        if interruptible:
+            conn.set_progress_handler(lambda: 1 if self._remaining(context) <= 0 else 0, _INTERRUPT_STEPS)
         try:
             for channel, loader, limit in channels:
                 if loader is None:
@@ -296,8 +351,17 @@ class RetrievalPipeline:
                 raw.extend(values)
         except ContractError:
             raise
+        except sqlite3.OperationalError as exc:
+            # Only the interrupt is the deadline; a locked store past it is still reported as the error it is.
+            if interruptible and getattr(exc, "sqlite_errorcode", None) == sqlite3.SQLITE_INTERRUPT:
+                gaps.append("deadline_exceeded_collect")
+                return admitted()
+            gaps.append(f"sqlite_candidate_error:{type(exc).__name__}")
         except Exception as exc:
             gaps.append(f"sqlite_candidate_error:{type(exc).__name__}")
+        finally:
+            if interruptible:
+                conn.set_progress_handler(None, 0)
         if self._remaining(context) <= 0:
             gaps.append("deadline_exceeded_collect")
             return admitted()
@@ -315,17 +379,25 @@ class RetrievalPipeline:
 
     # -- hydration and admission ----------------------------------------------
 
-    def _hydrate_admit(self, tx, candidate: CandidateRef, context: SearchContext, *, original_query: str | None = None) -> RetrievedObject | None:
+    def _hydrate_admit(self, tx, candidate: CandidateRef, context: SearchContext, *, original_query: str | None = None,
+                       echoes: list[CandidateRef] | None = None) -> RetrievedObject | None:
         obj = self.storage_reader.hydrate(tx, candidate, context)
         if obj is None:
             return None
         # The current message already supplies this text. Older copies add no
         # information to automatic context and can crowd out its actual evidence.
+        # What such a copy was told in its turn still answers it: the copy is set
+        # aside in ``echoes`` to lead to its turn's replies, never delivered.
         if context.mode == "auto" and obj.kind == "event":
             query = context.query if original_query is None else original_query
             if unicodedata.normalize("NFKC", obj.content).strip() == unicodedata.normalize("NFKC", query).strip():
+                if echoes is not None:
+                    echoes.append(candidate)
                 return None
-        if candidate.source != "exact_ref" and not identifiers_compatible(context.query, obj.content):
+        # A message of the day a question named was chosen by its day and entry: the entry's name ("pc2") is not an
+        # identifier it has to repeat.  Every other candidate still has to.
+        asked = context.scope.rest if context.scope is not None and candidate.source == "scoped" else context.query
+        if candidate.source != "exact_ref" and not identifiers_compatible(asked, obj.content):
             return None
         # An episode whose resume was never consolidated carries nothing but its
         # own state: `{"state": "unknown"}` fills a packet slot and answers
@@ -336,7 +408,8 @@ class RetrievalPipeline:
         return obj
 
     def _hydrate_all(self, tx, hydrated: list[tuple[CandidateRef, RetrievedObject]], candidates, context: SearchContext,
-                     gaps: list[str], *, floor: int, original_query: str | None = None) -> None:
+                     gaps: list[str], *, floor: int, original_query: str | None = None,
+                     echoes: list[CandidateRef] | None = None) -> None:
         """Hydrate in rank order; once the deadline is gone, only up to ``floor`` items."""
         known = {candidate.key for candidate, _obj in hydrated}
         for candidate in candidates:
@@ -345,7 +418,7 @@ class RetrievalPipeline:
                 break
             if candidate.key in known:
                 continue
-            obj = self._hydrate_admit(tx, candidate, context, original_query=original_query)
+            obj = self._hydrate_admit(tx, candidate, context, original_query=original_query, echoes=echoes)
             if obj is not None:
                 hydrated.append((candidate, obj))
                 known.add(candidate.key)
@@ -375,13 +448,18 @@ class RetrievalPipeline:
     #: what the question was told, and are read before the hops.
     RELATION_WEIGHT = RELATION_WEIGHT
 
-    def _expand(self, tx, context: SearchContext, seeds: tuple[CandidateRef, ...], gaps: list[str]) -> tuple[CandidateRef, ...]:
-        """Bounded relation hops out of the seeds; every inspected object counts."""
+    def _expand(self, tx, context: SearchContext, seeds: tuple[CandidateRef, ...], gaps: list[str], *,
+                echoes: tuple[CandidateRef, ...] = ()) -> tuple[CandidateRef, ...]:
+        """Bounded relation hops out of the seeds; every inspected object counts.
+
+        ``echoes`` are older copies of the current message (``_hydrate_admit``): each leads to the replies of its turn
+        like a seed, and to nothing else.  What the latest copy was told is raised once hydrated (``_raise_echo_turn``).
+        """
         limits = context.limits
         if limits.relation_hops == 0 or limits.relation_objects == 0:
             return seeds
         all_candidates = list(seeds)
-        seen = {candidate.key for candidate in seeds}
+        seen = {candidate.key for candidate in (*seeds, *echoes)}
         frontier = list(seeds)
         inspected = 0
 
@@ -395,12 +473,19 @@ class RetrievalPipeline:
         # answer.  Half the bound is the most they may take, because a query
         # that recalls many messages would otherwise leave nothing for the
         # claims and episodes an answer is just as often reached through.
+        # A question asked again word for word is refused as an echo of the
+        # current message, and it was the only way to what it had been told:
+        # over the owner's real questions asked again on the shared store, 42
+        # of the 46 answers never reached were behind such a copy (3.4.2).
         turn_replies = getattr(self.storage_reader, "turn_replies", None)
         if callable(turn_replies):
             turn_bound = max(1, limits.relation_objects // 2)
-            for seed in sorted(frontier, key=lambda item: (-item.fusion_score, item.key)):
+            for seed in sorted((*frontier, *echoes), key=lambda item: (-item.fusion_score, item.key)):
                 if inspected >= turn_bound:
                     break
+                # Checked per seed as well: a seed whose turn has no reply still costs its two look-ups.
+                if self._remaining(context) <= 0:
+                    return stopped("deadline_exceeded_relation")
                 for candidate in turn_replies(tx, seed):
                     if inspected >= turn_bound:
                         break
@@ -556,8 +641,12 @@ class RetrievalPipeline:
         try:
             with self.storage.read(working.trusted_context, remaining_seconds=max(self._remaining(working), 0.001)) as tx:
                 epoch = self.storage_reader.epoch(tx)
-                hydrated, seed_count = self._collect_rounds(tx, working, gaps, prefetched=prefetched)
-                self._hydrate_related(tx, working, hydrated, gaps)
+                working = self._scoped(tx, working, gaps)
+                echoes: list[CandidateRef] = []
+                hydrated, seed_count = self._collect_rounds(tx, working, gaps, prefetched=prefetched, echoes=echoes)
+                if len(meaningful_query_terms(working.query)) < ECHO_TURN_MIN_TERMS:
+                    echoes.clear()
+                self._hydrate_related(tx, working, hydrated, gaps, echoes=tuple(echoes))
                 ranked, query_items = self._select(tx, working, hydrated, gaps)
                 return self._result(working, epoch, ranked, query_items, gaps, seed_count, len(hydrated))
         except ContractError as exc:
@@ -567,10 +656,33 @@ class RetrievalPipeline:
         except Exception as exc:
             return _empty_result(working, f"sqlite_unavailable:{type(exc).__name__}")
 
+    @staticmethod
+    def _scoped(tx, working: SearchContext, gaps: list[str]) -> SearchContext:
+        """The context with the days and entries its question names (``recall_scope``) when it names a day and asks
+        only what was said or done then; any other question has no scope.
 
-    def _collect_rounds(self, tx, working: SearchContext, gaps: list[str], *,
-                        prefetched=None) -> tuple[list[tuple[CandidateRef, RetrievedObject]], int]:
-        """The first round plus at most one directed follow-up for an open need."""
+        Reading the scope never fails a recall: a question it cannot read is recalled as if it named no day, and the
+        gap says so.  A prompt grown past the search's length by normalisation emptied the whole recall (review of
+        3.4.6).
+        """
+        scope = None
+        try:
+            if query_scope(working.query, now=working.now, zone=working.zone, entries={}) is not None:
+                entries = getattr(tx, "entries", None)
+                names = ({entry_id: str(value.get("name") or entry_id) for entry_id, value in entries().items()}
+                         if callable(entries) else {})
+                scope = query_scope(working.query, now=working.now, zone=working.zone, entries=names)
+                if scope is not None and not asks_what_was_said(scope.rest):
+                    scope = None
+        except Exception as exc:
+            gaps.append(f"scope_unreadable:{type(exc).__name__}")
+            scope = None
+        return working if working.scope == scope else replace(working, scope=scope)
+
+    def _collect_rounds(self, tx, working: SearchContext, gaps: list[str], *, prefetched=None,
+                        echoes: list[CandidateRef] | None = None) -> tuple[list[tuple[CandidateRef, RetrievedObject]], int]:
+        """The first round plus at most one directed follow-up for an open need; older copies of the current
+        message found on the way go to ``echoes``."""
         hydrated: list[tuple[CandidateRef, RetrievedObject]] = []
         seen: set[tuple[str, str, int]] = set()
         seed_count = 0
@@ -583,12 +695,14 @@ class RetrievalPipeline:
             if self._remaining(working) <= 0:
                 gaps.append("deadline_exceeded_followup" if round_index else "deadline_exceeded")
                 break
-            round_context = replace(working, query=follow_query) if follow_query else working
+            # The day a question names is read once: a follow-up asks for something else.
+            round_context = replace(working, query=follow_query, scope=None) if follow_query else working
             budget.hold(max_rounds - round_index - 1)
             seeds = self._collect(tx, round_context, gaps, seen=seen, budget=budget, prefetched=prefetched)
             seed_count += len(seeds)
             seen.update(candidate.key for candidate in seeds)
-            self._hydrate_all(tx, hydrated, seeds, round_context, gaps, floor=floor, original_query=working.query)
+            self._hydrate_all(tx, hydrated, seeds, round_context, gaps, floor=floor, original_query=working.query,
+                              echoes=echoes)
             if round_index + 1 >= max_rounds:
                 break
             items = tuple(obj for _candidate, obj in hydrated)
@@ -608,12 +722,67 @@ class RetrievalPipeline:
                     hydrated.append((replace(task[0], source="relation", lexical_score=1.0), task[1]))
         return hydrated, seed_count
 
-    def _hydrate_related(self, tx, working: SearchContext, hydrated: list[tuple[CandidateRef, RetrievedObject]], gaps: list[str]) -> None:
+    def _hydrate_related(self, tx, working: SearchContext, hydrated: list[tuple[CandidateRef, RetrievedObject]], gaps: list[str],
+                         *, echoes: tuple[CandidateRef, ...] = ()) -> None:
         seeds = tuple(candidate for candidate, _obj in hydrated)
-        known = {candidate.key for candidate in seeds}
-        expanded = [candidate for candidate in self._expand(tx, working, seeds, gaps) if candidate.key not in known]
+        known = {candidate.key for candidate in (*seeds, *echoes)}
+        expanded = [candidate for candidate in self._expand(tx, working, seeds, gaps, echoes=echoes)
+                    if candidate.key not in known]
         floor = min(working.limits.max_items, MINIMUM_HYDRATION_CAP)
         self._hydrate_all(tx, hydrated, expanded, working, gaps, floor=floor)
+        self._raise_echo_turn(tx, working, hydrated, echoes, gaps)
+
+    def _raise_echo_turn(self, tx, working: SearchContext, hydrated: list[tuple[CandidateRef, RetrievedObject]],
+                         echoes: tuple[CandidateRef, ...], gaps: list[str]) -> None:
+        """What the same question was told the last time it was asked goes before the best candidate of its time.
+
+        Reached as any seed's turn is, at a first rank's fixed score, it fell below every candidate two channels agreed
+        on: with vectors on, the owner's questions asked again lost about 25 of 124 answers (the threshold sweep of
+        2026-09-30).  Only the latest copy's turn is raised, so an answer that changed since is not raised beside the
+        one that replaced it.  Of that turn at most half the packet is: the replies a channel ranked highest, which say
+        what was asked, then the turn's last reply, which answers it, when the turn was read to its end.  An agent's
+        turn opens with what it is about to do, and raising every reply let an old turn's first messages fill the
+        packet, as raising every reply a channel found let its narration of the subject do (reviews of its first and
+        second versions); the last reply read of a turn cut by the window was narration too.  Raising only the best
+        found reply lost 6 of the owner's 173 questions asked again with vectors on, where more replies are found and
+        the answer is not always the best of them.  They go above the best
+        candidate said up to that turn, the turn's other replies included, and not above what was said after it and
+        ranks higher still, which may say the answer changed.  Kept below every such candidate outranking the best of
+        the turn's time, the answer fell out of the packet for 5 of the owner's 173 questions asked again: a store keeps
+        growing, and something said since matches most questions (review of its second version).
+        """
+        latest_turn = getattr(self.storage_reader, "latest_turn", None)
+        if not echoes or not callable(latest_turn):
+            return
+        if self._remaining(working) <= 0:
+            gaps.append("deadline_exceeded_relation")
+            return
+        read = latest_turn(tx, echoes, now=working.now)
+        if read is None:
+            return
+        opened, replies, ended = read
+        at = {candidate.key: index for index, (candidate, _obj) in enumerate(hydrated)}
+        found = [reply for reply in replies if reply.key in at and hydrated[at[reply.key]][0].source != "relation"]
+        # At most half the packet: the replies a channel ranked highest, then the last reply of a whole turn.
+        room = max(1, working.limits.max_items // 2)
+        final = replies[-1] if ended else None
+        by_score = [reply for reply in sorted(found, key=lambda reply: -hydrated[at[reply.key]][0].fusion_score)
+                    if final is None or reply.key != final.key]
+        raised = [*by_score[:room - (final is not None)], *([final] if final is not None else [])]
+        # The turn's other replies are of its time, and stay below what is raised of it.
+        of_turn, lifted = {reply.key for reply in replies}, {reply.key for reply in raised}
+        others = [(candidate.fusion_score, candidate.key not in of_turn and _said_after(obj, opened))
+                  for candidate, obj in hydrated if candidate.key not in lifted]
+        best = max((score for score, after in others if not after), default=0.0)
+        for index, reply in enumerate(raised):
+            score = best + rrf_score((index + 2,), k=self.policy.rrf_k)
+            if reply.key in at:
+                candidate, obj = hydrated[at[reply.key]]
+                if candidate.fusion_score < score:
+                    hydrated[at[reply.key]] = (replace(candidate, fusion_score=score), obj)
+            elif (f"{reply.ref}@{reply.revision}" not in working.current_source_refs
+                  and (obj := self._hydrate_admit(tx, reply, working)) is not None):
+                hydrated.append((replace(reply, fusion_score=score), obj))
 
     def _select(self, tx, working: SearchContext, hydrated: list[tuple[CandidateRef, RetrievedObject]], gaps: list[str]):
         """Rank, fold duplicate bodies, fit the item budget, then add background."""

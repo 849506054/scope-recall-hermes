@@ -57,7 +57,7 @@ _TOOL_SCHEMAS: tuple[dict[str, Any], ...] = (
     },
     {
         "name": "inspect",
-        "description": "Inspect one visible, versioned object or source.",
+        "description": "Inspect one visible, versioned object or source, or a recall packet's diagnostic_ref from this session.",
         "parameters": {
             "type": "object",
             "additionalProperties": False,
@@ -298,6 +298,7 @@ class HermesToolSurface:
             # Explicit tool calls get the bounded deep-search ceiling.  Auto
             # mode is still clamped by the trusted CoreConfig budget.
             deadline_seconds=5.0,
+            zone=display_zone(),
             # A lookup that finds nothing says so; prefetch keeps background.
             background_without_evidence=False,
         )
