@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from dataclasses import MISSING, asdict, dataclass, field, fields, replace
 from functools import partial
+from itertools import islice
 import math
 from pathlib import Path
 import sqlite3
@@ -276,6 +277,10 @@ class RuntimeInstanceConfig:
 #: Share of a recall's window its query embedding may take when it is asked for as the recall starts.  The rest is the
 #: vector search's own: an embedding that took all of it would leave the search nothing.
 QUERY_EMBEDDING_SHARE = 0.7
+#: Share of a recall's window its vector search may take when it starts with the recall, the embedding included: the
+#: three quarters Core gives the search when it asks with the whole window left (core/recall.py
+#: ``_vector_candidates``), whatever the SQLite channels then take.  Core's own wait for it ends no earlier.
+QUERY_SEARCH_SHARE = 0.75
 
 
 class _QueryEmbedding:
@@ -322,6 +327,47 @@ class _QueryEmbedding:
         return self._vector
 
 
+class _QuerySearch:
+    """One query's vector search, started when its recall starts instead of after the SQLite channels.
+
+    With only the embedding started early (``_QueryEmbedding``), the helper's open and the search itself still waited
+    for the scoped, exact, lexical, claim and recent channels and had three quarters of what they left.  A search that
+    leaves the machine lost to the time they took: a contributor whose vector store is a remote collection measured a
+    recall whose SQLite channels took 3.66 s of a 5 s window come back without it, the collection answering in
+    0.21-0.62 s (#173).  Started with the recall, the search has the window it would have had had they taken no time,
+    and the round that asks for the same query takes what it found (``_LazyVectorPort.search``).
+    """
+
+    def __init__(self, query: str, limit: int, deadline: float) -> None:
+        self.query = query
+        self.limit = limit
+        self.deadline = deadline
+        #: Set once the store is open, so a search still out when its round stops waiting is named for what it was
+        #: doing: the helper's open (``helper_open_deadline``) or the search (``helper_request_deadline``).
+        self.opened = threading.Event()
+        self._done = threading.Event()
+        self._candidates: tuple[Any, ...] = ()
+        self._error: BaseException | None = None
+
+    def run(self, search: Callable[[], Any]) -> None:
+        try:
+            self._candidates = tuple(islice(iter(search() or ()), self.limit))
+        except BaseException as exc:  # the round that takes it reports it
+            self._error = exc
+        finally:
+            self._done.set()
+
+    def candidates(self, deadline: float) -> tuple[Any, ...]:
+        """What the search found; its own failure; a timeout if it is still out at ``deadline``."""
+        if not self._done.wait(max(0.0, deadline - time.monotonic())):
+            if not self.opened.is_set():
+                raise TimeoutError("native vector helper open deadline exhausted before the search")
+            raise TimeoutError("native vector helper request deadline exhausted before the search answered")
+        if self._error is not None:
+            raise self._error
+        return self._candidates
+
+
 class _LazyVectorPort:
     """Request-local vector facade for direct Core and Runtime calls.
 
@@ -344,23 +390,33 @@ class _LazyVectorPort:
         adapter = LanceVectorPort(None, embedding, expected_embedding_space=self._instance.config.embedding_space_id())
         return adapter._embed_query
 
-    def prefetch_query(self, context: SearchContext) -> _QueryEmbedding | None:
-        """Ask for the query's embedding now, beside the SQLite channels; ``search`` takes it from there."""
+    def prefetch_query(self, context: SearchContext) -> _QuerySearch | None:
+        """Start the query's vector search now, beside the SQLite channels: the embedding in one thread, the store's
+        open and the search in another, which overlaps the two as ``search`` does.  The round that asks for the same
+        query takes what it found (``search``)."""
         if not isinstance(context, SearchContext) or self._instance.config.vector is None:
             return None
         embed = self._query_embedder()
         if embed is None:
             return None
+        limit = context.limits.vector_limit
+        if limit < 1:
+            return None
         now = time.monotonic()
         window = context.deadline - now
         if window <= 0.0:
             return None
-        pending = _QueryEmbedding(context.query, now + window * QUERY_EMBEDDING_SHARE)
-        threading.Thread(target=pending.run, args=(embed,), name="scope-recall-query-embedding", daemon=True).start()
+        embedding = _QueryEmbedding(context.query, now + window * QUERY_EMBEDDING_SHARE)
+        # The most any round asks for (``SearchLimits.vector_limit``); a round's own allowance is its first ones.
+        pending = _QuerySearch(context.query, limit, now + window * QUERY_SEARCH_SHARE)
+        threading.Thread(target=embedding.run, args=(embed,), name="scope-recall-query-embedding", daemon=True).start()
+        search = partial(self._search, replace(context, deadline=pending.deadline), limit=limit, prefetched=embedding,
+                         opened=pending.opened)
+        threading.Thread(target=pending.run, args=(search,), name="scope-recall-query-search", daemon=True).start()
         return pending
 
     def search(self, context: SearchContext, *, limit: int, remaining_seconds: float,
-               prefetched: _QueryEmbedding | None = None):
+               prefetched: _QuerySearch | _QueryEmbedding | None = None):
         if not isinstance(context, SearchContext):
             raise TypeError("context must be SearchContext")
         if type(limit) is not int or not 1 <= limit <= 200:
@@ -374,8 +430,17 @@ class _LazyVectorPort:
         if remaining <= 0.0:
             return ()
         effective_deadline = min(context.deadline, now + float(remaining_seconds))
-        context = replace(context, deadline=effective_deadline)
-        deadline = RequestDeadline.from_absolute(effective_deadline, now=now)
+        if isinstance(prefetched, _QuerySearch):
+            # Started with the recall; waited for no longer than this round's own search would have taken.
+            return prefetched.candidates(effective_deadline)[:limit]
+        return self._search(replace(context, deadline=effective_deadline), limit=limit, prefetched=prefetched)
+
+    def _search(self, context: SearchContext, *, limit: int, prefetched: _QueryEmbedding | None,
+                opened: threading.Event | None = None):
+        """Open the store and search it by ``context.deadline``, the query embedded while the store opens or taken
+        from ``prefetched``; ``opened`` is set once the store is open."""
+        effective_deadline = context.deadline
+        deadline = RequestDeadline.from_absolute(effective_deadline, now=time.monotonic())
         prepared: list[tuple[str, Any]] = []
         failed: list[Exception] = []
 
@@ -406,6 +471,8 @@ class _LazyVectorPort:
         with using_request_deadline(deadline):
             port = self._instance._ensure_vector_port(allow_create=False, deadline=effective_deadline,
                                                       during_open=embed_while_opening)
+            if opened is not None:
+                opened.set()
             if port is None:
                 return ()
             if failed:
@@ -417,7 +484,7 @@ class _LazyVectorPort:
                 raise TimeoutError("native vector helper open deadline exhausted before the search")
             if not prepared and prefetched is not None:
                 prepared.append((context.query, prefetched.result(effective_deadline)))
-            remaining = min(remaining, deadline.remaining())
+            remaining = deadline.remaining()
             if remaining <= 0.0:
                 # The embedding came back with no time left to search: the search would return nothing and say
                 # nothing, and the recall would look as if it had searched by meaning.

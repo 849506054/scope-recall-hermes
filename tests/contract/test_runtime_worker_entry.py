@@ -284,10 +284,11 @@ def test_lazy_vector_facade_opens_existing_store_for_each_core_search_context(tm
     assert store.opened is True, result
     assert store.open_deadline is not None
     assert store.open_deadline <= context.deadline
-    assert len(store.search_calls) == 1
-    # The facade does not substitute the instance construction session for
-    # the request-bound physical partition; the search ran for this context.
-    assert store.search_calls[0][1]
+    # The facade starts this context's search with the recall (3.4.8.2), so a search the test
+    # already made by hand is a second one for the same query -- nothing is reused, because a
+    # result from another session's partition may not stand in for this one.  What must hold is
+    # that the recall's own search ran for this context's scope, not the construction session's.
+    assert store.search_calls and store.search_calls[-1][1]
     instance.close()
 
 
@@ -1457,3 +1458,56 @@ def test_the_split_the_worker_computed_reaches_the_file_that_is_polled():
     assert '"terminal_failed_work"' in source, "the allowlist drops it before anyone reads it"
     payload_source = inspect.getsource(worker_entry)
     assert "terminal_failed_work=terminal_failed" in payload_source
+
+
+class _Embedding:
+    def embed_query(self, text, *, remaining_seconds):
+        return (0.1, 0.2)
+
+
+class _RoundTripStore(_ScopedStore):
+    """A store whose search is a round trip of ``seconds``, failed as the helper fails when its time does not cover
+    it."""
+
+    def __init__(self, seconds):
+        super().__init__()
+        self.seconds = seconds
+        self.started = []
+
+    def search_scopes(self, vector, *, scope_ids, limit):
+        from scope_recall.core.deadline import remaining_seconds
+
+        self.started.append(time.monotonic())
+        left = remaining_seconds()
+        if left is None or left < self.seconds:
+            time.sleep(max(0.0, left or 0.0))
+            raise TimeoutError("native vector helper request deadline exhausted")
+        time.sleep(self.seconds)
+        return super().search_scopes(vector, scope_ids=scope_ids, limit=limit)
+
+
+def test_a_slow_sqlite_channel_leaves_the_vector_search_its_window(tmp_path, monkeypatch):
+    """Started after the SQLite channels, the search had three quarters of what they left, and one that leaves the
+    machine came back too late: a contributor whose store is a remote collection measured a recall whose channels took
+    3.66 s of a 5 s window lose it, the collection answering in 0.21-0.62 s (#173).  Started with the recall, the search
+    runs beside them: here the word search takes 1.1 s of a 1.6 s window and the store answers in 0.45 s, which the
+    0.36 s it left would not cover."""
+    from scope_recall.core.retrieval_storage import RetrievalStorage
+
+    lexical = RetrievalStorage.lexical
+    finished = []
+
+    def slow_lexical(self, tx, context, *, limit):
+        time.sleep(1.1)
+        finished.append(time.monotonic())
+        return lexical(self, tx, context, limit=limit)
+
+    monkeypatch.setattr(RetrievalStorage, "lexical", slow_lexical)
+    store = _RoundTripStore(0.45)
+    instance, binding = _vector_instance(tmp_path, store, _Embedding())
+    try:
+        result = instance.core.recall_pipeline.search(_search_context(binding, 1.6))
+        assert not [gap for gap in result.gaps if gap.startswith(("vector", "deadline"))], result.gaps
+        assert len(store.searches) == 1 and store.started[0] < finished[0], "the search ran beside the word search"
+    finally:
+        instance.close()

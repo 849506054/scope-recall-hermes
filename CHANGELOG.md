@@ -2,6 +2,41 @@
 
 All notable changes to `scope-recall` will be documented in this file.
 
+## [3.4.8.2] - 2026-10-01
+
+**Fork release.** The semantic search starts with the recall, and the thread that ran it beside
+the local channels is out of `core/recall.py`.
+
+`runtime/instance.py`'s `_LazyVectorPort.prefetch_query` starts the whole search when the recall
+starts -- the embedding, the store's open and the search -- instead of asking for the embedding
+alone. The search runs under its own deadline inside `_QuerySearch`, and the round that asks for
+the same query takes what it found within its own `remaining_seconds`, so a search that leaves
+the machine costs the recall the longer of the two rather than their sum. Core stays
+single-threaded.
+
+What leaves `core/recall.py`: `_StartedChannel`, `_VECTOR_JOIN_GRACE`, and the join that reported
+a still-running search as `deadline_exceeded_vector`. The three objections upstream raised on
+PR #173 went with them -- a thread spent the round's `ChannelBudget` from beside it, waited past
+the recall's deadline for its 0.25 s grace, and started inside `_collect` after the read
+transaction had opened. A search that overruns now names `helper_open_deadline` or
+`helper_request_deadline`, which is what the grace existed to keep. The mechanism is upstream's:
+the maintainer's patch on PR #173, measured against their own store, and not carried there since
+their store never leaves the machine.
+
+Measured here before it: a host prefetch spent 3.66 s of its five-second window and the search,
+run last, was handed what was left -- a transport timeout and a recall without its meaning
+channel. Coverage: upstream's `test_a_slow_sqlite_channel_leaves_the_vector_search_its_window`
+(the word search takes 1.1 s of a 1.6 s window, the store answers in 0.45 s, which the 0.36 s it
+left would not cover).
+
+### Upgrading from 3.4.8.1
+
+1. Stop the hosts and the Scope Recall worker, and take a `backup`.
+2. Install the 3.4.8.2 package, then run `plan-install` and `apply-install` for each host.
+3. Start the hosts again and run `doctor`.
+
+The store's schema is unchanged (1110).
+
 ## [3.4.8.1] - 2026-10-01
 
 **Fork release.** Upstream v3.4.7 and v3.4.8 are merged over the shared v3.4.2 baseline
