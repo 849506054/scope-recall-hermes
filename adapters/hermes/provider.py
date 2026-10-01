@@ -13,7 +13,7 @@ import threading
 import time
 from typing import Any, Dict, List, Optional
 
-from scope_recall.contracts import ContractError, RecallRequest, TrustedContext
+from scope_recall.contracts import ContractError, RecallPacket, RecallRequest, TrustedContext
 from scope_recall.core import CoreConfig, MemoryCore
 from scope_recall.core.capture_filters import sanitize_source_capture_text
 from scope_recall.core.retrieval import AUTOMATIC_PACKET_BUDGET_UNITS, MAX_CURRENT_SOURCE_REFS
@@ -571,6 +571,23 @@ class ScopeRecallHermesAdapter(HermesToolSurface, _MemoryProviderBase):  # pyrig
             self._capture_event(context, pending.event, identity=key, gaps=pending.gaps,
                                 scope_id=pending.scope_id, remaining_seconds=remaining, replay=True)
 
+    def _log_vector_loss(self, packet: RecallPacket, recall_seconds: float) -> None:
+        """Say so, once, when a recall came back without the semantic channel, with what took its share.
+
+        The channel is lost on a minority of recalls, and only when the install is busy or its connection to the
+        provider has gone cold, so it is recorded where it happens rather than probed for: the gaps name the failure
+        and the pipeline's timeline names where the window went (``core/recall.py`` ``last_vector_failure``).
+        """
+        gaps = tuple(str(gap) for gap in (packet.get("gaps") or ()))
+        if not any(gap == "vector_unavailable" or gap.startswith("vector_error:") for gap in gaps):
+            return
+        pipeline = getattr(self._require_core(), "recall_pipeline", None)
+        _log.warning(
+            "scope-recall: vector channel lost recall=%.2fs status=%s gaps=%s timeline=%s",
+            recall_seconds, packet.get("status"), ",".join(gaps[:10]),
+            json.dumps(getattr(pipeline, "last_vector_failure", None), sort_keys=True),
+        )
+
     @_serialized_host_event
     def prefetch(self, query: str, *, session_id: str = "") -> str:
         identity = self._require_identity()
@@ -587,6 +604,7 @@ class ScopeRecallHermesAdapter(HermesToolSurface, _MemoryProviderBase):  # pyrig
         recent = (self._current_task_message,) if self._current_task_message else ()
         context = identity.trusted_context(session_id=effective_session, recent_messages=recent)
         current_refs = tuple(self._current_source_refs)
+        timed = time.monotonic()
         packet = self._require_core().recall_packet(
             context,
             self._recall_request(query, effective_session),
@@ -594,6 +612,8 @@ class ScopeRecallHermesAdapter(HermesToolSurface, _MemoryProviderBase):  # pyrig
             # A day the message names is read in the zone this profile tells its model, as its memories' times are.
             zone=display_zone(),
         )
+        recall_seconds = time.monotonic() - timed
+        self._log_vector_loss(packet, recall_seconds)
         preparation = self._require_core().prepare_recall_render(context, packet)
         self._diagnostics.last_prefetch_request_id = packet["request_id"]
         self._diagnostics.last_render_ref = preparation.render_ref

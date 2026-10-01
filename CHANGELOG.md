@@ -2,6 +2,19 @@
 
 All notable changes to `scope-recall` will be documented in this file.
 
+## [3.4.8.3] - 2026-10-01
+
+**Fork release.** A recall that comes back without the semantic channel says so, once, with the
+stages that took its share.
+
+`_QuerySearch.timeline` reports the query embedding's provider round trip, the helper's open and
+the search beside each other; `RetrievalPipeline.last_vector_failure` carries that reading out of
+the read-only pass, and the host adapter logs it when a packet's gaps name a lost vector channel.
+Measured on this install (2026-10-01): a prompt after a few idle minutes embeds in 2.4 s of the
+search's 3.0 s share -- the connection to the provider has gone cold -- and the collection's
+0.57-0.68 s answer then misses the deadline.  The helper's open costs 0.22 s.  Until now the loss
+was counted by hand, from a probe run beside the install.
+
 ## [3.4.8.2] - 2026-10-01
 
 **Fork release.** The semantic search starts with the recall, and the thread that ran it beside

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from datetime import timedelta, timezone
 import json
+import logging
 import sys
 import types
 
@@ -56,6 +57,57 @@ def test_duplicate_prefetch_does_not_duplicate_injection(adapter):
     second = provider.prefetch("继续 TEST 项目")
     assert first == second
     assert provider.diagnostics.last_prefetch_request_id is not None
+
+
+def test_a_lost_vector_channel_is_logged_with_the_stages_that_took_its_share(adapter, initialize_kwargs, caplog):
+    """A recall that comes back without the semantic channel says so once, with the pipeline's timeline beside it:
+    on an install where it happens to a minority of recalls, that line is the count."""
+    provider, _clock = adapter
+    core = provider._core
+    ctx = _bind_context(core, initialize_kwargs, session_id="TEST-session-1")
+
+    class LostPipeline:
+        storage_reader = core.recall_pipeline.storage_reader
+        last_vector_failure = {"share_seconds": 3.0, "embedding_seconds": 2.8, "open_seconds": 0.1,
+                               "search_seconds": None, "total_seconds": None, "store_opened": True,
+                               "finished": False, "error": "QdrantHTTPError"}
+
+        def search(self, search_context):
+            return RetrievalResult(
+                items=(), candidates=(), memory_epoch=core.status(ctx).memory_epoch,
+                gaps=("vector_unavailable", "vector_error:QdrantHTTPError:timeout"),
+                answerability_hint="unknown", coverage="partial", candidate_count=0, admitted_count=0,
+                request_id="TEST-request",
+            )
+
+    core.recall_pipeline = LostPipeline()
+    with caplog.at_level(logging.WARNING, logger="scope_recall.adapters.hermes.provider"):
+        provider.prefetch("继续 TEST 项目", session_id="")
+    assert "vector channel lost" in caplog.text
+    assert "vector_error:QdrantHTTPError:timeout" in caplog.text
+    assert '"embedding_seconds": 2.8' in caplog.text
+
+
+def test_a_recall_that_kept_its_vector_channel_logs_nothing(adapter, initialize_kwargs, caplog):
+    provider, _clock = adapter
+    core = provider._core
+    ctx = _bind_context(core, initialize_kwargs, session_id="TEST-session-1")
+
+    class KeptPipeline:
+        storage_reader = core.recall_pipeline.storage_reader
+        last_vector_failure = None
+
+        def search(self, search_context):
+            return RetrievalResult(
+                items=(), candidates=(), memory_epoch=core.status(ctx).memory_epoch,
+                gaps=("relation_bound_reached",), answerability_hint="unknown", coverage="partial",
+                candidate_count=0, admitted_count=0, request_id="TEST-request",
+            )
+
+    core.recall_pipeline = KeptPipeline()
+    with caplog.at_level(logging.WARNING, logger="scope_recall.adapters.hermes.provider"):
+        provider.prefetch("继续 TEST 项目", session_id="")
+    assert "vector channel lost" not in caplog.text
 
 
 def test_prefetch_does_not_use_raw_callback_text_for_scope(adapter, initialize_kwargs):

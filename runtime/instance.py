@@ -299,6 +299,10 @@ class _QueryEmbedding:
         self._done = threading.Event()
         self._vector: Any = None
         self._error: BaseException | None = None
+        #: When this stage started and ended, so a recall that comes back without the semantic channel can say what
+        #: the embedding alone cost (``_QuerySearch.timeline``).
+        self.started = time.monotonic()
+        self.finished: float | None = None
 
     def run(self, embed: Callable[[str, float], Any]) -> None:
         try:
@@ -314,6 +318,7 @@ class _QueryEmbedding:
         except BaseException as exc:  # the recall that waits for it reports it
             self._error = exc
         finally:
+            self.finished = time.monotonic()
             self._done.set()
 
     def result(self, deadline: float) -> Any:
@@ -325,6 +330,18 @@ class _QueryEmbedding:
         if self._error is not None:
             raise self._error
         return self._vector
+
+
+class _OpenMark(threading.Event):
+    """An event that records when it was set: the helper's open, timed for ``_QuerySearch.timeline``."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.at: float | None = None
+
+    def mark(self) -> None:
+        self.at = time.monotonic()
+        self.set()
 
 
 class _QuerySearch:
@@ -344,10 +361,15 @@ class _QuerySearch:
         self.deadline = deadline
         #: Set once the store is open, so a search still out when its round stops waiting is named for what it was
         #: doing: the helper's open (``helper_open_deadline``) or the search (``helper_request_deadline``).
-        self.opened = threading.Event()
+        self.opened = _OpenMark()
         self._done = threading.Event()
         self._candidates: tuple[Any, ...] = ()
         self._error: BaseException | None = None
+        #: The embedding this search waits for, and its own stage times; ``timeline`` reports both to the recall that
+        #: comes back without it.
+        self.embedding: _QueryEmbedding | None = None
+        self.started = time.monotonic()
+        self.finished: float | None = None
 
     def run(self, search: Callable[[], Any]) -> None:
         try:
@@ -355,6 +377,7 @@ class _QuerySearch:
         except BaseException as exc:  # the round that takes it reports it
             self._error = exc
         finally:
+            self.finished = time.monotonic()
             self._done.set()
 
     def candidates(self, deadline: float) -> tuple[Any, ...]:
@@ -366,6 +389,31 @@ class _QuerySearch:
         if self._error is not None:
             raise self._error
         return self._candidates
+
+    def timeline(self) -> dict[str, Any]:
+        """What each stage of this search cost, for a recall that came back without the semantic channel.
+
+        The stages are the ones the search is made of: the query embedding's provider round trip, the helper's open,
+        and the search itself.  Read by the host adapter that logs the loss (``core/recall.py``
+        ``last_vector_failure``), so an install that loses the channel says where its share went.
+        """
+        def span(begin: float | None, end: float | None) -> float | None:
+            return None if begin is None or end is None else round(end - begin, 3)
+
+        embedding = self.embedding
+        opened_at = getattr(self.opened, "at", None)
+        embedding_error = getattr(embedding, "_error", None)
+        return {
+            "share_seconds": round(self.deadline - self.started, 3),
+            "embedding_seconds": span(getattr(embedding, "started", None), getattr(embedding, "finished", None)),
+            "embedding_error": type(embedding_error).__name__ if embedding_error is not None else None,
+            "open_seconds": span(self.started, opened_at),
+            "search_seconds": span(opened_at, self.finished),
+            "total_seconds": span(self.started, self.finished),
+            "store_opened": self.opened.is_set(),
+            "finished": self._done.is_set(),
+            "error": type(self._error).__name__ if self._error is not None else None,
+        }
 
 
 class _LazyVectorPort:
@@ -409,6 +457,7 @@ class _LazyVectorPort:
         embedding = _QueryEmbedding(context.query, now + window * QUERY_EMBEDDING_SHARE)
         # The most any round asks for (``SearchLimits.vector_limit``); a round's own allowance is its first ones.
         pending = _QuerySearch(context.query, limit, now + window * QUERY_SEARCH_SHARE)
+        pending.embedding = embedding
         threading.Thread(target=embedding.run, args=(embed,), name="scope-recall-query-embedding", daemon=True).start()
         search = partial(self._search, replace(context, deadline=pending.deadline), limit=limit, prefetched=embedding,
                          opened=pending.opened)
@@ -436,7 +485,7 @@ class _LazyVectorPort:
         return self._search(replace(context, deadline=effective_deadline), limit=limit, prefetched=prefetched)
 
     def _search(self, context: SearchContext, *, limit: int, prefetched: _QueryEmbedding | None,
-                opened: threading.Event | None = None):
+                opened: _OpenMark | None = None):
         """Open the store and search it by ``context.deadline``, the query embedded while the store opens or taken
         from ``prefetched``; ``opened`` is set once the store is open."""
         effective_deadline = context.deadline
@@ -472,7 +521,7 @@ class _LazyVectorPort:
             port = self._instance._ensure_vector_port(allow_create=False, deadline=effective_deadline,
                                                       during_open=embed_while_opening)
             if opened is not None:
-                opened.set()
+                opened.mark()  # when the helper finished opening, for _QuerySearch.timeline
             if port is None:
                 return ()
             if failed:

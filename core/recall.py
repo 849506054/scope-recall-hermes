@@ -159,6 +159,10 @@ class RetrievalPipeline:
         self.storage_reader = storage_reader if storage_reader is not None else RetrievalStorage(clock=self.clock)
         if hasattr(self.storage_reader, "clock"):
             self.storage_reader.clock = self.clock
+        #: What the vector search was doing when a recall came back without it (runtime/instance.py
+        #: ``_QuerySearch.timeline``); read once by the host adapter that logs the loss, so an install that loses the
+        #: semantic channel says where the window went instead of only that it is gone.
+        self.last_vector_failure: dict | None = None
 
     def _remaining(self, context: SearchContext) -> float:
         return context.deadline - self.clock.monotonic()
@@ -205,6 +209,9 @@ class RetrievalPipeline:
             # The class alone does not say what went wrong; see core/vector_failure.py.
             gaps.append("vector_unavailable")
             gaps.append(f"vector_error:{vector_failure_label(exc)}")
+            timeline = getattr(prefetched, "timeline", None)
+            detail = timeline() if callable(timeline) else None
+            self.last_vector_failure = detail if isinstance(detail, dict) else None
             return ()
         if budget is not None:
             budget.spend("vector", len(raw))
@@ -579,6 +586,7 @@ class RetrievalPipeline:
         if self._remaining(working) <= 0:
             return _empty_result(working, "deadline_exceeded")
         gaps: list[str] = []
+        self.last_vector_failure = None
         prefetched = self._prefetch_query(working)
         try:
             with self.storage.read(working.trusted_context, remaining_seconds=max(self._remaining(working), 0.001)) as tx:
