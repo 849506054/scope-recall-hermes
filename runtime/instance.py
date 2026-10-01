@@ -274,12 +274,15 @@ class RuntimeInstanceConfig:
         )
 
 
-#: Share of a recall's window its query embedding may take when it is asked for as the recall starts.  The rest is the
-#: vector search's own: an embedding that took all of it would leave the search nothing.
+#: Share of a recall's window its query embedding may take when it is asked for as the recall starts.  The search's
+#: share is measured after it (``_QuerySearch.deadline_for``), so this bounds the embedding stage itself: one that
+#: never answered would otherwise hold the recall's whole window.
 QUERY_EMBEDDING_SHARE = 0.7
-#: Share of a recall's window its vector search may take when it starts with the recall, the embedding included: the
-#: three quarters Core gives the search when it asks with the whole window left (core/recall.py
-#: ``_vector_candidates``), whatever the SQLite channels then take.  Core's own wait for it ends no earlier.
+#: Share of a recall's window its vector search may take when it starts with the recall, measured from the moment the
+#: embedding lands (``_QuerySearch.deadline_for``) and never past the recall's own deadline: the provider round trip a
+#: cold connection needs is not the collection's answer to pay for.  Core gives the search the three quarters of what
+#: is left when it asks with the whole window left (core/recall.py ``_vector_candidates``), and its own wait for it
+#: ends no earlier.
 QUERY_SEARCH_SHARE = 0.75
 
 
@@ -355,10 +358,16 @@ class _QuerySearch:
     and the round that asks for the same query takes what it found (``_LazyVectorPort.search``).
     """
 
-    def __init__(self, query: str, limit: int, deadline: float) -> None:
+    def __init__(self, query: str, limit: int, deadline: float, *, share_seconds: float | None = None) -> None:
         self.query = query
         self.limit = limit
+        #: The recall's own deadline: this search never runs past it, whatever share it is given.
         self.deadline = deadline
+        #: The share this search may take, measured from the moment the embedding landed rather than from the recall's
+        #: start.  A cold provider round trip spends the share before the search can use any of it: on 2026-10-01 an
+        #: embedding of 2.43 s left the collection 0.57 s of a 3.00 s share to answer in, and its 0.57-0.68 s answer
+        #: missed it -- the share, not the recall's window, was the limit that failed.
+        self.share_seconds = share_seconds
         #: Set once the store is open, so a search still out when its round stops waiting is named for what it was
         #: doing: the helper's open (``helper_open_deadline``) or the search (``helper_request_deadline``).
         self.opened = _OpenMark()
@@ -390,6 +399,16 @@ class _QuerySearch:
             raise self._error
         return self._candidates
 
+    def deadline_for(self, embedding_done_at: float | None) -> float:
+        """The deadline this search runs to: its share from the embedding's arrival, never past the recall's.
+
+        ``embedding_done_at`` is the moment the query embedding landed (``_QueryEmbedding.finished``); without it,
+        the recall's own deadline is the answer, as it is for a search that embedded inside itself.
+        """
+        if self.share_seconds is None or embedding_done_at is None:
+            return self.deadline
+        return min(self.deadline, embedding_done_at + self.share_seconds)
+
     def timeline(self) -> dict[str, Any]:
         """What each stage of this search cost, for a recall that came back without the semantic channel.
 
@@ -404,7 +423,7 @@ class _QuerySearch:
         opened_at = getattr(self.opened, "at", None)
         embedding_error = getattr(embedding, "_error", None)
         return {
-            "share_seconds": round(self.deadline - self.started, 3),
+            "share_seconds": round(self.deadline_for(getattr(embedding, "finished", None)) - self.started, 3),
             "embedding_seconds": span(getattr(embedding, "started", None), getattr(embedding, "finished", None)),
             "embedding_error": type(embedding_error).__name__ if embedding_error is not None else None,
             "open_seconds": span(self.started, opened_at),
@@ -456,11 +475,12 @@ class _LazyVectorPort:
             return None
         embedding = _QueryEmbedding(context.query, now + window * QUERY_EMBEDDING_SHARE)
         # The most any round asks for (``SearchLimits.vector_limit``); a round's own allowance is its first ones.
-        pending = _QuerySearch(context.query, limit, now + window * QUERY_SEARCH_SHARE)
+        # The recall's deadline is the search's cap, and its share is measured inside the search from the moment the
+        # embedding lands (``_QuerySearch.deadline_for``): a cold provider round trip is not the collection's to pay.
+        pending = _QuerySearch(context.query, limit, context.deadline, share_seconds=window * QUERY_SEARCH_SHARE)
         pending.embedding = embedding
         threading.Thread(target=embedding.run, args=(embed,), name="scope-recall-query-embedding", daemon=True).start()
-        search = partial(self._search, replace(context, deadline=pending.deadline), limit=limit, prefetched=embedding,
-                         opened=pending.opened)
+        search = partial(self._search, context, limit=limit, prefetched=embedding, opened=pending.opened, search=pending)
         threading.Thread(target=pending.run, args=(search,), name="scope-recall-query-search", daemon=True).start()
         return pending
 
@@ -485,7 +505,7 @@ class _LazyVectorPort:
         return self._search(replace(context, deadline=effective_deadline), limit=limit, prefetched=prefetched)
 
     def _search(self, context: SearchContext, *, limit: int, prefetched: _QueryEmbedding | None,
-                opened: _OpenMark | None = None):
+                opened: _OpenMark | None = None, search: _QuerySearch | None = None):
         """Open the store and search it by ``context.deadline``, the query embedded while the store opens or taken
         from ``prefetched``; ``opened`` is set once the store is open."""
         effective_deadline = context.deadline
@@ -533,14 +553,18 @@ class _LazyVectorPort:
                 raise TimeoutError("native vector helper open deadline exhausted before the search")
             if not prepared and prefetched is not None:
                 prepared.append((context.query, prefetched.result(effective_deadline)))
-            remaining = deadline.remaining()
+            # The embedding's provider round trip is not the collection's answer to pay for: a search started with
+            # the recall takes its share from the moment the embedding landed (``_QuerySearch.deadline_for``).
+            run_deadline = effective_deadline if search is None else search.deadline_for(getattr(prefetched, "finished", None))
+            remaining = min(deadline.remaining(), run_deadline - time.monotonic())
             if remaining <= 0.0:
                 # The embedding came back with no time left to search: the search would return nothing and say
                 # nothing, and the recall would look as if it had searched by meaning.
                 raise TimeoutError("native vector helper request deadline exhausted before the search")
-            if prepared:
-                return port.search(context, limit=limit, remaining_seconds=remaining, _prepared_query=prepared[0])
-            return port.search(context, limit=limit, remaining_seconds=remaining)
+            with using_request_deadline(RequestDeadline.from_absolute(run_deadline, now=time.monotonic())):
+                if prepared:
+                    return port.search(context, limit=limit, remaining_seconds=remaining, _prepared_query=prepared[0])
+                return port.search(context, limit=limit, remaining_seconds=remaining)
 
 
 def _open_store(resource: Any, *, allow_create: bool, deadline: float | None, during_open) -> None:

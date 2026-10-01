@@ -511,6 +511,42 @@ def test_an_embedding_back_with_no_time_left_to_search_is_a_gap(tmp_path):
         instance.close()
 
 
+def test_a_cold_embedding_does_not_spend_the_searchs_share(tmp_path):
+    """The search's share is measured from the moment the embedding lands, not from the recall's start.
+
+    A cold provider connection spends the share before the search can use any of it: on 2026-10-01 an embedding of
+    2.43 s left the collection 0.57 s of a 3.00 s share to answer in, and its 0.57-0.68 s answer missed it -- the
+    share, not the recall's window, was the limit that failed.  Here the embedding takes 0.5 s of a 2 s window.
+    """
+    from scope_recall.core.deadline import remaining_seconds as ambient_remaining_seconds
+
+    class ColdEmbedding:
+        def embed_query(self, text, *, remaining_seconds):
+            time.sleep(0.5)
+            return (0.1, 0.2)
+
+    class RecordingStore(_ScopedStore):
+        def __init__(self):
+            super().__init__()
+            self.budgets = []
+
+        def search_scopes(self, vector, *, scope_ids, limit):
+            self.budgets.append(ambient_remaining_seconds(time.monotonic()))
+            return super().search_scopes(vector, scope_ids=scope_ids, limit=limit)
+
+    store = RecordingStore()
+    instance, binding = _vector_instance(tmp_path, store, ColdEmbedding())
+    try:
+        result = instance.core.recall_pipeline.search(_search_context(binding, 2.0))
+        assert not [gap for gap in result.gaps if gap.startswith("vector")], result.gaps
+        assert len(store.searches) == 1, store.searches
+        # 0.75 of the 2 s window, less the milliseconds between the embedding's arrival and the search: the 0.5 s the
+        # embedding took is not the collection's answer to pay for.
+        assert 1.35 < store.budgets[0] <= 1.55, store.budgets
+    finally:
+        instance.close()
+
+
 def test_warming_opens_the_store_and_searches_one_of_its_partitions(tmp_path):
     """A kept handler's first prompt opened the table and read the index inside its recall; warmed when the server
     starts, that prompt finds them ready."""
