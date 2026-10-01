@@ -10,7 +10,7 @@ from typing import Any, Callable
 from .backup import BackupError
 from .doctor import run_doctor
 from .install import InstallError, apply_install, apply_uninstall, plan_install, plan_uninstall
-from .install_common import _absolute, _require_interpreter
+from .install_common import _absolute
 from .install_hermes import LOCAL_PLATFORM_CHOICES
 from .rollback import RollbackError
 

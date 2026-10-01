@@ -21,14 +21,8 @@ from __future__ import annotations
 from typing import Iterable
 
 #: ``t`` is the term, ``p`` the posting, ``e`` the source version.
-#:
-#: The order is pinned with ``CROSS JOIN`` on purpose: it is an inner join SQLite does not
-#: reorder.  Left to itself the planner drove these statements from ``source_events`` -- every
-#: version in the scope -- and looked up postings per version, so the term filter applied after
-#: the fact and the posting budget bounded nothing.  Measured on this store's 3M-posting index:
-#: 3.86 s against 0.19 s with the order pinned, same rows.
-JOIN = ("lexical_terms t CROSS JOIN lexical_postings p ON p.term_id=t.term_id "
-        "CROSS JOIN source_events e ON e.source_id=p.source_id")
+JOIN = ("lexical_terms t JOIN lexical_postings p ON p.term_id=t.term_id "
+        "JOIN source_events e ON e.source_id=p.source_id")
 
 
 def source_id(conn, event_id: str, source_revision: int) -> int | None:

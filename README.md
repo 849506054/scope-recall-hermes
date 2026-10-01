@@ -53,9 +53,9 @@ python -m pip install hermes-scope-recall==3.4.8
 python -m pip install "hermes-scope-recall[codex]==3.4.8"
 ```
 
-This fork's `3.2.7` build is installed from a wheel file built out of this branch
+This fork's `3.4.8.1` build is installed from a wheel file built out of this branch
 (`python -m pip install <path-to-wheel>`); the PyPI package and the release below carry
-upstream's `3.2.0`.
+upstream's `3.4.8`.  The fork numbers its own releases as upstream plus a fourth digit.
 
 The same wheel and sdist are attached to the
 [GitHub Release](https://github.com/410979729/scope-recall-hermes/releases/tag/v3.4.8)

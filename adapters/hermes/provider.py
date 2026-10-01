@@ -587,9 +587,6 @@ class ScopeRecallHermesAdapter(HermesToolSurface, _MemoryProviderBase):  # pyrig
         recent = (self._current_task_message,) if self._current_task_message else ()
         context = identity.trusted_context(session_id=effective_session, recent_messages=recent)
         current_refs = tuple(self._current_source_refs)
-        # Temporary instrumentation (3.4.4): this instance's prefetch sometimes spends its
-        # whole 5 s window and the packet says only which phase ran out, not what the work
-        # cost.  Only the cases that need it speak, so a healthy turn adds no line.
         packet = self._require_core().recall_packet(
             context,
             self._recall_request(query, effective_session),

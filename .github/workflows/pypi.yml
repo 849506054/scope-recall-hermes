@@ -47,8 +47,8 @@ jobs:
           DISPATCH_RUN_ID: ${{ github.event.client_payload.release_run_id }}
         run: |
           RELEASE_TAG="${DISPATCH_TAG:-${INPUT_RELEASE_TAG}}"
-          if ! [[ "${RELEASE_TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "Invalid release tag: expected a v<major>.<minor>.<patch> tag ref" >&2
+          if ! [[ "${RELEASE_TAG}" =~ ^v[0-9]+(\.[0-9]+){2,3}$ ]]; then
+            echo "Invalid release tag: expected a v<major>.<minor>.<patch>[.<build>] tag ref" >&2
             exit 1
           fi
           mkdir -p release-origin
@@ -108,8 +108,8 @@ jobs:
         env:
           RELEASE_TAG: ${{ steps.release_tag.outputs.release_tag }}
         run: |
-          if ! [[ "${RELEASE_TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "Invalid release tag: expected a v<major>.<minor>.<patch> tag ref" >&2
+          if ! [[ "${RELEASE_TAG}" =~ ^v[0-9]+(\.[0-9]+){2,3}$ ]]; then
+            echo "Invalid release tag: expected a v<major>.<minor>.<patch>[.<build>] tag ref" >&2
             exit 1
           fi
       - name: Verify tag matches package version

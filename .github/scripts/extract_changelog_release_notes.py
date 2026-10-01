@@ -16,7 +16,7 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
-SEMVER_RE = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+$")
+SEMVER_RE = re.compile(r"^[0-9]+(\.[0-9]+){2,3}$")
 _FENCE_RE = re.compile(r"^ {0,3}(?P<run>`{3,}|~{3,})(?P<tail>[^\r\n]*)(?:\r?\n)?$")
 _VERSION_HEADING_RE = re.compile(r"^ {0,3}##[ \t]+\[(?P<label>[^\]\r\n]+)\][^\r\n]*(?:\r?\n)?$")
 
@@ -66,7 +66,7 @@ def extract_version_section(changelog: str, version: str) -> str:
     closed so release tooling cannot publish ambiguous or example content.
     """
     if not SEMVER_RE.fullmatch(version):
-        raise ValueError("version must use major.minor.patch syntax")
+        raise ValueError("version must use major.minor.patch syntax, with an optional fourth number")
 
     headings = _version_headings(changelog)
     matches = [(index, heading) for index, heading in enumerate(headings) if heading.label == version]
