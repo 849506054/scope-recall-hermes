@@ -2,7 +2,7 @@
 
 Scope Recall v3 is a bounded local memory core with SQLite as the authority and rebuildable vector companions. It provides host adapters for Hermes, Codex and Claude Code (the last two share one adapter of hooks and an MCP server), with the MCP tools when the optional `codex` extra is installed. The public package is `hermes-scope-recall`; the Python import is `scope_recall`; the host wrapper identity remains `scope-recall`.
 
-This checkout is `3.4.9`, in which Claude Code and Codex on another machine can join the shared store too ([docs/remote-entries.md](docs/remote-entries.md)). Hermes, Codex and Claude Code can keep one memory: each attaches to a shared
+This checkout is `3.4.10`, in which Claude Code and Codex on another machine can join the shared store too ([docs/remote-entries.md](docs/remote-entries.md)). Hermes, Codex and Claude Code can keep one memory: each attaches to a shared
 store as an entry, what the owner tells one of them another can recall, and each memory says
 which agent it came in through ([docs/shared-store.md](docs/shared-store.md)). Hermes agents
 could share a store from 3.2.0; Codex and Claude Code join in 3.3.0. An agent that is not
@@ -49,16 +49,16 @@ The package is `hermes-scope-recall` on PyPI. Install it into the same isolated 
 environment the host uses:
 
 ```text
-python -m pip install hermes-scope-recall==3.4.9
-python -m pip install "hermes-scope-recall[codex]==3.4.9"
+python -m pip install hermes-scope-recall==3.4.10
+python -m pip install "hermes-scope-recall[codex]==3.4.10"
 ```
 
-This fork's `3.4.9.2` build is installed from a wheel file built out of this branch
+This fork's `3.4.10.1` build is installed from a wheel file built out of this branch
 (`python -m pip install <path-to-wheel>`); the PyPI package and the release below carry
 upstream's `3.4.8`.  The fork numbers its own releases as upstream plus a fourth digit.
 
 The same wheel and sdist are attached to the
-[GitHub Release](https://github.com/410979729/scope-recall-hermes/releases/tag/v3.4.9)
+[GitHub Release](https://github.com/410979729/scope-recall-hermes/releases/tag/v3.4.10)
 alongside `SHA256SUMS` and `RELEASE-PROVENANCE.json`, for an offline install
 (`python -m pip install "<path-to-wheel>"`). To build it yourself from this checkout instead:
 
@@ -74,7 +74,7 @@ The two console names `scope-recall` and `hermes-scope-recall` invoke the same v
 
 Use explicit absolute paths for installation planning. Hermes `--agent-id` must match the host active profile (`get_active_profile_name()`, commonly `default` on an isolated home). Hermes default `--agent-workspace` is `hermes` to match the host memory-provider init contract; pass the same value on plan and apply if you override it. Codex does not accept `--agent-workspace`.
 
-If you talk to Hermes through the Desktop app or `hermes --tui` rather than the CLI, add `--local-platform desktop` (or `tui`) to both commands. Those surfaces name no user unless a dashboard login exists, and a session that names no user is refused everywhere but the CLI until the installer approves the surface; [docs/install.md](docs/install.md) says what the approval does and does not cover. Hermes Desktop also builds
+If you talk to Hermes through the Desktop app or `hermes --tui` rather than the CLI, add `--local-platform desktop` (or `tui`) to both commands. Those surfaces name no user unless a dashboard login exists, and a session that names no user is refused everywhere but the CLI until the installer approves the surface; [docs/install.md](docs/install.md) says what the approval does and does not cover. If you reach the host through a dashboard login instead (`hermes serve` with `dashboard.basic_auth`, the Desktop app on another machine), the session is that login: approve it as yours with `--owner-login desktop=basic:<name>`. Hermes Desktop also builds
 the Python environment it runs plugins in, and builds it again on updates: pass it
 `--target-plugin-dir <home>\plugins\scope-recall`, where Hermes finds the plugin and the core it declares
 even after a rebuild dropped the core (section 1 of [docs/install.md](docs/install.md)).

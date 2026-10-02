@@ -2,6 +2,60 @@
 
 All notable changes to `scope-recall` will be documented in this file.
 
+## [3.4.10.1] - 2026-10-02
+
+**Fork release.** Upstream v3.4.10 is merged over v3.4.9 (33 files, +1628/-180): a session's hooks no longer wait
+out Hermes' hook timeout (#169), a dashboard login's sessions are stored and recalled (#175), and on a host that
+hands its packages over on `PYTHONPATH` the LanceDB helper starts (#176).  This fork keeps its qdrant backend, its
+own accounting and warm-up, and the changes below.
+
+`_log_vector_loss` and `_warm_query_route` are re-applied over upstream's rewritten prefetch (it now recalls
+outside the adapter lock): the accounting line still names where a lost vector channel's window went, and the
+query route is still warmed before the recall needs it when the last recall was more than a minute ago.
+
+### Upgrading from 3.4.9.2
+
+1. Stop the hosts and the Scope Recall worker, and take a `backup`.
+2. Install the 3.4.10.1 package, then run `plan-install` and `apply-install` for each host.
+3. Start the hosts again and run `doctor`.
+
+The store's schema is unchanged (1110).
+
+## [3.4.10] - 2026-10-01
+
+3.4.10 fixes three faults reported on GitHub, all on Hermes. A session's hooks could wait out Hermes' hook timeout and then be skipped for every session (#169). The sessions of a dashboard login were never stored or recalled, and nothing said so (#175). On a host that hands its packages over on `PYTHONPATH`, the LanceDB helper could not start, so the vector search was dead (#176). Our own five gateways were not exposed to #175 or #176, and met #169 rarely.
+
+### Hermes hooks (#169)
+
+- Each Hermes session has its own lock, and a hook waited for it without a bound. The lock was held through a prefetch's recall, which Hermes stops waiting for after 8 s and lets run on, and through the writing of the whole previous turn. A hook waited out past Hermes' 30 s hook timeout was abandoned. Scope Recall registers one callback per hook for the whole gateway, so Hermes 0.21.5 then skipped that hook for every session for a minute. Our five gateways logged 18 hook timeouts and 19 skips from 2026-09-20 to 2026-10-01; the reporter, with 7 to 15 sessions at once, 247 skips in ten days.
+- A hook now waits for its own session at most a third of the host's timeout, 10 s at most. One it cannot wait for in that time returns, and is counted and logged with what holds the session.
+- The prefetch reads the turn's state under a wait of at most 2 s and recalls without the lock. The end of a turn is written one capture at a time with the lock released, so the next turn can start meanwhile. Its message and reply are dated when its writing began, and a shutdown waits until it is written.
+- The callbacks are named `scope_recall_<hook>`, so Hermes' own timeout and skip lines name them. A hook that still outlives the host's timeout logs a warning. Both counts show in the `status` tool. The bounds and the log lines are in [docs/configuration.md](docs/configuration.md).
+- A skipped `pre_llm_call` leaves its turn id for the turn's start, so the turn's interim messages are still matched to it. With Hermes' hook timeout set to 0 or less, which Hermes reads as none, a hook waits at most 10 s and nothing reports a skip.
+- Not done: a hook that cannot wait is not kept to be written later. A skipped tool hook loses that tool's result and a skipped `api_request_error` its failure mark; the turn's message and reply are still stored when it ends.
+
+### Dashboard logins (#175)
+
+- Hermes passes a desktop or tui session's dashboard login (`basic:<name>`) as its user and names no chat. No owner grant could match that route, and no installer option approved a login. Every session of someone working through the desktop client with basic auth stored and recalled nothing. Nothing said so: Hermes reads none of the adapter's gaps, and `doctor` stayed healthy.
+- On desktop or tui, a login whose host names no chat is now a one-to-one chat with that login (`private`, the login, thread `main`), the way an owner grant is written. An unapproved login gets no owner grant: only what an audience row on its route gives it, like any gateway user. The session that names no user, the CLI and the platforms that name their chats are unchanged.
+- `apply-install --owner-login <platform>=<login>` approves a login as the owner's own, on desktop or tui. It is Hermes only, and refused on a shared store entry, like `--local-platform`. See [docs/install.md](docs/install.md), which also warns that a dashboard served to other machines runs its Chat tab as a session that names no user.
+- A desktop or tui session that binds no memory scope logs one warning, with its platform, its login, its gaps and what to do, never what was said. A gateway chat left unmapped stays silent, as before.
+- `doctor` reports an owner grant whose user is no owner principal: `audience_owner_unverified`, `attention`, counted by platform.
+- Upgrade note: a hand-written audience row for a desktop or tui login with an empty chat no longer matches, and such a session now logs the warning. Rewrite the row's chat to `private`, the login and thread `main`. Approve the login with `--owner-login` only if it is the owner's own.
+
+### LanceDB helper (#176)
+
+- The helper runs isolated (`-I`), which keeps `PYTHONPATH` off its path. Hermes Desktop's package manager starts a bundled Python and hands its packages over on `PYTHONPATH`. There the helper died at its first import, before it answered. Every embed and every vector search failed as `worker_failed`, recall fell back to words, and only `doctor`'s `vector_unavailable` said anything.
+- The host now hands the helper the directories it imports `jsonschema`, LanceDB, PyArrow and numpy from, and nothing else of its path. The helper stays isolated.
+- When the worker cannot open the vector store because its helper ended before answering, it runs the start-up once more. That run is sent no request, so it holds no memory text. Its last error line, paths removed, goes into the `worker_error` that `doctor` shows. The worker's gap now names the fault: `vector_unavailable:RuntimeError:worker_failed`.
+
+### Upgrading from 3.4.9
+
+1. Stop the hosts and the Scope Recall worker, and take a `backup`.
+2. Install the 3.4.10 package, then run `plan-install` and `apply-install` for each host.
+3. Start the hosts again and run `doctor`.
+
+The store's schema is unchanged (1110). Every change, with its details, is in [CHANGELOG.md](https://github.com/410979729/scope-recall-hermes/blob/v3.4.10/CHANGELOG.md).
 ## [3.4.9.2] - 2026-10-01
 
 **Fork release.** The first query embedding after idle is asked for before the recall needs it, and the search waits
@@ -456,7 +510,7 @@ The store's schema is unchanged (1110), so a 3.3.x process can still open it. Ev
 - The deferred-source probe asks for the newest revision, as the page does: nothing clears an older revision's marker, so one started the page's scan of every source on every pass.
 - The secret screen lets through what cannot be a credential after "password", "secret", "token" or "api key": a placeholder (`<your-api-key>`, `${API_KEY}`, `$API_KEY`, `%API_KEY%`, `{api_key}`, `[REDACTED]`), a mask or an empty string, a type or a null in code (`def login(user: str, password: str)`, `Optional[str]`, `None`), a word that says what the value is ("password: reset it from the login page", `required`, `see`), a call or subscript on a lower-case name (`os.environ["KEY"]`) or a dotted name (`settings.DB_PASSWORD`), and after "is" a short list of words ("the password is required", "the secret is out"). Each such message was refused and never stored, and a model request carrying one was refused as `sensitive_request`. Anything else still counts, in any script: `$unshine2024`, `[hunter2]`, "my password is iloveyou", "password: correct horse battery staple". The name before `token` is at most 64 characters, so a long hyphenated line scans in linear time (it took 18 s for 60,000 characters).
 - A recall's query is screened whole before it is embedded: the request guard saw only what the input bound keeps, so a key across the cut went out in part.
-- Hermes: `post_llm_call` no longer takes the adapter lock. Hermes calls it before it sends the reply, and the reply waited behind whatever held the lock, a capture on a busy store or a recall; a callback Hermes gave up on (30 s) was skipped for the rest of the session. It writes nothing and keeps its copy under a small lock of its own.
+- Hermes: `post_llm_call` no longer takes the adapter lock. Hermes calls it before it sends the reply, and the reply waited behind whatever held the lock, a capture on a busy store or a recall; a callback Hermes gave up on (30 s) was then skipped for 60 s (Hermes 0.21.5), and for every session of the gateway, since Scope Recall registers one callback per hook. It writes nothing and keeps its copy under a small lock of its own.
 - Hermes: a turn writes at most 64 of the messages it showed between tool calls, the first ones, and says `capture_gap:interim_limit` and logs a warning past that. Each is its own write after the reply, under the adapter lock; a turn of 300 tool steps held that lock for minutes.
 - Remote entries: a request the server refuses for good (HTTP 400 or 413) is dropped from the client's spool and logged. Kept, it stopped every later flush until 256 newer hooks pushed it out. A store error answers 500 now, not 400, so the client keeps that hook to send again.
 - Remote entries: a hook whose message the busy store could not take is kept in the client's spool and sent again; the server answered 200 whatever became of the capture, and the client took that as delivered. The server log says `not stored, to be sent again`.
