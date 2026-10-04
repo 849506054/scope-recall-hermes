@@ -1,8 +1,9 @@
-"""Private stdlib HTTPS worker for the bounded auxiliary transport."""
+"""Private stdlib HTTP worker for the bounded auxiliary transport."""
 from __future__ import annotations
 
 import base64
 import http.client
+import ipaddress
 import json
 import math
 import select
@@ -16,6 +17,35 @@ import urllib.request
 
 MAX_REQUEST_BYTES = 3 * 1024 * 1024
 _REQUEST_KEYS = frozenset({"url", "body_b64", "headers", "timeout_seconds", "max_response_bytes"})
+
+#: Networks a cleartext ``http://`` request may address.  A local gateway or a
+#: locally served model is a real deployment, and TLS is not available there;
+#: the risk that the original https-only rule guards against is a credential
+#: and a memory in flight across a network the owner does not control, so
+#: cleartext is permitted to loopback and private addressing and nowhere else.
+_PLAIN_HTTP_NETWORKS = (
+    ipaddress.ip_network("127.0.0.0/8"),
+    ipaddress.ip_network("::1/128"),
+    ipaddress.ip_network("10.0.0.0/8"),
+    ipaddress.ip_network("172.16.0.0/12"),
+    ipaddress.ip_network("192.168.0.0/16"),
+    ipaddress.ip_network("169.254.0.0/16"),
+    ipaddress.ip_network("fe80::/10"),
+)
+
+
+def _plain_http_target_allowed(hostname: str) -> bool:
+    """Whether cleartext may address this host: a loopback or private literal, or
+    a name reserved for the local network.  A public name is refused rather
+    than resolved, because this worker does no DNS and a name it cannot
+    adjudicate is exactly the one the exception must not cover."""
+    if hostname == "localhost" or hostname.endswith((".localhost", ".local")):
+        return True
+    try:
+        address = ipaddress.ip_address(hostname)
+    except ValueError:
+        return False
+    return any(address in network for network in _PLAIN_HTTP_NETWORKS)
 
 
 class _Failure(Exception):
@@ -62,6 +92,20 @@ def _resolve_http_proxy(target_hostname: str) -> tuple[str, int, dict[str, str]]
     return parsed.hostname, port, _proxy_authorization_from_url(proxy_url)
 
 
+def _open_connection(parsed, deadline: float) -> http.client.HTTPConnection:
+    """The bounded connection for a validated request.
+
+    Cleartext goes straight to its target: the hosts it may address are on this
+    machine's own network, which a proxy configured for internet egress has no
+    business carrying.  TLS is tunnelled through that proxy when one applies."""
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError
+    if parsed.scheme == "http":
+        return http.client.HTTPConnection(parsed.hostname, parsed.port or 80, timeout=remaining)
+    return _open_https_connection(parsed.hostname, parsed.port or 443, deadline=deadline)
+
+
 def _open_https_connection(target_hostname: str, target_port: int, *, deadline: float) -> http.client.HTTPSConnection:
     remaining = deadline - time.monotonic()
     if remaining <= 0:
@@ -94,7 +138,9 @@ def _parse_request(raw: bytes) -> tuple[urllib.parse.ParseResult, bytes, dict[st
         parsed = urllib.parse.urlparse(url)
     except ValueError:
         raise _Failure("endpoint_invalid") from None
-    if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
+    if parsed.scheme not in ("http", "https") or not parsed.hostname or parsed.username or parsed.password:
+        raise _Failure("endpoint_invalid")
+    if parsed.scheme == "http" and not _plain_http_target_allowed(parsed.hostname):
         raise _Failure("endpoint_invalid")
     body_b64, headers = request["body_b64"], request["headers"]
     timeout_seconds, max_response_bytes = request["timeout_seconds"], request["max_response_bytes"]
@@ -142,7 +188,8 @@ def _take_connection(parsed, headers: dict[str, str], deadline: float, connectio
     A persistent worker keeps at most one connection; anything cached for a
     different key is closed rather than left half-open.
     """
-    cache_key = (parsed.hostname, parsed.port or 443, tuple(sorted(headers.items())))
+    cache_key = (parsed.scheme, parsed.hostname, parsed.port or (80 if parsed.scheme == "http" else 443),
+                 tuple(sorted(headers.items())))
     connection = None
     try:
         if connections is not None:
@@ -154,13 +201,13 @@ def _take_connection(parsed, headers: dict[str, str], deadline: float, connectio
                 connection.close()
                 connection = None
         if connection is None:
-            connection = _open_https_connection(parsed.hostname, parsed.port or 443, deadline=deadline)
+            connection = _open_connection(parsed, deadline)
     except ValueError:
         raise _Failure("http_protocol") from None
     return cache_key, connection
 
 
-def _arm(connection: http.client.HTTPSConnection, deadline: float) -> float:
+def _arm(connection: http.client.HTTPConnection, deadline: float) -> float:
     """Fail now if the deadline passed; otherwise bound the next socket operation by it."""
     remaining = deadline - time.monotonic()
     if remaining <= 0:
@@ -176,7 +223,7 @@ def _request(raw: bytes, connections: dict | None = None) -> bytes:
     except _Failure as failure:
         return _result(ok=False, error=failure.error)
     deadline = time.monotonic() + timeout_seconds
-    connection: http.client.HTTPSConnection | None = None
+    connection: http.client.HTTPConnection | None = None
     chunks: list[bytes] = []
     status: int | None = None
     reusable = False
@@ -221,7 +268,7 @@ def _request(raw: bytes, connections: dict | None = None) -> bytes:
     finally:
         if connection is not None:
             if reusable and connections is not None:
-                connection.scope_recall_idle_since = time.monotonic()
+                setattr(connection, "scope_recall_idle_since", time.monotonic())
                 connections[cache_key] = connection
             else:
                 connection.close()

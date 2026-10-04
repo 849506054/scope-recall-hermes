@@ -4,6 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from functools import partial
 import base64
+import ipaddress
 import json
 import math
 import os
@@ -174,11 +175,60 @@ def _hidden_window() -> dict[str, Any]:
     return {"startupinfo": startupinfo, "creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0)}
 
 
+#: Cleartext HTTP is for a model or gateway served on the operator's own network,
+#: where TLS is often unavailable.  The worker repeats this list in
+#: ``runtime/_http_worker.py``; it runs isolated (``-I``) and imports nothing from
+#: the package, so the two copies cannot be shared.  Keep them equal.
+_PLAIN_HTTP_NETWORKS = (
+    ipaddress.ip_network("127.0.0.0/8"),
+    ipaddress.ip_network("::1/128"),
+    ipaddress.ip_network("10.0.0.0/8"),
+    ipaddress.ip_network("172.16.0.0/12"),
+    ipaddress.ip_network("192.168.0.0/16"),
+    ipaddress.ip_network("169.254.0.0/16"),
+    ipaddress.ip_network("fe80::/10"),
+)
+
+
+def plain_http_target_allowed(hostname: str) -> bool:
+    """Whether a cleartext ``http://`` request may address this host.
+
+    A loopback or private literal, or a name reserved for the local network.  A
+    public name is refused rather than resolved: this layer does no DNS, and a
+    name it cannot adjudicate is the one the exception must not cover.
+    """
+    if hostname == "localhost" or hostname.endswith((".localhost", ".local")):
+        return True
+    try:
+        address = ipaddress.ip_address(hostname)
+    except ValueError:
+        return False
+    return any(address in network for network in _PLAIN_HTTP_NETWORKS)
+
+
+def _endpoint_scheme_allowed(endpoint: object) -> bool:
+    """Whether a configured endpoint is a URL this transport may address: TLS
+    anywhere, cleartext only to a local target."""
+    if type(endpoint) is not str:
+        return False
+    if endpoint.startswith("https://"):
+        return True
+    if not endpoint.startswith("http://"):
+        return False
+    try:
+        hostname = urllib.parse.urlparse(endpoint).hostname
+    except ValueError:
+        return False
+    return bool(hostname) and plain_http_target_allowed(hostname)
+
+
 def _worker_request(url: str, *, body: bytes, headers: Mapping[str, str], budget: float,
                     max_response_bytes: int) -> bytes:
     """The one request line the worker accepts, validated before any process starts."""
     parsed = urllib.parse.urlparse(url)
-    if parsed.scheme != "https" or not parsed.hostname:
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        raise AuxiliaryModelError("endpoint_invalid")
+    if parsed.scheme == "http" and not plain_http_target_allowed(parsed.hostname):
         raise AuxiliaryModelError("endpoint_invalid")
     if not _HTTP_WORKER_PATH.is_file():
         raise AuxiliaryModelError("transport_unavailable")
@@ -790,7 +840,7 @@ class ConsolidationRouteConfig:
     def __post_init__(self) -> None:
         if type(self.model) is not str or not self.model:
             raise ValueError("model")
-        if type(self.endpoint) is not str or not self.endpoint.startswith("https://"):
+        if not _endpoint_scheme_allowed(self.endpoint):
             raise ValueError("endpoint")
         _validate_credential_env_name(self.credential_env)
         if self.output_limit_field not in {"max_tokens", "max_completion_tokens"}:
@@ -852,7 +902,7 @@ class ResponsesRouteConfig:
     def __post_init__(self) -> None:
         if type(self.model) is not str or not self.model:
             raise ValueError("model")
-        if type(self.endpoint) is not str or not self.endpoint.startswith("https://"):
+        if not _endpoint_scheme_allowed(self.endpoint):
             raise ValueError("endpoint")
         _validate_credential_env_name(self.credential_env)
         if type(self.max_output_tokens) is not int or not 1 <= self.max_output_tokens <= 131_072:

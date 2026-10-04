@@ -2,6 +2,25 @@
 
 All notable changes to `scope-recall` will be documented in this file.
 
+## [3.4.10.2] - 2026-10-04
+
+**Fork release.** A new capability, not a relaxed guard: the auxiliary routes may now address a
+model or gateway served on the operator's own network over cleartext `http://`, which is how a
+locally deployed model and a local gateway are actually reached.
+
+`ConsolidationRouteConfig` and `ResponsesRouteConfig` accept an `http://` endpoint, the parent
+process admits the same scheme, and the worker opens a plain connection for it instead of a TLS
+one.  Cleartext is bounded to loopback and private addressing (RFC1918 and IPv6 equivalents,
+link-local) and to the names reserved for the local network; any other cleartext target is still
+`endpoint_invalid`, and a non-HTTP scheme is still refused.  Nothing about a public `https://`
+endpoint changes, so an existing install is unaffected.
+
+### Upgrading from 3.4.10.1
+
+1. Stop the hosts and the Scope Recall worker, and take a `backup`.
+2. Install the 3.4.10.2 package, then run `plan-install` and `apply-install` for each host.
+3. Start the hosts again and run `doctor`.
+
 ## [3.4.10.1] - 2026-10-02
 
 **Fork release.** Upstream v3.4.10 is merged over v3.4.9 (33 files, +1628/-180): a session's hooks no longer wait
