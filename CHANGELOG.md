@@ -2,6 +2,18 @@
 
 All notable changes to `scope-recall` will be documented in this file.
 
+## [3.4.10.3] - 2026-10-05
+
+**Fork release.** A route may now state the proxy its own requests leave through. The embedding
+route accepts `proxy_url`, and the helper that carries those requests is the only process given it:
+the rest of the runtime, and every other process on the host, keeps the egress path it had. A
+deployment whose endpoint is only reachable through a proxy no longer has to give the whole runtime
+one to reach it.
+
+The helper tunnels a TLS target through an `http://` proxy and opens a cleartext one directly, so a
+route that states no proxy is unchanged. Routing is not geometry: the space digest does not move and
+no vector is re-embedded.
+
 ## [3.4.10.2] - 2026-10-04
 
 **Fork release.** A new capability, not a relaxed guard: the auxiliary routes may now address a

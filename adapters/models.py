@@ -222,6 +222,23 @@ def _endpoint_scheme_allowed(endpoint: object) -> bool:
     return bool(hostname) and plain_http_target_allowed(hostname)
 
 
+def _proxy_url_allowed(proxy_url: object) -> bool:
+    """Whether a configured egress proxy is one the worker can carry TLS through.
+
+    The helper tunnels an ``https://`` target through an ``http://`` proxy and
+    refuses every other scheme, so a route may state only that shape: a setting
+    the helper would reject belongs at load time, not in a failed request.
+    """
+    if type(proxy_url) is not str or not proxy_url.startswith("http://"):
+        return False
+    try:
+        parsed = urllib.parse.urlparse(proxy_url)
+        port = parsed.port
+    except ValueError:
+        return False
+    return bool(parsed.hostname) and (port is None or 1 <= port <= 65535)
+
+
 def _worker_request(url: str, *, body: bytes, headers: Mapping[str, str], budget: float,
                     max_response_bytes: int) -> bytes:
     """The one request line the worker accepts, validated before any process starts."""
@@ -286,10 +303,24 @@ def _worker_reply(stdout: bytes, max_response_bytes: int) -> tuple[int, bytes]:
 class HttpsTransport:
     """Bounded HTTPS POST; query callers may own a persistent stdlib worker."""
 
-    def __init__(self, *, persistent: bool = False):
+    def __init__(self, *, persistent: bool = False, proxy_url: str | None = None):
         from ..runtime.http_session import HttpWorkerSession
         self._session = HttpWorkerSession() if persistent else None
         self._post_lock = threading.Lock()
+        self._proxy_url = proxy_url
+
+    def _worker_environment(self) -> dict[str, str] | None:
+        """The environment the helper runs with, or ``None`` to inherit this one.
+
+        Only ``HTTPS_PROXY`` is stated: the helper tunnels a TLS target through
+        it and opens a cleartext one directly, so a proxy configured for
+        internet egress cannot carry a request to a local model.  The variable
+        reaches this helper alone -- the parent's own environment, and every
+        other process on the host, is left as it was.
+        """
+        if self._proxy_url is None:
+            return None
+        return {**os.environ, "HTTPS_PROXY": self._proxy_url}
 
     def close(self):
         if self._session is not None:
@@ -333,6 +364,7 @@ class HttpsTransport:
         request_bytes = _worker_request(url, body=body, headers=headers, budget=budget,
                                         max_response_bytes=max_response_bytes)
         command = [sys.executable, "-I", "-B", str(_HTTP_WORKER_PATH)]
+        environment = self._worker_environment()
         max_stdout = (max_response_bytes * 4) // 3 + _HTTP_WORKER_STDOUT_MARGIN
         process: subprocess.Popen[bytes] | None = None
         try:
@@ -340,12 +372,13 @@ class HttpsTransport:
                 raise AuxiliaryModelError("timeout")
             if self._session is not None:
                 stdout, stderr = self._session.exchange(
-                    command, request_bytes, deadline=deadline, max_stdout=max_stdout, **_hidden_window(),
+                    command, request_bytes, deadline=deadline, max_stdout=max_stdout,
+                    environment=environment, **_hidden_window(),
                 )
             else:
                 process = subprocess.Popen(
                     command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                    **_hidden_window(),
+                    env=environment, **_hidden_window(),
                 )
                 remaining = _remaining_seconds(deadline)
                 if remaining <= 0:
@@ -797,6 +830,14 @@ class EmbeddingRouteConfig:
     #: name is the only lever.  A wire detail, not a geometry: it does not enter
     #: the space digest, and the response length is still checked.
     dimensions_field: str = "dimensions"
+    #: The proxy this route's requests leave through, when the operator's own
+    #: network reaches the endpoint that way.  It is stated here, not in the
+    #: environment the whole host shares, because the helper that carries these
+    #: requests is the only process that has to know: nothing else on the host
+    #: gains an egress proxy by this being set.  Routing, not geometry -- it
+    #: does not enter the space digest, and a route that names none is
+    #: unchanged.
+    proxy_url: str | None = None
 
     def __post_init__(self) -> None:
         _validate_credential_env_name(self.credential_env)
@@ -809,6 +850,8 @@ class EmbeddingRouteConfig:
             raise ValueError("embedding_route_dialect")
         if type(self.dimensions_field) is not str or not _REQUEST_FIELD_RE.fullmatch(self.dimensions_field):
             raise ValueError("embedding_route_dimensions_field")
+        if self.proxy_url is not None and not _proxy_url_allowed(self.proxy_url):
+            raise ValueError("embedding_route_proxy_url")
 
     def space(self) -> dict:
         """The embedding space this route addresses, defaults included."""
@@ -1014,8 +1057,11 @@ class GeminiEmbeddingAdapter:
     ) -> None:
         self._route = route
         self._ledger = ledger
-        self._transport = transport if transport is not None else HttpsTransport()
-        self._query_transport = transport if transport is not None else HttpsTransport(persistent=True)
+        self._transport = transport if transport is not None else HttpsTransport(proxy_url=route.proxy_url)
+        self._query_transport = (
+            transport if transport is not None
+            else HttpsTransport(persistent=True, proxy_url=route.proxy_url)
+        )
         self._owns_transport = transport is None
         space = route.space()
         self._space = space

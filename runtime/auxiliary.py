@@ -178,8 +178,12 @@ def _embedding_route_from_mapping(raw: object) -> EmbeddingRouteConfig | None:
     # shipped Gemini space, or state all four to address another provider.
     # EmbeddingRouteConfig rejects a partial descriptor.
     # The width's field name is a wire detail of the openai dialect, optional on its own.
-    wire = {} if raw.get("dimensions_field") is None else {
-        "dimensions_field": text("embedding_dimensions_field", raw.get("dimensions_field"))}
+    # So is the egress proxy: it routes this route's helper, and states no geometry.
+    wire: dict[str, Any] = {}
+    if raw.get("dimensions_field") is not None:
+        wire["dimensions_field"] = text("embedding_dimensions_field", raw.get("dimensions_field"))
+    if raw.get("proxy_url") is not None:
+        wire["proxy_url"] = text("embedding_proxy_url", raw.get("proxy_url"))
     if all(raw.get(key) is None for key in ("model", "endpoint", "dimensions", "dialect")):
         return EmbeddingRouteConfig(credential_env=credential_env, **wire)
     return EmbeddingRouteConfig(

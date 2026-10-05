@@ -279,6 +279,7 @@ C:\path\to\python.exe -c "import json, pathlib; from scope_recall.runtime import
 | `dimensions` | int, 8–16384 | absent | Vector width. It is sent in the request and the response length is checked against it. |
 | `dialect` | `"gemini"` or `"openai"` | absent | Wire shape. See the next section. |
 | `dimensions_field` | string, a JSON field name | `"dimensions"` | The request field the `openai` dialect sends the width in. Voyage calls it `output_dimension` and refuses `dimensions`. A wire detail: it does not change the embedding space. |
+| `proxy_url` | `http://` URL with a host and an optional port | absent | Egress proxy for this route's requests. The helper that carries them tunnels TLS through it and opens cleartext targets directly; no other process on the host gains a proxy. Routing, not geometry: it does not change the embedding space. |
 
 `model`, `endpoint`, `dimensions` and `dialect` move together. Omit all four and
 the route addresses the shipped Gemini space, so an existing installation keeps
@@ -286,6 +287,11 @@ its vector directory. State all four to address another provider. State some but
 not all and the file is refused with `embedding_route_partial_space`, because
 half a descriptor would silently mix a new model with the old width or dialect
 and the digest would not reveal it.
+
+`proxy_url` is optional on its own and states where this route's requests leave
+through when the endpoint is reached over a proxy. Only the helper that carries
+those requests is given it, so the rest of the runtime keeps its own egress
+path; a route that omits it behaves exactly as before.
 
 ### `auxiliary.consolidation`
 

@@ -7,7 +7,6 @@ from io import BytesIO
 import json
 import os
 from pathlib import Path
-import sys
 import time
 
 import pytest
@@ -335,3 +334,49 @@ def test_the_helper_does_not_reuse_a_connection_idle_past_its_limit(tmp_path, mo
             server.shutdown()
             server.server_close()
             thread.join(timeout=2)
+
+
+def _environment_reporting_worker(tmp_path: Path) -> Path:
+    """A synthetic helper that answers every request with the egress proxy it was given."""
+    worker = tmp_path / "environment_reporting_worker.py"
+    _write_worker(
+        worker,
+        "import base64, json, os, sys\n"
+        "reply = json.dumps({'ok': True, 'status': 200,\n"
+        "                    'body_b64': base64.b64encode(\n"
+        "                        os.environ.get('HTTPS_PROXY', '').encode('utf-8')).decode('ascii')},\n"
+        "                   separators=(',', ':')) + '\\n'\n"
+        "while True:\n"
+        "    line = sys.stdin.buffer.readline()\n"
+        "    if not line:\n"
+        "        break\n"
+        "    sys.stdout.write(reply)\n"
+        "    sys.stdout.flush()\n",
+    )
+    return worker
+
+
+def _proxy_post(transport):
+    return transport.post("https://synthetic.invalid/embed", body=b"body",
+                          headers={"X-Synthetic": "ok"}, timeout_seconds=2.0, max_response_bytes=1024)
+
+
+def test_only_a_transport_that_names_a_proxy_gives_its_helper_one(tmp_path, monkeypatch) -> None:
+    """The proxy is the transport's, not the host's: the helper that carries this route's requests is the
+    only process that sees it, both when it is kept for queries and when it is started per request."""
+    worker = _environment_reporting_worker(tmp_path)
+    monkeypatch.setattr(models, "_HTTP_WORKER_PATH", worker)
+    monkeypatch.delenv("HTTPS_PROXY", raising=False)
+
+    assert _proxy_post(models.HttpsTransport()) == (200, b"")
+
+    persistent = models.HttpsTransport(persistent=True, proxy_url="http://proxy.local:7890")
+    try:
+        assert _proxy_post(persistent) == (200, b"http://proxy.local:7890")
+        assert _proxy_post(persistent) == (200, b"http://proxy.local:7890")
+    finally:
+        persistent.close()
+
+    assert _proxy_post(models.HttpsTransport(proxy_url="http://proxy.local:7890")) == (200, b"http://proxy.local:7890")
+    assert "HTTPS_PROXY" not in os.environ
+

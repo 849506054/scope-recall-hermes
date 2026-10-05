@@ -5,6 +5,7 @@ from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal
 import hashlib
 import json
+import os
 import sqlite3
 from pathlib import Path
 from threading import Barrier
@@ -1380,3 +1381,58 @@ def test_uncapped_policy_still_refuses_a_metered_breach(tmp_path):
         db.execute("UPDATE requests SET status='meter_breach'")
     with pytest.raises(ValueError, match="budget_exhausted_or_meter_breach"):
         _reserve(ledger, uncapped, "deepseek-v4-flash")
+
+
+def test_embedding_route_states_an_egress_proxy_for_its_helper(tmp_path, monkeypatch):
+    """The proxy belongs to the route, not to the host: it reaches this route's own helpers and leaves
+    the environment every other process shares alone."""
+    monkeypatch.setenv("SCOPE_RECALL_TEST_EMBED_KEY", "synthetic-local-value")
+    monkeypatch.delenv("HTTPS_PROXY", raising=False)
+    config, _, _ = _runtime_config(tmp_path, embedding={
+        "credential_env": "SCOPE_RECALL_TEST_EMBED_KEY",
+        "proxy_url": "http://proxy.local:7890",
+    })
+
+    runtime = build_auxiliary_runtime(config)
+    try:
+        adapter = runtime.query_embedding
+        for transport in (adapter._transport, adapter._query_transport):
+            assert transport._worker_environment()["HTTPS_PROXY"] == "http://proxy.local:7890"
+    finally:
+        runtime.close()
+    assert "HTTPS_PROXY" not in os.environ
+
+
+def test_embedding_route_without_a_proxy_leaves_the_environment_alone(tmp_path, monkeypatch):
+    monkeypatch.setenv("SCOPE_RECALL_TEST_EMBED_KEY", "synthetic-local-value")
+    monkeypatch.delenv("HTTPS_PROXY", raising=False)
+    config, _, _ = _runtime_config(tmp_path)
+
+    assert config.embedding.proxy_url is None
+    runtime = build_auxiliary_runtime(config)
+    try:
+        adapter = runtime.query_embedding
+        for transport in (adapter._transport, adapter._query_transport):
+            assert transport._worker_environment() is None
+    finally:
+        runtime.close()
+
+
+@pytest.mark.parametrize(
+    "proxy_url",
+    [
+        "socks5://proxy.local:1080",
+        "https://proxy.local:7890",
+        "proxy.local:7890",
+        "http://",
+        "http://proxy.local:99999",
+    ],
+)
+def test_embedding_route_rejects_a_proxy_the_helper_cannot_use(tmp_path, proxy_url):
+    """The helper tunnels TLS through an ``http://`` proxy and refuses any other scheme, so a route
+    stating one the helper would reject is refused where the setting is read, not per request."""
+    with pytest.raises(ValueError, match="embedding_route_proxy_url"):
+        _runtime_config(tmp_path, embedding={
+            "credential_env": "SCOPE_RECALL_TEST_EMBED_KEY",
+            "proxy_url": proxy_url,
+        })
