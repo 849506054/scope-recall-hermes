@@ -65,6 +65,18 @@ ANSWER_MARGIN_SECONDS = 0.3
 #: a few seconds on a large store), and the share of its time a recall that comes meanwhile waits for that.
 WARM_SECONDS = 60.0
 WARM_WAIT_SHARE = 0.5
+#: What a server's start may spend warming its query embedding.  The warming holds the kept handler, and a provider or
+#: proxy that took the connection and hung kept every recall off it for the whole ``WARM_SECONDS`` (review of 3.6.0rc1).
+EMBEDDING_WARM_SECONDS = 10.0
+#: A kept handler left this long without a recall searches its vector store once more, off any prompt's time, and again
+#: after each such stretch.  The helper keeps the index in its memory, and a search touches the codes of every row its
+#: filter keeps (the warm search filters as a recall does: ``runtime/instance.py warm_vector_store``): left alone, the
+#: OS gave those pages to other work, and the first recall after an idle hour searched past its time.  This machine's
+#: Claude Code lost the vector search on 2 of the 4 prompts it had after an idle hour (2026-10-02), and on none of the 5
+#: it had while another process searched the same index every 10 minutes.
+KEEP_WARM_IDLE_SECONDS = 600.0
+#: How often a server looks whether its kept handler has been idle that long.
+KEEP_WARM_CHECK_SECONDS = 60.0
 #: What closing waits for a recall that holds the kept handler (a prompt's recall ends within its hook's time).
 CLOSE_WAIT_SECONDS = 10.0
 #: Recalls one server runs at once; a hook past that recalls itself.
@@ -72,6 +84,18 @@ MAX_CONCURRENT = 8
 #: How often a server looks for its own name, and puts it back when a hook removed it: a busy server that did not
 #: prove itself in time was left out for 30 s (review of rc11).
 ADVERTISE_SECONDS = 2.0
+#: Minutes a client's resident recall server (``resident_entry``) stays up without a recall when the entry's runtime
+#: config names none (``resident_recall_minutes``).  WorkBuddy starts the entry's MCP server with each conversation's
+#: agent process, so a prompt that started one met a server still opening its vector store: a cold server answered
+#: with its vector search 12.7 s after its start (measured 2026-10-03), past the prompt hook's 6 s.  Claude Code and
+#: Codex keep their server for as long as the client runs, and keep none.
+RESIDENT_DEFAULT_MINUTES = {"workbuddy": 120, "dsh": 120}
+#: How often a client starts a resident server when it finds none: a start warms for several seconds, and the next
+#: prompt's hook would otherwise start another meanwhile (the second gives way, ``resident_entry``).
+RESIDENT_START_EVERY_SECONDS = 60.0
+#: How often a client's live MCP server looks for the resident server, marks the client in use and starts one when none
+#: runs (``keep_resident``): within the shortest idle end, a minute.
+RESIDENT_KEEP_SECONDS = 30.0
 _NONCE = "X-Scope-Recall-Nonce"
 _PROOF = "X-Scope-Recall-Proof"
 
@@ -263,14 +287,20 @@ class Recaller:
         self.outcome = "none"
         request = {"payload": payload, "current_refs": list(current_refs), "gaps": list(gaps)}
         tried = 0
+        named = []
         for path in _named(endpoints(self.home)):
-            if tried >= MAX_TRIED or time.monotonic() - started > FIND_SECONDS:
-                break
             try:
                 info = json.loads(path.read_text(encoding="utf-8"))
                 port, token, pid = int(info["port"]), str(info["token"]), int(info["pid"])
             except (OSError, ValueError, KeyError, TypeError):
                 continue
+            named.append((path, info, port, token, pid))
+        # A resident server first, newest first within each kind (the sort keeps the order): it stays warm, while a
+        # server the client just started with a conversation may still be opening its vector store.
+        named.sort(key=lambda item: item[1].get("resident") is not True)
+        for path, info, port, token, pid in named:
+            if tried >= MAX_TRIED or time.monotonic() - started > FIND_SECONDS:
+                break
             try:
                 state = probe_process(pid)
             except (OSError, ValueError):
@@ -405,9 +435,16 @@ class KeptRecaller:
         self._made_with: object = None
         self._closed = False
         self._warming: threading.Event | None = None
+        #: When a recall or a warming last searched the handler's vector store (``_keep_warm``).
+        self._used = time.monotonic()
+        self._stopped = threading.Event()
+        self._keeping = False
+        #: A keep-warm search holds the handler: ``close`` does not wait for it, and it closes the handler itself.
+        self._searching = False
 
     def warm(self, seconds: float = WARM_SECONDS) -> None:
-        """Make the handler and warm its vector store in the background, when the server starts.
+        """Make the handler and warm its vector store in the background, when the server starts, then keep it warm
+        (``_keep_warm``) until the recaller is closed.
 
         Made at the first prompt, the handler attached its runtime, started the vector helper, opened the table and
         read the index inside that prompt's recall, and the first prompt after every start recalled by words alone:
@@ -415,8 +452,10 @@ class KeptRecaller:
         of making a second handler.  It writes nothing."""
         done = threading.Event()
         self._warming = done
+        keep = not self._keeping
+        self._keeping = True
 
-        def run() -> None:
+        def start() -> None:
             try:
                 with self._lock:
                     if self._closed or self._handler is not None:
@@ -428,18 +467,60 @@ class KeptRecaller:
                         self._handler.warm_vectors(seconds)
                     except Exception:  # noqa: BLE001 - the first recall opens what is not open, as before
                         pass
+                    # The query embedding route too, at the start only: warmed by the store alone, a cold server's
+                    # first recalls lost their vector search to the embedding's time (measured 2026-10-03).
+                    warm_embedding = getattr(self._handler, "warm_embedding", None)
+                    if callable(warm_embedding):
+                        try:
+                            warm_embedding(min(seconds, EMBEDDING_WARM_SECONDS))
+                        except Exception:  # noqa: BLE001 - a provider down now is the first recall's to report
+                            pass
                     if self._closed or not getattr(self._handler, "runtime_ready", False):
                         self._discard(later=True)
             except Exception:  # noqa: BLE001 - a handler that cannot be made now is made by the first recall
                 pass
             finally:
+                self._used = time.monotonic()
                 done.set()
                 if self._closed:
                     # A close during the warming did not wait for it (``close``): the handler it made is closed here.
                     with self._lock:
                         self._discard(later=True)
 
+        def run() -> None:
+            start()
+            if keep:
+                self._keep_warm(seconds)
+
         threading.Thread(target=run, name="scope-recall-kept-warm", daemon=True).start()
+
+    def _keep_warm(self, seconds: float) -> None:
+        """Search the kept handler's vector store again after each ``KEEP_WARM_IDLE_SECONDS`` no recall searched it,
+        until the recaller is closed.  A moment a recall holds the handler is skipped; no handler is made for it; it
+        writes nothing.  A search that failed is tried once more at once: one that found the vector helper gone closed
+        the store, and the second opens it again here, not inside the next prompt's recall.  Like the start's warming,
+        a search is not waited for by ``close``, and closes the handler itself when the recaller was closed."""
+        while not self._stopped.wait(KEEP_WARM_CHECK_SECONDS):
+            if time.monotonic() - self._used < KEEP_WARM_IDLE_SECONDS or not self._lock.acquire(blocking=False):
+                continue
+            self._searching = True
+            try:
+                for _attempt in range(2):
+                    if self._closed or self._handler is None:
+                        break
+                    try:
+                        self._handler.warm_vectors(seconds)
+                        break
+                    except Exception:  # noqa: BLE001 - tried once more, then left to the next recall as before
+                        continue
+                self._used = time.monotonic()
+            finally:
+                # Cleared before the recaller is looked at, both under the lock: a close that saw the search still
+                # running left the handler to it, and one that did not finds the lock free or the handler closed.
+                self._searching = False
+                if self._closed:
+                    self._discard(later=True)
+                self._lock.release()
 
     def __call__(self, payload: dict[str, Any], current_refs: tuple[str, ...], gaps: tuple[str, ...], budget: float,
                  *, received: float | None = None) -> tuple[dict[str, Any], dict[str, Any]] | None:
@@ -469,6 +550,10 @@ class KeptRecaller:
                 raise
             diagnostics = dataclasses.asdict(handler.diagnostics)
             diagnostics["capability_gaps"] = list(diagnostics.get("capability_gaps") or ())
+            if diagnostics.get("recall_vectors") is True:
+                # Only a recall that searched the index puts off the next keep-warm search: one whose query embedding
+                # failed (a provider or proxy outage) never reached it, and an hour of such prompts left it cold.
+                self._used = time.monotonic()
             if not getattr(handler, "runtime_ready", False):
                 self._discard(later=True)
             return result, diagnostics
@@ -488,11 +573,13 @@ class KeptRecaller:
             pass
 
     def close(self) -> None:
-        """Close the kept handler, once a recall that holds it is done; later recalls get None.  A warming that holds
-        it (up to ``WARM_SECONDS``) is not waited for: it sees the recaller closed and closes its handler itself."""
+        """Close the kept handler, once a recall that holds it is done; later recalls get None.  A warming or a
+        keep-warm search that holds it (up to ``WARM_SECONDS``) is not waited for: it sees the recaller closed and
+        closes its handler itself."""
         self._closed = True
+        self._stopped.set()
         warming = self._warming
-        if warming is not None and not warming.is_set():
+        if (warming is not None and not warming.is_set()) or self._searching:
             return
         if not self._lock.acquire(timeout=CLOSE_WAIT_SECONDS):
             return
@@ -507,9 +594,15 @@ class HookEndpoint:
 
     def __init__(self, home: Path | str, host: str, *, env_file: Path | None = None,
                  runtime_config: Path | None = None,
-                 credentials: Callable[[], dict[str, str]] | None = None) -> None:
+                 credentials: Callable[[], dict[str, str]] | None = None, resident: bool = False) -> None:
         self.home = Path(home)
         self.host = host
+        #: Said in the server's name: a resident server (``resident_entry``) runs apart from the MCP server of a
+        #: conversation (though WorkBuddy's agent still ends it with that conversation's process), and hooks ask it
+        #: before a server the client started for a conversation (``Recaller``).
+        self.resident = resident
+        #: When a prompt's recall last came in, for a resident server's idle end; keep-warm searches do not count.
+        self.last_used = time.monotonic()
         self.token = secrets.token_urlsafe(32)
         self.path = endpoints(home) / f"{os.getpid()}.json"
         self.port = 0
@@ -569,6 +662,8 @@ class HookEndpoint:
         another recall holds that, by one of its own that the caller closes once the answer is out.  Its time counts
         from the request's arrival, loading the handler included."""
         received = time.monotonic() if received is None else received
+        # Of two recalls at once, the one received first may come here last.
+        self.last_used = max(self.last_used, received)
         self._refresh_credentials()
         kept = self.kept(request["payload"], request["current_refs"], request["gaps"], request["remaining"],
                          received=received)
@@ -591,6 +686,12 @@ class HookEndpoint:
         with self.lock:
             return any(time.monotonic() > due for due in self.inflight.values())
 
+    def stuck_for(self) -> float:
+        """How long the oldest recall still running past its time has been so; 0 when none is."""
+        with self.lock:
+            now = time.monotonic()
+            return max((now - due for due in self.inflight.values() if now > due), default=0.0)
+
     def _advertise(self) -> None:
         from ..._version import __version__
         from ...runtime.process_probe import probe_process
@@ -601,7 +702,7 @@ class HookEndpoint:
             for part in (folder, folder.parent, folder.parent.parent):
                 part.chmod(0o700)
         record = {"host": self.host, "port": self.port, "token": self.token, "pid": os.getpid(),
-                  "start": probe_process(os.getpid()).start_token, "version": __version__}
+                  "start": probe_process(os.getpid()).start_token, "version": __version__, "resident": self.resident}
         pending = self.path.with_suffix(".tmp")
         handle = os.open(pending, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(handle, "w", encoding="utf-8") as stream:
@@ -653,6 +754,8 @@ class HookEndpoint:
                 pass  # the shared store then starts its own helper when it opens
 
     def stop(self) -> None:
+        if self._stopped.is_set():
+            return  # stopped already, as at exit after its owner stopped it: a stuck recall is not waited for twice
         self._stopped.set()
         server, self._server = self._server, None
         _forget(self.path)
@@ -663,11 +766,13 @@ class HookEndpoint:
 
 
 def serve(home: Path | str, host: str, *, env_file: Path | None = None, runtime_config: Path | None = None,
-          credentials: Callable[[], dict[str, str]] | None = None, warm: bool = True) -> HookEndpoint | None:
+          credentials: Callable[[], dict[str, str]] | None = None, warm: bool = True,
+          resident: bool = False) -> HookEndpoint | None:
     """Answer this entry's prompt recalls from this process until it exits; None when that cannot start.  ``warm``
-    readies the kept handler's vector store now (``KeptRecaller.warm``)."""
+    readies the kept handler's vector store now (``KeptRecaller.warm``); ``resident`` names it a resident server."""
     try:
-        endpoint = HookEndpoint(home, host, env_file=env_file, runtime_config=runtime_config, credentials=credentials)
+        endpoint = HookEndpoint(home, host, env_file=env_file, runtime_config=runtime_config, credentials=credentials,
+                                resident=resident)
     except Exception:  # noqa: BLE001 - the MCP server starts whatever this does; its hooks recall themselves
         return None
     try:
@@ -679,3 +784,303 @@ def serve(home: Path | str, host: str, *, env_file: Path | None = None, runtime_
         endpoint.kept.warm()
     return endpoint
 
+
+def resident_minutes(home: Path | str, host: str) -> int:
+    """Minutes the entry's resident recall server stays up without a recall: the entry's runtime config's
+    ``resident_recall_minutes``, else the client's default (``RESIDENT_DEFAULT_MINUTES``).  0 when the entry has no
+    runtime config (its hooks recall without a vector search, which a resident server would not change) or one that
+    cannot be read or names a bad value, so that a broken entry starts no process.  Read from the file as the hook's
+    own budget is (``handler._configured_budget``): an entry's config may name only some fields."""
+    minutes = configured_minutes(home, host)
+    return 0 if minutes is None else minutes
+
+
+def configured_minutes(home: Path | str, host: str, *, missing: int | None = 0) -> int | None:
+    """``resident_minutes``, or None when the entry's files cannot be read just now: a file held for a moment, or a
+    runtime config caught half saved.  A running server looks again at its next check instead of ending on it (review
+    2 of 3.6.0rc1).  A missing file is ``missing``: 0 for a start, None for a running server, since an editor that
+    saves by moving files leaves none for a moment (review 3)."""
+    from ...runtime.instance import RESIDENT_RECALL_MINUTES_BOUNDS
+    from ...runtime.validation import strict_int
+    from .config import load_shared_client
+
+    try:
+        path = load_shared_client(Path(home), host).runtime_config_path
+        raw = json.loads(Path(path).read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return missing
+    except Exception:  # noqa: BLE001 - see above
+        return None
+    if not isinstance(raw, dict):
+        return 0
+    value = raw.get("resident_recall_minutes")
+    if value is None:
+        return RESIDENT_DEFAULT_MINUTES.get(host, 0)
+    low, high = RESIDENT_RECALL_MINUTES_BOUNDS
+    try:
+        strict_int("resident_recall_minutes", value, minimum=low, maximum=high)
+    except ValueError:
+        return 0
+    return value
+
+
+def resident_lock(home: Path | str, host: str) -> Path:
+    """The file a resident server holds for as long as it runs (``resident_entry``): one for each entry and client,
+    whatever the version."""
+    return endpoints(home) / f"resident-{host}.lock"
+
+
+def resident_record(home: Path | str, host: str) -> Path:
+    """Where the running resident server keeps its process id, start and version, beside its lock.  A hook removes the
+    name of a server that did not prove itself in time, and ``resident stop`` saw nothing until it named itself again
+    (review of 3.6.0rc1); no hook removes this.  Not a ``.json``: it is not a name hooks ask."""
+    return endpoints(home) / f"resident-{host}.pid"
+
+
+def resident_alive(home: Path | str, host: str) -> Path:
+    """What a client's live processes touch while the resident server runs (``ensure_resident``): it ends
+    ``resident_recall_minutes`` after the last of these or of its recalls (``resident_entry``)."""
+    return endpoints(home) / f"resident-{host}.alive"
+
+
+def _residents(home: Path | str, host: str, *, any_version: bool = False
+               ) -> list[tuple[list[Path], dict[str, Any], bool]]:
+    """This entry's live resident servers for ``host``, of this package's version unless ``any_version``: the files
+    that say each (its record and its name), what they say, and whether its identity is proven.
+
+    A file whose process is gone, or whose process id another process took since, is removed: its start time differs,
+    or cannot be read at all where it could when the file was written (a process of another account or a service, as
+    a hook's ``Recaller`` reads it).  One written where no start time can be read (macOS) is kept and marked unproven:
+    after a crash its id may belong to any of the user's processes, which a stop must not end (reviews of 3.6.0rc1)."""
+    from ..._version import __version__
+    from ...runtime.process_probe import probe_process
+
+    said: dict[int, tuple[list[Path], dict[str, Any]]] = {}
+    record = resident_record(home, host)
+    for path in (record, *_named(endpoints(home))):
+        try:
+            info = json.loads(path.read_text(encoding="utf-8"))
+            pid = int(info["pid"])
+        except (OSError, ValueError, KeyError, TypeError):
+            continue
+        if info.get("host") != host or (path != record and info.get("resident") is not True):
+            continue
+        said.setdefault(pid, ([], info))[0].append(path)
+    found = []
+    for pid, (paths, info) in said.items():
+        try:
+            state = probe_process(pid)
+        except (OSError, ValueError):
+            continue
+        started = info.get("start")
+        if not state.running or (started is not None and state.start_token != started):
+            for path in paths:
+                _forget(path)
+            continue
+        if any_version or info.get("version") == __version__:
+            found.append((paths, info, started is not None))
+    return found
+
+
+def resident_running(home: Path | str, host: str) -> bool:
+    """Whether a resident server of this entry and client runs, of any version: the lock it holds is held.  A name or
+    a record can outlive its process, or name an id another process took since; a lock cannot (review of 3.6.0rc1)."""
+    from ...core.file_lock import advisory_file_lock
+
+    lock = resident_lock(home, host)
+    if not lock.exists():
+        return False
+    try:
+        with advisory_file_lock(lock, timeout_seconds=0):
+            return False
+    except TimeoutError:
+        return True
+    except OSError:
+        return False
+
+
+def ensure_resident(home: Path | str, host: str, *, minutes: int, env_file: Path | None = None,
+                    replace: bool = False) -> str:
+    """Start the entry's resident recall server (``resident_entry``) when none runs; what it did: ``off`` (``minutes``
+    is 0), ``running`` (the client is then marked in use: ``resident_alive``), ``running:<version>`` (one of another
+    version runs, left unmarked to its own end), ``unstoppable:<version>`` (the same, though the caller would have
+    replaced it: its identity cannot be proven, or this account may not end it), ``recent`` (one was started less than
+    ``RESIDENT_START_EVERY_SECONDS`` ago and may still be starting), ``upgrading`` (the package is being replaced),
+    ``started``, ``replaced:<version>`` (one of another version was stopped and this version's started) or ``failed``.
+
+    ``replace`` is the prompt hook's.  Hooks ask only a server of their own version, and one of another version that
+    held the entry's lock (an installation in another venv, a canary, a build from before its self-exit) kept every
+    prompt cold for as long as the client ran, while every hook and MCP server marked it in use (review 2 of
+    3.6.0rc1).  None marks it now.  The hook stops one it can prove and end, and starts its own; the version an
+    entry's hooks run then wins, and hooks of two versions against one entry switch it at most once a minute (review
+    3).  A client's MCP server never stops one.  The server is started apart from this process, which the client may
+    end at once (WorkBuddy stops a conversation's processes): in a new process group, broken away from the client's job
+    where Windows allows it, with no window and no console of its own.  It writes nothing to the store; two started at
+    once settle on one."""
+    from ..._version import __version__
+    from ...core.file_lock import advisory_file_lock
+
+    if minutes <= 0:
+        return "off"
+    if _upgrading():
+        return "upgrading"
+    folder = endpoints(home)
+    other = None
+    if resident_running(home, host):
+        others = [(info, proven) for _paths, info, proven in _residents(home, host, any_version=True)
+                  if info.get("version") != __version__]
+        if not others:
+            try:
+                resident_alive(home, host).touch()
+            except OSError:
+                pass  # a recall of it puts its end off as well
+            return "running"
+        other = str(others[0][0].get("version"))
+        if not replace:
+            return f"running:{other}"
+        # One whose identity is not proven (macOS) is never signalled: left unmarked, it ends at its idle end.
+        if not any(proven for _info, proven in others):
+            return f"unstoppable:{other}"
+    stamp = folder / f"resident-{host}.start"
+    switched = folder / f"resident-{host}.replaced"
+    try:
+        folder.mkdir(parents=True, exist_ok=True)
+        # The look at the stamps, the stop, the removal of a stale stamp and the new one under one lock: two starters
+        # that both found the stamp stale both started a server (review 2 of 3.6.0rc1).
+        with advisory_file_lock(folder / f"resident-{host}.start.lock", timeout_seconds=1.0):
+            if other is not None:
+                if _recent(switched):
+                    return f"running:{other}"
+                # A stop that failed (a server this account may not end) said ``replaced`` at every prompt, and started
+                # one that gave way each time (review 3 of 3.6.0rc1).
+                if not stop_residents(home, host, other_versions=True):
+                    return f"unstoppable:{other}"
+                switched.write_text(str(os.getpid()), encoding="ascii")
+            elif _recent(stamp):
+                return "recent"
+            stamp.unlink(missing_ok=True)
+            # Made only where none is, for a starter of a version without the lock.
+            handle = os.open(stamp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(handle, "w", encoding="ascii") as stream:
+                stream.write(str(os.getpid()))
+    except (TimeoutError, FileExistsError):
+        return "recent"
+    except OSError:
+        return "failed"
+    # Through a process that starts the server and ends at once (``--detach``): the server then has no living parent
+    # in the client's process tree, which the client may end as a whole (``resident_entry``).
+    command = [sys.executable, "-I", "-B", "-m", "scope_recall.adapters.codex.resident_entry",
+               "--home", str(Path(home)), "--host", host, "--detach"]
+    if env_file is not None:
+        command += ["--env-file", str(env_file)]
+    if not _start_apart(command, cwd=folder):
+        return "failed"
+    return f"replaced:{other}" if other is not None else "started"
+
+
+def _recent(stamp: Path) -> bool:
+    """Whether ``stamp`` was written less than ``RESIDENT_START_EVERY_SECONDS`` ago.  One more than that far in the
+    future (a clock set back) is stale, not recent: it held off every start until the clock passed it (review of
+    3.6.0rc1); one just written can read a little ahead."""
+    try:
+        age = time.time() - stamp.stat().st_mtime
+    except FileNotFoundError:
+        return False
+    return -RESIDENT_START_EVERY_SECONDS < age < RESIDENT_START_EVERY_SECONDS
+
+
+def _upgrading() -> bool:
+    """Whether ``package-upgrade`` is replacing this environment's package now (its lock in the venv is held): a server
+    started meanwhile could import part of either version, and once the new ``_version.py`` was in place it would not
+    end (review 2 of 3.6.0rc1).  The client should be quit for an upgrade; its MCP servers' keeping made this
+    reachable without a prompt."""
+    from ...core.file_lock import advisory_file_lock
+
+    lock = Path(sys.prefix) / ".scope-recall-package-upgrade.lock"
+    if not lock.exists():
+        return False
+    try:
+        with advisory_file_lock(lock, timeout_seconds=0):
+            return False
+    except TimeoutError:
+        return True
+    except OSError:
+        return False
+
+
+def keep_resident(home: Path | str, host: str, *, env_file: Path | None = None,
+                  every: float | None = None) -> threading.Event:
+    """For a client's MCP server, for as long as it runs: ``ensure_resident`` now and after every ``every`` seconds
+    (``RESIDENT_KEEP_SECONDS``), in a daemon thread; set the event returned to stop.  The resident server then ends
+    ``resident_recall_minutes`` after the client's last process, not its last prompt: WorkBuddy keeps a conversation's
+    process long after its prompts, and a resident that ended meanwhile left that conversation's next prompt colder
+    than the conversation's own server had kept it (review of 3.6.0rc1).  The minutes are read each time, so at 0 this
+    starts none.  Nothing it meets ends the MCP server, which serves its tools whatever this does."""
+    stopped = threading.Event()
+    every = RESIDENT_KEEP_SECONDS if every is None else every
+
+    def run() -> None:
+        while True:
+            try:
+                minutes = resident_minutes(home, host)
+                if minutes > 0:
+                    ensure_resident(home, host, minutes=minutes, env_file=env_file)
+            except Exception as exc:  # noqa: BLE001 - see above
+                sys.stderr.write(f"SCOPE_RECALL_RESIDENT_START:{type(exc).__name__}\n")
+            if stopped.wait(every):
+                return
+
+    threading.Thread(target=run, name="scope-recall-resident-keep", daemon=True).start()
+    return stopped
+
+
+def _start_apart(command: list[str], *, cwd: Path) -> bool:
+    """Start ``command`` so that it outlives this process and its parent's job; whether it started."""
+    import subprocess
+
+    from ...runtime.worker_launch import detached_creationflags
+
+    quiet = {"stdin": subprocess.DEVNULL, "stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL,
+             "cwd": str(cwd), "close_fds": True}
+    if os.name != "nt":
+        try:
+            subprocess.Popen(command, start_new_session=True, **quiet)
+            return True
+        except Exception:  # noqa: BLE001 - a start that failed is a later prompt's to try
+            return False
+    flags = detached_creationflags()
+    # A job that does not allow breaking away refuses the flag; started inside it, the server still outlives its
+    # parent unless the job ends it with the client.  Whatever refuses the first form, the second is tried.
+    for extra in (int(getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0)), 0):
+        try:
+            subprocess.Popen(command, creationflags=flags | extra, **quiet)
+            return True
+        except Exception:  # noqa: BLE001 - see above
+            continue
+    return False
+
+
+def stop_residents(home: Path | str, host: str, *, other_versions: bool = False) -> list[int]:
+    """Stop this entry's resident servers for ``host``, for an upgrade or an uninstall: a server runs from the package
+    that would be replaced.  With ``other_versions``, only those of another version than this package's (a starting
+    server's, ``resident_entry``).  A server writes nothing, so it is ended rather than asked (on Windows ``os.kill``
+    terminates the process); its vector and embedding helpers read their requests from it and end when it is gone.
+    One whose identity is not proven (``_residents``) is never signalled: it ends itself once its package is replaced
+    or its minutes are 0.  Returns the process ids stopped."""
+    import signal
+
+    from ..._version import __version__
+
+    stopped = []
+    for paths, info, proven in _residents(home, host, any_version=True):
+        if not proven or (other_versions and info.get("version") == __version__):
+            continue
+        pid = int(info["pid"])
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            continue
+        for path in paths:
+            _forget(path)
+        stopped.append(pid)
+    return stopped

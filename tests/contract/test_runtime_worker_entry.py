@@ -607,6 +607,54 @@ def test_warming_opens_the_store_and_searches_one_of_its_partitions(tmp_path):
         instance.close()
 
 
+def test_a_server_s_start_asks_the_query_embedding_route_for_one_vector(tmp_path):
+    """Warmed by the store alone, a cold server's first recalls lost their vector search to the embedding's time
+    (measured 2026-10-03).  Its start asks the route once, with a fixed text and its own time; nothing is kept."""
+    asked = []
+
+    class Embedding:
+        def embed_query(self, text, *, remaining_seconds):
+            asked.append((text, remaining_seconds))
+            return (0.1, 0.2)
+
+    instance, _binding = _vector_instance(tmp_path, _ScopedStore(), Embedding())
+    try:
+        assert instance.warm_query_embedding(5.0) is True
+        assert len(asked) == 1 and asked[0][0] == "scope recall warm-up" and 0 < asked[0][1] <= 5.0
+    finally:
+        instance.close()
+
+
+def test_warming_searches_every_partition_a_recall_of_the_runtime_searches(tmp_path):
+    """Review of 3.5.0rc2: a search reads the index codes of the rows its filter keeps.  The warm search filtered on
+    the first allowed scope's partition only, which holds no rows for any of the five entries a kept handler serves
+    on the shared store; once the helper's cached index was paged out it touched 26 MB of the 306 MB the next
+    recall paged back in (copy of the store, 2026-10-02)."""
+    class Embedding:
+        def embed_query(self, text, *, remaining_seconds):
+            return (0.1, 0.2)
+
+    binding = InstanceBinding("TEST-runtime-agent", "TEST-runtime-installation", tmp_path / "data",
+                              frozenset({"TEST-scope-a", "TEST-scope-b", "TEST-scope-c"}), True)
+    config = RuntimeInstanceConfig(
+        binding=binding, session_id="construction-session", allowed_scope_ids=binding.scope_ids,
+        auxiliary=AuxiliaryRuntimeConfig.from_mapping({"external_embedding": False, "external_consolidation": False}),
+        vector=VectorRuntimeConfig(backend="lancedb", storage_dir=tmp_path / "vectors", table_name="TEST-vectors",
+                                   dimensions=2, test_injection_override=True),
+    )
+    store = _ScopedStore()
+    instance = build_runtime_instance(config, vector_factory=lambda _: store)
+    instance.auxiliary = replace(instance.auxiliary, query_embedding=Embedding())
+    instance.core.initialize()
+    try:
+        assert instance.warm_vector_store(5.0) is True
+        instance.core.recall_pipeline.vector_port.search(_search_context(binding, 5.0), limit=1, remaining_seconds=4.0)
+        (_size, warmed, _limit), (_size, recalled, _limit) = store.searches
+        assert set(recalled) <= set(warmed), f"the warm search filtered on {len(warmed)} of {len(recalled)} partitions"
+    finally:
+        instance.close()
+
+
 def test_lazy_vector_facade_reopens_poisoned_cached_store_on_next_search(tmp_path):
     binding = _binding(tmp_path / "data")
     config = RuntimeInstanceConfig(

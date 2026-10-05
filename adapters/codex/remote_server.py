@@ -263,7 +263,8 @@ def handle_request(config: RemoteServerConfig, body: dict[str, Any], *, started:
     if recaller is not None and payload.get("hook_event_name") == "UserPromptSubmit":
         asked = handler.resident_recall = _Asked(recaller)
     try:
-        result = handler.handle_payload(payload, record=record, local_record=False)
+        result = handler.handle_payload(payload, record=record, local_record=False,
+                                        error_reply=body.get("error_reply") is True)
     finally:
         closing = time.monotonic()
         handler.close()
@@ -454,7 +455,7 @@ def main(argv: list[str] | None = None) -> int:
     run = sub.add_parser("serve", help="serve an entry to its client on another machine")
     for command in (setup, run):
         command.add_argument("--home", required=True, help="absolute home of the client's entry, on this machine")
-        command.add_argument("--host", required=True, choices=("codex", "claude-code"))
+        command.add_argument("--host", required=True, choices=("codex", "claude-code", "workbuddy"))
     setup.add_argument("--listen", required=True, help="this machine's private (tailnet) address")
     setup.add_argument("--port", required=True, type=int)
     setup.add_argument("--token-sha256", required=True, help="what remote_client token printed on the client")

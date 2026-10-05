@@ -56,7 +56,7 @@ def main(argv: list[str] | None = None) -> int:
     where = parser.add_mutually_exclusive_group(required=True)
     where.add_argument("--config", help="absolute trusted installation config")
     where.add_argument("--home", help="absolute home of a client attached to a shared store")
-    parser.add_argument("--host", choices=("codex", "claude-code"), default="codex",
+    parser.add_argument("--host", choices=("codex", "claude-code", "workbuddy", "dsh"), default="codex",
                         help="the client that starts this server, for --home")
     parser.add_argument("--workspace", default=None, help="absolute mapped Codex project workspace, for --config")
     parser.add_argument("--runtime-config", default=None, help="absolute trusted local runtime worker config")
@@ -86,19 +86,30 @@ def main(argv: list[str] | None = None) -> int:
         )
         # The client runs this server for as long as it is open: its prompt hooks, each a process of their own, have
         # their recall answered here, warm (``local_endpoint``).  An override of the runtime config is this server's.
-        endpoint = None
+        # A client that keeps a resident recall server instead (WorkBuddy, which runs this one only with a
+        # conversation's process) has it started and kept from here while this runs (``keep_resident``), and this
+        # server answers no hook: warmed for every conversation, each held a vector helper of its own (about 1 GB)
+        # beside the resident one.  Which of the two is decided once, here: a changed ``resident_recall_minutes``
+        # reaches this side when the client starts this server again.
+        endpoint = keeping = None
         if isinstance(config, SharedClientConfig) and runtime_config is None:
-            from .local_endpoint import serve
+            from .local_endpoint import keep_resident, resident_minutes, serve
             env_file = _absolute(args.env_file, "env-file") if args.env_file else None
-            endpoint = serve(config.home, config.host, env_file=env_file, runtime_config=config.runtime_config_path,
-                             credentials=(lambda: host_process_credential_environment(config.runtime_config_path,
-                                                                                      env_file))
-                             if env_file is not None else None)
+            if resident_minutes(config.home, config.host) > 0:
+                keeping = keep_resident(config.home, config.host, env_file=env_file)
+            else:
+                endpoint = serve(config.home, config.host, env_file=env_file,
+                                 runtime_config=config.runtime_config_path,
+                                 credentials=(lambda: host_process_credential_environment(config.runtime_config_path,
+                                                                                          env_file))
+                                 if env_file is not None else None)
         try:
             server.server.run(transport="stdio")
         finally:
             if endpoint is not None:
                 endpoint.stop()
+            if keeping is not None:
+                keeping.set()
     except (CodexConfigError, ValueError) as exc:
         raise SystemExit(str(exc)) from None
     return 0

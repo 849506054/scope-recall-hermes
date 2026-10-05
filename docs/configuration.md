@@ -132,6 +132,7 @@ defaults a standalone worker pass uses.
 | `max_auto_recoveries` | int | `2` | 0–4 | Automatic retries a recoverable failure gets. `0` disables automatic recovery; the failure then waits for `retry-failures`. |
 | `auto_recall_seconds` | number | `5.0` | 0.001–5.0 | Deadline for *automatic* recall on the read path. On timeout, recall degrades to lexical. |
 | `hook_processing_seconds` | number | `6.0` | 0.001–6.0 | Total budget a trusted-host hook has to answer. Must be at least `auto_recall_seconds`, so the hook can cover a full automatic recall; a smaller value fails the file with `hook_processing_seconds_must_cover_auto_recall`. |
+| `resident_recall_minutes` | int | unset | 0–1440 | For a client attached to a shared store (from 3.6.0): minutes its resident recall server stays up after the last prompt's recall and the last of the client's running MCP servers. Unset, the client's default applies: 120 for WorkBuddy, which runs the entry's MCP server only with a conversation's process, 120 for dsh, whose plugin runs each hook as a process of its own and whose headless runs are one process each, and none for Claude Code and Codex, whose server runs as long as the client. An entry with no runtime config file keeps none. **`0` keeps none**: a running server reads the value every 30 s and ends at 0. Each of the client's MCP servers decides at its own start whether it answers the hooks itself (0) or keeps the resident server, so a change reaches that side when the client starts it again: for Claude Code, Codex and dsh at the client's restart, for WorkBuddy with each conversation's process. While it runs the server holds a vector helper, about 1 GB. Under WorkBuddy it also ends with the conversation's agent process that started it, since that process ends every process it started. Read from the entry's own runtime config; a value outside the bounds or of another type (`true`, `"60"`, `2.0`) fails the whole runtime config, as any field's does. See [install.md](install.md), sections 12 and 13. |
 
 A running supervisor reads the file again before each pass, so an edited setting takes effect at
 its next pass. Only a file that names another store ends it, as `suspended` with the reason
@@ -554,11 +555,16 @@ more than 10 s; a prefetch waits at most 2 s for its session to read the turn's
 state, and recalls without holding it. With a timeout of 0 or less, which Hermes
 reads as none, a hook waits at most 10 s. A finished turn is written one capture
 at a time, so the next turn's hooks get in between; its message and reply are
-dated when its writing began, and a shutdown waits for it. What could not wait is
-not taken, and the gateway log says so:
+dated when its writing began, and a shutdown waits for it. A tool result is written
+without holding its session (from 3.5.1), so a step's parallel tool calls do not
+wait for one another's writes; those still take turns at the store's one writer,
+each within its own budget. After its write a tool hook takes its session back once
+more, which can wait behind a message being captured. A shutdown waits up to 10 s
+for a tool result being written and counts one still writing after that. What
+could not wait is not taken, and the gateway log says so:
 
 ```text
-scope-recall: post_tool_call not taken: this session has been busy in observe_post_tool_call for 10.0 s
+scope-recall: post_tool_call not taken: this session has been busy in observe_pre_llm for 10.0 s
 ```
 
 A hook that still ran past the host's timeout is reported as:

@@ -84,7 +84,8 @@ without a restart.
 ## Bringing an agent's memories along
 
 `attach` starts an agent on the shared store without what its own store held. To bring that in,
-stop every attached host and pause the shared worker, then run for each agent:
+stop every attached host (and a WorkBuddy or dsh entry's resident recall server: `scope-recall resident stop`) and
+pause the shared worker, then run for each agent:
 
 ```text
 scope-recall import-entry --root D:\ScopeRecall\shared --entry desk --from <home>\scope-recall.local-<date>
@@ -176,9 +177,11 @@ recalled by a handler of its own, as before. It is made anew when the env file o
 after a recall that raised, or when its runtime could not be attached. A recall that fails in the server is answered as
 failed, with the last frames of its traceback on the server's stderr (the client's MCP log). It reads its key again at the next prompt
 after its env file or the runtime config changed, or when it could not read them before. A server
-started before an upgrade is not asked until its client restarts. Each open client keeps the LanceDB
-helper of its kept handler open, and one more ready for a recall that comes while that one is busy: about
-550 MB of committed memory each, which the system pages out while they are idle. Each prompt hook still starts one of its own, which
+started before an upgrade is not asked until its client restarts; a resident recall server ends itself
+within 30 s of the upgrade ([install.md](install.md), section 12). Each open client keeps one LanceDB
+helper, which its kept handler, the handlers made for prompts that come meanwhile and its tools share (3.4.9).
+The system pages it out while it is idle, and the server searches it once more after each 10 minutes
+without a recall that searched it (3.5.0). Each prompt hook still starts one of its own, which
 ends with the hook, once its import is done, when the hook did not need it.
 
 Claude Code or Codex on another machine attaches the same way, under a name of its own, and reaches
@@ -190,8 +193,65 @@ and run `apply-install --host codex` without `--project-root`. Its hooks and MCP
 the home and serve every workspace. Refresh Codex's plugin cache and approve the changed hooks in
 Codex. The moved store's memories are not imported.
 
-`doctor --host codex|claude-code --instance-root <home>` and `detach` work for these entries as
-for a Hermes home.
+`doctor --host codex|claude-code|workbuddy|dsh --instance-root <home>` and `detach` work for these
+entries as for a Hermes home.
+
+## Attach WorkBuddy
+
+Every process on the store, its worker included, must run 3.5.0 or later before WorkBuddy
+attaches: an older one does not know the host, and cannot replay a capture this entry queued.
+
+WorkBuddy attaches the same way, as the owner at this machine, and runs the same hooks and MCP
+server; its installer adds them to WorkBuddy's own `settings.json` and `mcp.json` rather than
+writing a plugin ([install.md](install.md), section 12, which also says what is not recorded):
+
+```text
+scope-recall attach --host workbuddy --instance-root D:\ScopeRecall\workbuddy ^
+    --root D:\ScopeRecall\shared --entry workbuddy --display-name WorkBuddy ^
+    --grants-like all --capture-like desk ^
+    --runtime-config-from <an attached home>\scope-recall\runtime-config.json
+scope-recall apply-install --host workbuddy --instance-root D:\ScopeRecall\workbuddy ^
+    --agent-id <the store's agent id> --python D:\ScopeRecall\workbuddy-venv\Scripts\python.exe ^
+    --env-file <the file with the embedding key>
+```
+
+Quit WorkBuddy before `apply-install` and start it again after, then approve the MCP server
+`scope-recall` in WorkBuddy's MCP settings: WorkBuddy starts a server of `mcp.json` only once it
+is approved. WorkBuddy 5.6.2 runs that server only with a conversation's agent process, so its
+prompt hook asks a resident recall server instead: started by its hooks and its MCP server, and
+ended with the conversation's agent process that started it (WorkBuddy's agent ends every process
+it started) or `resident_recall_minutes` after the last prompt, whichever comes first
+([install.md](install.md), section 12). Its `Stop`
+reads WorkBuddy's session record. Take the hooks out with `apply-uninstall` before `detach`;
+`detach` alone leaves WorkBuddy's settings as they are.
+
+## Attach dsh
+
+Every process on the store, its worker included, must run 3.7.0 or later before dsh (DeepSeek
+Harness) attaches: an older one does not know the host, and cannot replay a capture this entry
+queued.
+
+dsh attaches the same way, as the owner at this machine. A plugin the installer writes runs the
+same hooks (dsh's own hooks name no turn and no reply), and dsh's MCP client runs the same MCP
+server; the installer adds both as rows of dsh's home patch, `cordis.patch.yml`, and switches off
+dsh's upload of its session logs to its model API ([install.md](install.md), section 13, which
+also says what is not recorded):
+
+```text
+scope-recall attach --host dsh --instance-root D:\ScopeRecall\dsh ^
+    --root D:\ScopeRecall\shared --entry dsh --display-name "DeepSeek Harness" ^
+    --grants-like all --capture-like desk ^
+    --runtime-config-from <an attached home>\scope-recall\runtime-config.json
+scope-recall apply-install --host dsh --instance-root D:\ScopeRecall\dsh ^
+    --agent-id <the store's agent id> --python D:\ScopeRecall\dsh-venv\Scripts\python.exe ^
+    --env-file <the file with the embedding key>
+```
+
+Quit every dsh before `apply-install` and start it again after. Its prompt hook asks the entry's
+resident recall server, as WorkBuddy's does, which outlives a dsh process and ends
+`resident_recall_minutes` after the last prompt (120 by default). Take the rows out with
+`apply-uninstall` before `detach`; `detach` alone leaves dsh's patch file as it is. A dsh on
+another machine cannot be an entry yet.
 
 ## Check
 
@@ -218,7 +278,9 @@ autostart and start its gateway.
 
 ## Moving the store
 
-1. Pause the shared worker (`autostart pause`), stop every attached host, and take a `backup`.
+1. Pause the shared worker (`autostart pause`), stop every attached host and a WorkBuddy or dsh entry's resident
+   recall server (`scope-recall resident stop`), and take a `backup`. The server reads the store, and on Windows its open
+   files keep the old root from being removed.
 2. Copy the whole root directory to the new place.
 3. `scope-recall adopt --root <new root>`. It checks the store is the one its manifest names,
    records the new directory in the store, the manifest and the worker's config, and says what

@@ -575,6 +575,9 @@ def _read_manifest(path: Path) -> dict[str, Any]:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise HermesIdentityError("installation manifest is invalid") from exc
+    # JSON that is not an object raised AttributeError here, past every caller's handling (review of 3.6.1).
+    if not isinstance(payload, dict):
+        raise HermesIdentityError("installation manifest is invalid")
     if payload.get("schema_version") != SCHEMA_VERSION:
         raise HermesIdentityError("unsupported installation manifest schema; explicit v3 upgrade required")
     return payload
@@ -671,7 +674,7 @@ _MAX_DISPLAY_NAME = 32
 #: The local coding assistants a shared store takes as entries beside Hermes homes.  Such an
 #: entry has no installation of its own to carry grants over from: it is the owner at this
 #: machine, with one owner row on the platform named after the client (``client_entry_record``).
-CLIENT_HOSTS = ("codex", "claude-code")
+CLIENT_HOSTS = ("codex", "claude-code", "workbuddy", "dsh")
 ENTRY_HOSTS = ("hermes", *CLIENT_HOSTS)
 
 

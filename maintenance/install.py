@@ -9,7 +9,7 @@ from types import ModuleType
 from typing import Any
 import uuid
 
-from . import install_claude_code, install_codex, install_hermes
+from . import install_claude_code, install_codex, install_dsh, install_hermes, install_workbuddy
 from .backup import _atomic_write, _sha256
 from .doctor import _host_registration_status
 from .install_common import (
@@ -46,8 +46,12 @@ __all__ = [
     "plan_uninstall",
 ]
 
-# Every host module exposes the same functions; the entry picks one instead of branching.
-_HOSTS: dict[str, ModuleType] = {"codex": install_codex, "claude-code": install_claude_code, "hermes": install_hermes}
+# Every host module exposes the same functions; the entry picks one instead of branching.  A host that reads its hooks
+# from its own configuration (WorkBuddy) names those files in ``host_config_files``: its target is then the host's own
+# home, which the host shares, and the install merges its entries into those files (``merged_file``) and takes them
+# out again at uninstall (``unmerged_file``) instead of owning files there.
+_HOSTS: dict[str, ModuleType] = {"codex": install_codex, "claude-code": install_claude_code, "hermes": install_hermes,
+                                 "workbuddy": install_workbuddy, "dsh": install_dsh}
 
 
 def _instance_files(host: ModuleType, instance_root: Path) -> tuple[Path, Path]:
@@ -69,7 +73,7 @@ def _written_digest(content: str | bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def _backup_copy(path: Path, backup_root: Path, plan: InstallPlan) -> Path:
+def _backup_copy(path: Path, backup_root: Path, plan: InstallPlan | UninstallPlan) -> Path:
     """Copy a file the install is about to overwrite under plugin/, instance/ or other/."""
     norm = _norm(path)
     if norm.startswith(_norm(plan.target_plugin_dir) + os.sep):
@@ -110,7 +114,9 @@ def plan_install(
     logins = adapter.validate_owner_logins(owner_logins)
     if type(test_mode) is not bool:
         raise InstallError("test_mode must be a boolean")
-    _validate_plugin_name(target.name)
+    host_files = adapter.host_config_files(target)
+    if not host_files:
+        _validate_plugin_name(target.name)
     roots = ((instance, "instance_root"), *(((project, "project_root"),) if project is not None else ()))
     home_plugin = adapter.home_plugin_dir(instance)
     if home_plugin is not None and _norm(target) == _norm(home_plugin):
@@ -148,7 +154,8 @@ def plan_install(
     planned = adapter.planned_files(plan)
     target_norm = _norm(target)
     keep = {_norm(path) for path in planned} | {norm for norm in owned if _within(norm, target_norm)}
-    for path in _foreign_plugin_entries(target, keep):
+    # A host's own home holds the host's files; only a plugin directory is the installer's alone.
+    for path in _foreign_plugin_entries(target, keep) if not host_files else ():
         plan.conflicts.append(f"unrelated plugin file: {path}")
 
     plan.reuse_instance = adapter.config_path(instance).is_file()
@@ -190,11 +197,54 @@ def plan_install(
                     continue
                 plan.conflicts.append(f"edited prior file: {path}")
         plan.changes.append(PlannedChange("write", str(path), "install host wrapper artifact"))
+    _plan_merges(adapter, plan, host_files)
     plan.changes.append(PlannedChange("write", str(_receipt_path(instance)), "install receipt with digest"))
+    if host_files:
+        plan.changes.append(PlannedChange("restart", str(target), adapter.RESTART_NOTE))
 
     if receipt is not None and receipt.get("host") not in {None, host_choice}:
         plan.conflicts.append("existing receipt host mismatch")
     return plan
+
+
+def _plan_merges(adapter: ModuleType, plan: InstallPlan, host_files: tuple[Path, ...]) -> None:
+    """What the install changes in the host's own files, or why it cannot."""
+    if host_files and not plan.target_plugin_dir.is_dir():
+        plan.conflicts.append(f"{plan.target_plugin_dir} does not exist: start the host once, or name its home with "
+                              "--target-plugin-dir")
+        return
+    for path in host_files:
+        try:
+            merged = adapter.merged_file(plan, path)
+        except InstallError as exc:
+            plan.conflicts.append(str(exc))
+            continue
+        if merged is None:
+            plan.changes.append(PlannedChange("unchanged", str(path), "already holds this entry's entries as they "
+                                                                      "would be written"))
+        else:
+            plan.changes.append(PlannedChange("merge", str(path), "add or update this entry's entries, keeping every "
+                                                                  "other key; the file is copied to the backups first"))
+
+
+def _stop_residents(host: str, instance_root: Path) -> None:
+    """Stop the entry's resident recall servers, for a client that may keep one (``adapters/codex/resident_entry``).
+    They write nothing.  One that cannot be stopped (its identity not proven, as on macOS, or this account may not end
+    it) is said on stderr and left to its own end; nothing here fails the install."""
+    if host not in ("codex", "claude-code", "workbuddy", "dsh"):
+        return
+    import sys
+
+    from ..adapters.codex.local_endpoint import _residents, stop_residents
+
+    try:
+        stop_residents(instance_root, host)
+        left = [int(info["pid"]) for _paths, info, _proven in _residents(instance_root, host, any_version=True)]
+    except Exception:  # noqa: BLE001 - see above
+        return
+    if left:
+        sys.stderr.write(f"scope-recall: resident recall server {left} of {host} still runs; "
+                         f"see scope-recall resident status --home {instance_root} --host {host}\n")
 
 
 def apply_install(plan: InstallPlan) -> InstallResult:
@@ -219,6 +269,7 @@ def apply_install(plan: InstallPlan) -> InstallResult:
     backup_root = plan.instance_root / BACKUP_DIRNAME / uuid.uuid4().hex
     backups: list[str] = []
     written: list[str] = []
+    merged: list[str] = []
     touched: list[tuple[Path, Path | None]] = []
     installation_id = ""
     instance_initialized = False
@@ -250,6 +301,18 @@ def apply_install(plan: InstallPlan) -> InstallResult:
             _atomic_write(path, content)
             written.append(str(path))
             touched.append((path, backup_path))
+        # The host's own files are merged afresh from what they hold now, and never enter the receipt: an uninstall
+        # takes this entry's entries out of them rather than removing them.
+        for path in adapter.host_config_files(plan.target_plugin_dir):
+            merged_content = adapter.merged_file(plan, path)
+            if merged_content is None:
+                continue
+            backup_path = _backup_copy(path, backup_root, plan) if path.is_file() else None
+            if backup_path is not None:
+                backups.append(str(backup_path))
+            _atomic_write(path, merged_content)
+            merged.append(str(path))
+            touched.append((path, backup_path))
 
         receipt_path = _write_receipt(plan, installation_id=installation_id, written=written, tracked=tracked,
                                       kept=plan.kept)
@@ -268,6 +331,10 @@ def apply_install(plan: InstallPlan) -> InstallResult:
                 _write_receipt(plan, installation_id=installation_id, written=partial, tracked=tracked)
         raise
 
+    # A resident recall server runs the package it was started from: one of the installation this replaces (another
+    # venv, an older version) held the entry's lock against the new one's (review 2 of 3.6.0rc1).  The next prompt or
+    # conversation starts the new version's.
+    _stop_residents(plan.host, plan.instance_root)
     return InstallResult(
         files_written=written,
         # Registration is what the doctor can actually observe; hook trust is a
@@ -278,6 +345,7 @@ def apply_install(plan: InstallPlan) -> InstallResult:
         receipt_path=str(receipt_path),
         installation_id=installation_id,
         backups=backups,
+        files_merged=merged,
     )
 
 
@@ -344,6 +412,12 @@ def plan_uninstall(
             plan.edited_files.append(norm)
         else:
             plan.files_to_remove.append(norm)
+    for path in adapter.host_config_files(target):
+        try:
+            if adapter.unmerged_file(instance, path) is not None:
+                plan.unmerged_files.append(str(path))
+        except InstallError as exc:
+            plan.conflicts.append(str(exc))
 
     if purge:
         if plan.edited_files:
@@ -385,6 +459,21 @@ def apply_uninstall(plan: UninstallPlan, *, purge: bool = False) -> UninstallRes
     adapter = _HOSTS[plan.host]
     data_dir = adapter.data_dir(plan.instance_root)
     _disable_autostart(data_dir)
+    # A resident recall server of this entry runs from the package (``adapters/codex/resident_entry``): with the hooks
+    # taken out nothing would ask it, and it would hold the package until its idle end.
+    _stop_residents(plan.host, plan.instance_root)
+    # This entry's entries come out of the host's own files, each copied to the backups first; the rest stays.
+    unmerged: list[str] = []
+    backups: list[str] = []
+    backup_root = plan.instance_root / BACKUP_DIRNAME / uuid.uuid4().hex
+    for path_text in plan.unmerged_files:
+        path = Path(path_text)
+        content = adapter.unmerged_file(plan.instance_root, path)
+        if content is None:
+            continue
+        backups.append(str(_backup_copy(path, backup_root, plan)))
+        _atomic_write(path, content)
+        unmerged.append(path_text)
 
     purged_paths: list[str] = []
     retained_backups = list(plan.retained_backups)
@@ -419,4 +508,6 @@ def apply_uninstall(plan: UninstallPlan, *, purge: bool = False) -> UninstallRes
         edited_files=list(plan.edited_files),
         purged_paths=purged_paths,
         retained_backups=retained_backups,
+        unmerged_files=unmerged,
+        backups=backups,
     )

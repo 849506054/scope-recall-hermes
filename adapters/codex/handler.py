@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 import hashlib
 import json
 import math
+import os
 from pathlib import Path
 import sqlite3
 import sys
@@ -30,11 +31,14 @@ from .boundary import (
     is_codex_suggestions_prompt,
     is_codex_suggestions_reply,
     is_task_notification,
+    is_workbuddy_agent_run,
+    is_workbuddy_notice,
     lifecycle_source_event,
     recorded_source_event,
     tool_use_source_event,
     turn_id_from_payload,
     user_prompt_source_event,
+    workbuddy_person_text,
 )
 from .config import CodexConfigError, CodexInstallationConfig, SharedClientConfig, load_codex_config, load_shared_client
 from .identity import resolve_runtime_audience, trusted_context
@@ -83,25 +87,32 @@ _SUPPORTED_EVENTS = frozenset(
 #: same fields, except that a turn is named by ``prompt_id``.  Its tool output is not recorded:
 #: a tool result never becomes a memory, and a coding session's tool traffic would be most of
 #: the store for an embedding each.
-_TURN_FIELD = {"codex": "turn_id", "claude-code": "prompt_id"}
+_TURN_FIELD = {"codex": "turn_id", "claude-code": "prompt_id", "workbuddy": "generation_id", "dsh": "turn_id"}
 #: Clients whose prompt hook may run the entry's ``hook_processing_seconds`` (at most 6 s) from the
 #: start.  Both wait 15 s for a prompt's hook (``maintenance/install_claude_code.py``,
 #: ``maintenance/install_codex.py``), and recall on the pilot's shared store took 2.7-5.7 s: with 2 s most
 #: automatic recalls came back empty, as Codex's did until 3.4.0rc5.  The budget bounds the work; the hook
-#: answers as soon as it is done.
-_CONFIGURED_PROMPT_BUDGET = frozenset({"claude-code", "codex"})
+#: answers as soon as it is done.  WorkBuddy waits 60 s unless its hook says otherwise, and a prompt hook
+#: that runs past its wait blocks the prompt: the budget is what keeps it inside.
+_CONFIGURED_PROMPT_BUDGET = frozenset({"claude-code", "codex", "workbuddy", "dsh"})
 #: Clients whose Stop and SessionEnd also read the session record (``transcript``): what the person said,
 #: whatever the prompt hook could not write, and what the model said while it worked.  Claude Code waits
 #: 10 s for these hooks; a turn's lines take well under a second, and a long backlog is read over several
 #: turns, at most ``_RECORD_READ_S`` each, so the end of a turn is not held up.
-_READS_RECORD = frozenset({"claude-code"})
+#: dsh has no record a hook can read (its session log is compressed); its plugin sends the turn's messages with the Stop
+#: as the lines a remote client sends (``transcript.dsh_lines``).
+_READS_RECORD = frozenset({"claude-code", "workbuddy", "dsh"})
 _RECORD_READ_S = 3.0
 #: A capture is started only with this much of the reading time left.
 _RECORD_CAPTURE_MIN_S = 0.5
 #: A hook's copy of a message and the record's are the same message when the words match and the moments are this close.
 _RECORD_SAME_MESSAGE_S = 120.0
 _HOST_EVENTS = {"codex": _SUPPORTED_EVENTS,
-                "claude-code": frozenset({"UserPromptSubmit", "Stop", "SessionEnd"})}
+                "claude-code": frozenset({"UserPromptSubmit", "Stop", "SessionEnd"}),
+                "workbuddy": frozenset({"UserPromptSubmit", "Stop", "SessionEnd"}),
+                # dsh's plugin (``distribution/dsh``) sends a prompt hook before a turn's first step and a Stop at its
+                # end; dsh has no session end.
+                "dsh": frozenset({"UserPromptSubmit", "Stop"})}
 
 
 class HookClock(Protocol):
@@ -219,6 +230,12 @@ class CodexHookHandler:
         #: ``late``, ``without_vectors:<gap>`` or ``failed:<reason>``.  The hook's stderr says this, or else what
         #: ``resident_recall`` says of itself.
         self.resident_outcome: str | None = None
+        #: The turn a WorkBuddy Stop closed and the words of its reply, for the read of the record after it.
+        self._closed_reply: tuple[str, str] | None = None
+        #: Whether this hook may open the session record its payload names (``handle_payload``).
+        self._local_record = True
+        #: A client on another machine's word that its Stop's reply is an error its record marks (``handle_payload``).
+        self._client_error_reply = False
 
     @classmethod
     def from_config_path(
@@ -396,6 +413,14 @@ class CodexHookHandler:
         if callable(warm):
             warm(seconds)
 
+    def warm_embedding(self, seconds: float) -> None:
+        """Ask the runtime's query embedding route for one vector now, for a server's start
+        (``local_endpoint.KeptRecaller.warm``; its keep-warm searches do not).  It writes nothing."""
+        self._ensure_host_runtime()
+        warm = getattr(getattr(self._host_runtime, "_runtime", None), "warm_query_embedding", None)
+        if callable(warm):
+            warm(seconds)
+
     def close(self) -> None:
         if self._host_runtime is not None:
             # A short hook must return without synchronously killing the
@@ -422,15 +447,24 @@ class CodexHookHandler:
         return audience
 
     def handle_payload(self, payload: dict[str, Any], *, record: RecordLines | None = None,
-                       local_record: bool = True) -> dict[str, Any]:
+                       local_record: bool = True, error_reply: bool = False) -> dict[str, Any]:
         payload = without_lone_surrogates(payload)
         self._persisted_this_call = False
         self._queued_this_call = False
+        self._closed_reply = None
+        self._local_record = record is None and local_record  # a client on another machine sends its record's lines
+        self._client_error_reply = error_reply  # what that client judged from its own record
         self.diagnostics = HookDiagnostics(capability_gaps=self.diagnostics.capability_gaps)
         event = payload.get("hook_event_name")
         self.diagnostics.last_event = str(event) if event is not None else None
         if event not in _HOST_EVENTS[self.host]:
             self._diag("unsupported_event")
+            return {}
+        if self.host == "workbuddy" and is_workbuddy_agent_run(payload):
+            # A subagent's prompt is the agent that started it speaking, and its end is not the session's: like a
+            # task notification, none of it is the person's.  WorkBuddy 5.3.14 sends these hooks for the main session
+            # only; this keeps a later version that sends them from storing a subagent under the person's session.
+            self._diag("agent_run")
             return {}
         session_id = self._session_id(payload)
         if session_id is None:
@@ -467,6 +501,10 @@ class CodexHookHandler:
             return self._interrupt(session_id, audience, payload, deadline)
         if event == "PostToolUse":
             return self._post_tool_use(session_id, audience, payload, deadline)
+        if self.host == "dsh" and record is None:
+            # The turn's messages as dsh's plugin kept them (it has no record a hook could open), read as a remote
+            # client's lines; the answer says how many are stored, so the plugin drops those and sends the rest again.
+            record = RecordLines(start=0, lines=transcript.dsh_lines(payload.get("record")))
         capture = self._stop if event == "Stop" else self._session_end
         result = capture(session_id, audience, payload, deadline)
         # A server for a client on another machine reads only the lines that client sent (``local_record``
@@ -474,7 +512,11 @@ class CodexHookHandler:
         # opened here.
         if self._reads_record(event) and (record is not None or local_record):
             self._read_record(session_id, audience, payload, deadline, remote=record)
+        if self.host == "workbuddy" and event == "SessionEnd":
+            _forget_turns(self.config, session_id)
         self._wake_after_capture(session_id, audience, deadline)
+        if self.host == "dsh" and record is not None:
+            result = {**result, "through": record.through or 0}
         return result
 
     def handle_bytes(self, raw: bytes) -> dict[str, Any]:
@@ -573,30 +615,36 @@ class CodexHookHandler:
         back in ``remote.through`` for that client's own cursor.
         """
         cursor = None
+        workbuddy = self.host == "workbuddy"
         if remote is not None:
             start, lines = remote.start, remote.lines
         else:
-            record = transcript.record_path(payload.get("transcript_path"), session_id)
+            record = (transcript.workbuddy_record_path(payload.get("transcript_path"), session_id,
+                                                       record_id=payload.get("agent_id"))
+                      if workbuddy else transcript.record_path(payload.get("transcript_path"), session_id))
             if record is None:
                 self._diag("session_record_unavailable", gaps=("capture_gap:session_record_unavailable",))
                 return
             cursor = transcript.Cursor(self.config.home, session_id, record)
             start = cursor.load()
             try:
-                lines = transcript.read(record, start)
+                lines = transcript.read(record, start, rows=transcript.workbuddy_said if workbuddy else transcript.said)
             except OSError:
                 self._diag("session_record_unavailable", gaps=("capture_gap:session_record_unavailable",))
                 return
         said = [entry for _end, entry in lines if entry is not None]
+        # WorkBuddy's record names no turn: a person's message there is the turn its prompt hook kept for the same words,
+        # and the model's message after it with the words of the Stop's reply is that Stop's turn: held when the Stop
+        # stored it, stored from here when the Stop took it for the previous reply repeated (``_close_turn``).
+        turns = _record_turns(self.config, session_id, said) if workbuddy else {}
+        replied = _replied_entry(said, self._closed_reply) if workbuddy else None
         held: tuple[bool, ...] = ()
         if said:
             try:
                 held = self.core.said_in_session(
                     self._context(audience, session_id, "host_generated"), audience.capture_scope_id,
-                    [(entry.role, entry.text, entry.occurred_at,
-                      host_source_key(host=self.host, installation_id=self.config.installation_id,
-                                      session_id=session_id, event_kind="user", event_id=entry.prompt_id)
-                      if entry.role == "user" and entry.prompt_id else None) for entry in said],
+                    [(entry.role, entry.text, entry.occurred_at, self._record_key(session_id, entry, turns, replied))
+                     for entry in said],
                     window_seconds=_RECORD_SAME_MESSAGE_S,
                     remaining_seconds=max(0.0, self._remaining(deadline)))
             except (ContractError, OSError, RuntimeError, sqlite3.Error) as exc:
@@ -629,6 +677,18 @@ class CodexHookHandler:
             remote.through = position
         elif position != start:
             cursor.save(position)
+
+    def _record_key(self, session_id: str, entry: "transcript.Said", turns: dict[str, str],
+                    replied: tuple[str, str] | None) -> str | None:
+        """The key a hook stored a record message under, when the record or a kept turn names it."""
+        if entry.role == "user" and (turns.get(entry.entry_id) or entry.prompt_id):
+            kind, event_id = "user", turns.get(entry.entry_id) or entry.prompt_id
+        elif replied is not None and entry.entry_id == replied[0]:
+            kind, event_id = "assistant", replied[1]
+        else:
+            return None
+        return host_source_key(host=self.host, installation_id=self.config.installation_id, session_id=session_id,
+                               event_kind=kind, event_id=event_id)
 
     def _captured_for_good(self, context, audience, event, deadline: float) -> bool:
         """Capture one record message; False when it may succeed later and the read must stop here."""
@@ -679,17 +739,32 @@ class CodexHookHandler:
         return {}
 
     def _user_prompt_submit(self, session_id: str, audience, payload: dict[str, Any], deadline: float) -> dict[str, Any]:
-        turn_id, gaps = turn_id_from_payload(payload, required=True, field=_TURN_FIELD[self.host])
-        if turn_id is None:
-            self._diag("missing_turn_id", gaps=gaps)
-            return {}
-        prompt = payload.get("prompt")
-        if type(prompt) is not str:
-            self._diag("missing_prompt", gaps=(*gaps, "capability_gap:missing_prompt"))
-            return {}
-        if self.host == "claude-code" and is_task_notification(prompt):
+        if self.host == "workbuddy":
+            prompt = payload.get("prompt")
+            if type(prompt) is not str:
+                self._diag("missing_prompt", gaps=("capability_gap:missing_prompt",))
+                return {}
+            # Only the person's words are stored and recalled for, never what WorkBuddy wraps around them.
+            prompt = workbuddy_person_text(prompt)
+            notice = is_workbuddy_notice(prompt)
+            # A turn is kept for a notice too, so that the reply to it is stored under a turn of its own.
+            turn_id, gaps = _open_turn(self.config, session_id, payload, None if notice else prompt,
+                                       self.clock.utc_now()), ()
+        else:
+            turn_id, gaps = turn_id_from_payload(payload, required=True, field=_TURN_FIELD[self.host])
+            if turn_id is None:
+                self._diag("missing_turn_id", gaps=gaps)
+                return {}
+            prompt = payload.get("prompt")
+            if type(prompt) is not str:
+                self._diag("missing_prompt", gaps=(*gaps, "capability_gap:missing_prompt"))
+                return {}
+            notice = self.host == "claude-code" and is_task_notification(prompt)
+        if notice:
             # Claude Code's own notice that a background task finished: recorded as the owner's words it
-            # became a message they never wrote, and a recall on it answers nothing they asked.
+            # became a message they never wrote, and a recall on it answers nothing they asked.  WorkBuddy
+            # hands its model the same notice (its ``BackgroundTaskNotifier``), and a Stop hook's or a goal's
+            # request to go on.
             self._diag("task_notification")
             return {}
         if self.host == "codex" and is_codex_suggestions_prompt(prompt):
@@ -843,10 +918,18 @@ class CodexHookHandler:
             return {}
         turn_id, _gaps = turn_id_from_payload(payload, required=True, field=_TURN_FIELD[self.host])
         prompt = payload.get("prompt")
+        if self.host == "workbuddy":
+            if type(prompt) is not str or is_workbuddy_agent_run(payload):
+                return {}
+            # The turn the hook kept for these words moments ago (``_open_turn``), or one of this recall's own.
+            prompt = workbuddy_person_text(prompt)
+            turn_id = _kept_turn(self.config, session_id, prompt) or _derived_turn(session_id, prompt,
+                                                                                  self.clock.utc_now())
         # What the hook would have recalled nothing for, or recalled without the vector channel, is not asked here;
         # the server checks again rather than take the hook's word for it.
         if (turn_id is None or type(prompt) is not str or not prompt.strip() or contains_secret_like_text(prompt)
                 or (self.host == "claude-code" and is_task_notification(prompt))
+                or (self.host == "workbuddy" and is_workbuddy_notice(prompt))
                 or (self.host == "codex" and is_codex_suggestions_prompt(prompt))):
             return {}
         deadline = self.clock.monotonic() + max(0.0, remaining)
@@ -905,10 +988,32 @@ class CodexHookHandler:
         return {"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": text}}
 
     def _stop(self, session_id: str, audience, payload: dict[str, Any], deadline: float) -> dict[str, Any]:
-        turn_id, gaps = turn_id_from_payload(payload, required=True, field=_TURN_FIELD[self.host])
-        if turn_id is None:
-            self._diag("missing_turn_id", gaps=gaps)
+        if self.host == "dsh" and type(payload.get("last_assistant_message")) is not str:
+            # A turn that ended without a reply (aborted, failed), or dsh's plugin sending what it kept of earlier
+            # turns: the record lines carry whatever was said.
+            self._diag("no_reply")
             return {}
+        if self.host == "workbuddy":
+            reply = payload.get("last_assistant_message")
+            if type(reply) is str and self._workbuddy_error_reply(session_id, payload, reply):
+                # WorkBuddy hands the Stop the error it showed in place of a reply (not signed in, a model or network
+                # failure) as the reply; the model said nothing, and the record marks that message with the error.
+                _note_error_reply(self.config, session_id, reply)
+                self._diag("client_error_reply")
+                return {}
+            turn_id, repeated = _close_turn(self.config, session_id, payload, reply if type(reply) is str else "",
+                                            self.clock.utc_now())
+            self._closed_reply = (turn_id, _words(reply)) if type(reply) is str and reply.strip() else None
+            gaps = ()
+            if repeated:
+                # A turn that failed or was stopped before it said anything hands the Stop the reply before it.
+                self._diag("repeated_reply")
+                return {}
+        else:
+            turn_id, gaps = turn_id_from_payload(payload, required=True, field=_TURN_FIELD[self.host])
+            if turn_id is None:
+                self._diag("missing_turn_id", gaps=gaps)
+                return {}
         message = payload.get("last_assistant_message")
         if type(message) is not str:
             gaps = (*gaps, "outcome_gap:missing_assistant_body")
@@ -928,6 +1033,19 @@ class CodexHookHandler:
         context = self._context(audience, session_id, "assistant_visible")
         self._capture(context, audience, event, deadline=deadline, gaps=(*gaps, *outcome_gaps))
         return {}
+
+    def _workbuddy_error_reply(self, session_id: str, payload: dict[str, Any], reply: str) -> bool:
+        """Whether a WorkBuddy Stop's reply is an error its record marks (``transcript.workbuddy_error_reply``).  A client
+        on another machine judges it from its own record and says so (this side never opens a record for a request); a
+        record that cannot be found or read says no, and the reply is stored as before."""
+        if not self._local_record:
+            return self._client_error_reply
+        try:
+            record = transcript.workbuddy_record_path(payload.get("transcript_path"), session_id,
+                                                      record_id=payload.get("agent_id"))
+        except OSError:
+            return False
+        return record is not None and transcript.workbuddy_error_reply(record, reply)
 
     def _post_tool_use(self, session_id: str, audience, payload: dict[str, Any], deadline: float) -> dict[str, Any]:
         turn_id, gaps = turn_id_from_payload(payload, required=True, field=_TURN_FIELD[self.host])
@@ -965,11 +1083,17 @@ class CodexHookHandler:
 _SUGGESTIONS_THREAD_SECONDS = 24 * 3600
 
 
-def _suggestions_mark(config, session_id: str) -> Path:
-    """One thread's mark: beside the pointer for an entry of a shared store, in its data for a store of its own."""
+def _session_marks(config, kind: str, session_id: str) -> Path:
+    """One session's mark of ``kind``: beside the pointer for an entry of a shared store, in its data for a store of
+    its own."""
     folder = (Path(config.home) / "scope-recall" if isinstance(config, SharedClientConfig)
-              else Path(config.data_directory)) / "host-threads"
+              else Path(config.data_directory)) / kind
     return folder / hashlib.sha256(session_id.encode("utf-8")).hexdigest()[:32]
+
+
+def _suggestions_mark(config, session_id: str) -> Path:
+    """One thread's mark (``_session_marks``)."""
+    return _session_marks(config, "host-threads", session_id)
 
 
 def _mark_suggestions_thread(config, session_id: str) -> None:
@@ -1001,6 +1125,143 @@ def _suggestions_thread(config, session_id: str, *, ended: bool = False) -> bool
         except OSError:
             pass
     return marked
+
+
+# -- WorkBuddy's turns ---------------------------------------------------------
+# WorkBuddy's hooks name no turn they share.  Its ``generation_id`` is the id of the session's latest model request,
+# made anew for each request: a prompt carries the previous turn's last one (none on a session's first prompt) and its
+# Stop carries this turn's.  So a prompt opens a turn, under that id when no turn of the session has it yet and else
+# under one made from the session, the person's words and the moment; the turn is kept in a small file per session for
+# the Stop that closes it and the read of the session record after, and the session's end removes it.  The file is
+# disposable: without it a Stop makes a turn of its own, and the record is matched by words and moment as before.
+
+#: How long a session's turns are kept; older ones are removed when a turn is kept.
+_TURNS_SECONDS = 24 * 3600
+#: Turns kept per session: a Stop's read of the record covers its own turn and any before it that fired no Stop.
+_TURNS_KEPT = 16
+
+
+def _words(text: str) -> str:
+    """What two copies of one message share whatever their line breaks: WorkBuddy's prompt hook takes the newlines
+    out of the person's words, and its record keeps them."""
+    return hashlib.sha256("".join(text.split()).encode("utf-8")).hexdigest()
+
+
+def _derived_turn(session_id: str, text: str, moment: str) -> str:
+    return "turn-" + hashlib.sha256("\x00".join((session_id, text, moment)).encode("utf-8")).hexdigest()[:32]
+
+
+def _turns(config, session_id: str) -> dict[str, Any]:
+    """A session's kept turns, oldest first, each ``[turn id, words or None]``, and the words of its last reply."""
+    path = _session_marks(config, "turns", session_id)
+    try:
+        if time.time() - path.stat().st_mtime >= _TURNS_SECONDS:
+            return {"turns": [], "reply": None, "error": None}
+        kept = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, ValueError):
+        return {"turns": [], "reply": None, "error": None}
+    if not isinstance(kept, dict):
+        return {"turns": [], "reply": None, "error": None}
+    turns = [list(item) for item in kept.get("turns") or () if isinstance(item, list) and len(item) == 2
+             and type(item[0]) is str and (item[1] is None or type(item[1]) is str)]
+    reply, error = kept.get("reply"), kept.get("error")
+    return {"turns": turns[-_TURNS_KEPT:], "reply": reply if type(reply) is str else None,
+            "error": error if type(error) is str else None}
+
+
+def _keep_turns(config, session_id: str, kept: dict[str, Any]) -> None:
+    """Write a session's turns; one that cannot be written leaves the next Stop to make its own."""
+    path = _session_marks(config, "turns", session_id)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        pending = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+        pending.write_text(json.dumps(kept), encoding="utf-8")
+        os.replace(pending, path)
+        cutoff = time.time() - _TURNS_SECONDS
+        for count, old in enumerate(path.parent.iterdir()):
+            if count >= 256:
+                break
+            if old.stat().st_mtime < cutoff:
+                old.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _forget_turns(config, session_id: str) -> None:
+    try:
+        _session_marks(config, "turns", session_id).unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _open_turn(config, session_id: str, payload: dict[str, Any], words: str | None, moment: str) -> str:
+    """The turn a WorkBuddy prompt opens, kept for its Stop; ``words`` are the person's, None for a notice."""
+    kept = _turns(config, session_id)
+    given, _gaps = turn_id_from_payload(payload, required=False, field=_TURN_FIELD["workbuddy"])
+    turn = (given if given is not None and all(given != known for known, _words_of in kept["turns"])
+            else _derived_turn(session_id, words or "", moment))
+    kept["turns"] = [*kept["turns"], [turn, _words(words) if words and words.strip() else None]][-_TURNS_KEPT:]
+    _keep_turns(config, session_id, kept)
+    return turn
+
+
+def _close_turn(config, session_id: str, payload: dict[str, Any], reply: str, moment: str) -> tuple[str, bool]:
+    """The turn a WorkBuddy Stop closes: the last one a prompt opened, else its own (its ``generation_id``, or one
+    made from the reply); and whether the reply is the one the session's last Stop had."""
+    kept = _turns(config, session_id)
+    if kept["turns"]:
+        turn = kept["turns"][-1][0]
+    else:
+        given, _gaps = turn_id_from_payload(payload, required=False, field=_TURN_FIELD["workbuddy"])
+        turn = given or _derived_turn(session_id, reply, moment)
+    words = _words(reply) if reply.strip() else None
+    # The last reply, or the error WorkBuddy showed in place of one since: a stopped turn hands either.
+    repeated = words is not None and words in (kept["reply"], kept["error"])
+    if words is not None and not repeated:
+        kept["reply"], kept["error"] = words, None
+        _keep_turns(config, session_id, kept)
+    return turn, repeated
+
+
+def _note_error_reply(config, session_id: str, reply: str) -> None:
+    """Keep the words of an error WorkBuddy showed in place of a reply, which a later stopped turn may hand its Stop."""
+    kept = _turns(config, session_id)
+    kept["error"] = _words(reply)
+    _keep_turns(config, session_id, kept)
+
+
+def _kept_turn(config, session_id: str, text: str) -> str | None:
+    """The latest kept turn of the session opened for these words."""
+    words = _words(text)
+    return next((turn for turn, kept in reversed(_turns(config, session_id)["turns"]) if kept == words), None)
+
+
+def _replied_entry(said: list["transcript.Said"], closed: tuple[str, str] | None) -> tuple[str, str] | None:
+    """The record id of the model's message with the words of the reply a Stop closed its turn with, among those after
+    the person's last message of the read, and that turn."""
+    if closed is not None:
+        turn, words = closed
+        for entry in reversed(said):
+            if entry.role == "user":
+                break
+            if _words(entry.text) == words:
+                return entry.entry_id, turn
+    return None
+
+
+def _record_turns(config, session_id: str, said: list["transcript.Said"]) -> dict[str, str]:
+    """The kept turn of each of the person's record messages that has one, by record id: the latest messages take the
+    latest turns of the same words, each turn one message."""
+    open_turns = list(reversed(_turns(config, session_id)["turns"]))
+    found: dict[str, str] = {}
+    for entry in reversed(said):
+        if entry.role != "user":
+            continue
+        words = _words(entry.text)
+        match = next((index for index, (_turn, kept) in enumerate(open_turns) if kept == words), None)
+        if match is not None:
+            found[entry.entry_id] = open_turns.pop(match)[0]
+    return found
 
 
 #: What a runtime config that does not name ``hook_processing_seconds`` runs: the worker's default.  No
@@ -1091,11 +1352,12 @@ def recall_without_vectors(gaps) -> str | None:
     return None
 
 
-def emit_result(result: dict[str, Any], *, diagnostics: HookDiagnostics | None = None) -> None:
+def emit_result(result: dict[str, Any], *, diagnostics: HookDiagnostics | None = None, empty: str = "{}") -> None:
     # Codex decodes hook stdout as UTF-8, while a Windows child process may
     # inherit a legacy code-page TextIOWrapper.  ASCII JSON is safe on both
-    # sides and json.loads restores the original Unicode values.
-    sys.stdout.write(json.dumps(result, ensure_ascii=True))
+    # sides and json.loads restores the original Unicode values.  An empty
+    # answer is written as ``empty`` (``boundary.EMPTY_ANSWER``).
+    sys.stdout.write(json.dumps(result, ensure_ascii=True) if result else empty)
     if diagnostics is not None and diagnostics.last_reason:
         sys.stderr.write(f"CODEX_HOOK:{diagnostics.last_reason}\n")
     if diagnostics is not None and diagnostics.capture_stage:

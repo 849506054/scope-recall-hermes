@@ -101,6 +101,15 @@ def packaging_helper_env(tier: str) -> dict[str, str]:
     return {"SCOPE_RECALL_TEST_PACKAGING_HELPER_ROOTS": str(Path(packaging_uv).resolve().parent)}
 
 
+def node_helper_env(tier: str) -> dict[str, str]:
+    """The node executable the host tier's dsh plugin tests run; none where node is not installed (they skip)."""
+
+    if tier != "host":
+        return {}
+    node = shutil.which("node")
+    return {"SCOPE_RECALL_TEST_NODE": str(Path(node).resolve())} if node else {}
+
+
 SCRIPT_GATE_TESTS = [
     "tests/packaging/test_source_manifest.py",
     "tests/packaging/test_check_selection.py",
@@ -108,8 +117,8 @@ SCRIPT_GATE_TESTS = [
     "tests/packaging/test_release_notes.py",
 ]
 SUITES = {
-    "unit": ["tests/unit/test_v11_context.py", "tests/unit/test_check_runner.py", "tests/unit/test_secret_patterns.py", "tests/unit/test_recall_budget.py", "tests/unit/test_contract_schemas.py", "tests/unit/test_claude_code_record.py"],
-    "contract": ["tests/contract/test_v11_protocol.py", "tests/contract/test_v11_inputs.py", "tests/contract/test_p13_configurable_budget.py", "tests/contract/test_autostart_cli.py", "tests/contract/test_companion_publish.py", "tests/contract/test_upgrade_store_cli.py", "tests/contract/test_request_guard_escaping.py", "tests/contract/test_relation_candidates_rank.py", "tests/contract/test_status_file_beside_its_writer.py", "tests/contract/test_every_store_meets_the_runtime.py", "tests/contract/test_qdrant_config.py", "tests/contract/test_a_paused_wake_lets_go.py", "tests/contract/test_a_pass_that_ends_hands_back_its_group.py", "tests/contract/test_qdrant_runtime.py", "tests/contract/test_qdrant_store.py", "tests/contract/test_vector_candidate_authority.py", "tests/contract/test_vector_migration.py"],
+    "unit": ["tests/unit/test_v11_context.py", "tests/unit/test_check_runner.py", "tests/unit/test_secret_patterns.py", "tests/unit/test_recall_budget.py", "tests/unit/test_contract_schemas.py", "tests/unit/test_claude_code_record.py", "tests/unit/test_workbuddy_record.py", "tests/unit/test_dsh_record.py"],
+    "contract": ["tests/contract/test_v11_protocol.py", "tests/contract/test_v11_inputs.py", "tests/contract/test_p13_configurable_budget.py", "tests/contract/test_autostart_cli.py", "tests/contract/test_companion_publish.py", "tests/contract/test_upgrade_store_cli.py", "tests/contract/test_request_guard_escaping.py", "tests/contract/test_relation_candidates_rank.py", "tests/contract/test_status_file_beside_its_writer.py", "tests/contract/test_every_store_meets_the_runtime.py", "tests/contract/test_a_paused_wake_lets_go.py", "tests/contract/test_a_pass_that_ends_hands_back_its_group.py", "tests/contract/test_qdrant_config.py", "tests/contract/test_qdrant_runtime.py", "tests/contract/test_qdrant_store.py", "tests/contract/test_vector_candidate_authority.py", "tests/contract/test_vector_migration.py"],
     "storage": ["tests/contract/test_v11_storage.py", "tests/contract/test_shared_store.py"],
     "capture": ["tests/contract/test_v11_capture.py"],
     "claims": ["tests/contract/test_v11_claims.py"],
@@ -152,6 +161,7 @@ SUITES = {
         "tests/host/codex/test_runtime_wiring.py",
         "tests/host/codex/test_shared_client.py",
         "tests/host/codex/test_remote.py",
+        "tests/host/codex/test_resident_recall.py",
     ],
     "migration": ["tests/migration/test_v11_migration.py"],
     "packaging": [
@@ -652,6 +662,7 @@ def _test_environment(tier: str, isolated: Path) -> dict[str, str]:
     test_import_paths = (test_root, test_root / "contract", test_root / "migration", ROOT)
     env.update(PYTHONUTF8="1", PYTHONDONTWRITEBYTECODE="1", PYTEST_DISABLE_PLUGIN_AUTOLOAD="1", PYTHONPATH=os.pathsep.join(str(path) for path in test_import_paths), SCOPE_RECALL_TEST_BOUNDARY_PARENT=str(isolated), SCOPE_RECALL_TEST_PROTECTED_HOME=str(Path.home()), SCOPE_RECALL_ACTIVE_HERMES_HOME=str(isolated / "protected-unused"), SCOPE_RECALL_REAL_HOME=str(isolated / "unused-real"), SCOPE_RECALL_TEST_TIER=tier, HF_HUB_OFFLINE="1", TRANSFORMERS_OFFLINE="1")
     env.update(packaging_helper_env(tier))
+    env.update(node_helper_env(tier))
     if tier in _PROCESS_TIERS:
         # Process tiers enable v11_guard's allowlisted TEST child-process path;
         # network and protected-file checks remain active in the parent.

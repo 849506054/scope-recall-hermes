@@ -2,6 +2,31 @@
 
 All notable changes to `scope-recall` will be documented in this file.
 
+## [Unreleased]
+
+## [3.7.1.1] - 2026-10-05
+
+**Fork release.** Upstream v3.7.1 is merged over v3.4.10 (42 non-merge commits, 69 files, +8190/-234):
+a gateway's runtimes share one vector helper, a client's recall server can keep running beside its
+process, WorkBuddy and DeepSeek Harness join the shared store as hosts, every store connection reads
+the store through a memory map, and a tool result's capture is written without the adapter lock and
+kept to retry rather than lost.
+
+Ten files conflicted.  The fork's own faces are re-applied over the rewritten code, and upstream
+carries none of them: the qdrant backend (store, HTTP worker, config, mutation, migration) with its
+runtime wiring, the query route's share accounting and warm-up (`_log_vector_loss`,
+`_warm_query_route`), the auxiliary routes' cleartext endpoints and the embedding route's own egress
+proxy, the fork's doctor probes and its maintenance commands.  Upstream's capture/retry rewrite, its
+shared vector helper and the new host entries are taken as upstream wrote them.
+
+### Upgrading from 3.4.10.3
+
+1. Stop the hosts and the Scope Recall worker, and take a `backup`.
+2. Install the 3.7.1.1 package, then run `plan-install` and `apply-install` for each host.
+3. Start the hosts again and run `doctor`.
+
+The store's schema is unchanged (1110).
+
 ## [3.4.10.3] - 2026-10-05
 
 **Fork release.** A route may now state the proxy its own requests leave through. The embedding
@@ -52,6 +77,265 @@ query route is still warmed before the recall needs it when the last recall was 
 
 The store's schema is unchanged (1110).
 
+## [3.7.1] - 2026-10-05
+
+3.7.1 lets the MCP tools say why they refused a call, and recognises an older copy of the current message whatever its closing punctuation, as long as both ask or neither does.
+
+### Fixes
+
+- **MCP tools say why they refused a call.** mcp 2 shows the model only `Error executing tool <name>` for an exception other than its own `ToolError`, so a refused call gave no reason to correct: a change asked from a client that sends no conversation id (Claude Code, WorkBuddy, dsh), a scope the caller may not write, a malformed argument. A contract refusal now reaches the model as its code and the name of the field it refused (`ACCESS_DENIED: invalid codex_thread_id`); nothing read from the store is in it. `inspect` advertises its `limit` bound (1 to 24), as the Hermes tool already did, so a larger one is refused by the SDK's argument check, whose message names the bound.
+- **An older copy whatever its closing marks.** The automatic recall sets an older copy of the current message aside, since the message already says it, and for a query of five search terms or more follows it to what it was told. A copy is now recognised whatever its closing punctuation and surrounding spaces, as long as both end asking (on a question mark or an asking particle) or neither does (`same_message`).
+  - Compared character for character, "我家窗外有什么" and "我家窗外有什么？" were two messages; on 2026-10-04 the copy without the question mark took a slot of the owner's automatic packet as if it answered.
+  - A statement asked back as a question ("我的航班改到周五早上八点了。", then "……八点了？") stays two messages, however long, so the person's statement is still found. Different words, a space between them, or a different letter case ("Release-2", "release-2") still make another message.
+- Whether a message only asks, and where its closing marks begin, are read from its end once. A pattern anchored at the end tried a long run of spaces or marks again from each of its positions: 7.5 s for one message holding a run of 32,000 (measured in review). No message on the shared store holds a run of even 500 inside it.
+
+### Known limits
+
+- **A short question asked again is not given what it was told.** An older copy leads to what it was told only for a query of five search terms or more, so that a short command sent again does not bring back an old turn. "我家窗外有什么" holds four. On 2026-10-04, asked of dsh with vectors on, the automatic recall delivered six items: earlier copies of the question, a complaint about it and the investigation that followed. None said what is outside the window, and the answer ranked twelfth. dsh's own reply that evening restates the answer, and on the store as it stands that reply now comes first, in 3.7.0 and 3.7.1 alike.
+  - A lower bar for questions was measured (one more of the owner's 173 questions answered, none lost) and withdrawn in review. Four-term status questions ("测试通过了吗？") would have put their last answer above newer messages that contradict it, and commands that end like questions ("按你说的做吗？") would have brought back old turns. Tests now pin both.
+
+### Measured
+
+On a copy of the shared store taken at 2026-10-04 21:39, each entry asking with its own binding and audience, 3.7.0 against 3.7.1:
+
+- The owner's 173 real questions asked again on the automatic path: identical case by case (rank and item count), words only (147 in the top five) and with vectors (139).
+- The older sets (facts, no-match, rephrased questions and the older QA set on the recall tool's path, tianshu and tianji): identical case by case, words only; the set holding the automatic no-match questions also with vectors.
+- The window question through tianshu's entry, with vectors, in four spellings ("我家窗外有什么", with "？", with "?", with " ？"): 3.7.0 set aside only the copy spelled exactly like the query (none for " ？"), and the other copy took a slot; 3.7.1 sets aside both copies in every spelling.
+
+### Upgrading from 3.7.0
+
+Install the package and run `plan-install` and `apply-install` where you upgrade, and restart the clients' MCP servers and the Hermes gateways. The store's schema is unchanged (1110).
+
+## [3.7.0] - 2026-10-04
+
+3.7.0 lets DeepSeek Harness (dsh) join a shared store: its prompts are recalled before each turn and each turn's messages are stored, by a dsh plugin that runs the entry's hooks.
+
+### Features
+
+- **dsh as an entry of a shared store** (`attach --host dsh`, `plan-install` / `apply-install --host dsh`), the owner at this machine, measured with dsh 0.2.0-rc.2. dsh's own hooks name no turn and no reply, and its session log is compressed (multi-frame Zstandard), so no hook could record a turn there.
+  - A native dsh plugin (`distribution/dsh/scope-recall/index.mjs`, an ES module run inside dsh, no dependencies) runs the entry's hook client (`hook_entry --host dsh`), the one the other clients' hooks run. It owns no memory policy.
+  - Recall: before the first step of each turn (`agent/pre-step`) it runs the prompt hook with the person's message, the last of theirs that step takes. The prompt is stored as the owner's, named by the session and dsh's turn number, and what is remembered is added to the step as a message of its own (`source.kind: plugin:scope-recall`). The step waits up to 9 s (`recallTimeoutMs`), then goes on without it; cancelling the turn ends the hook. The plugin takes the answer as soon as it is whole, while the hook goes on to start the resident recall server.
+  - Capture: it keeps each turn's messages as dsh commits them (`session/event`: the person's and the model's text; dsh's own context, ours, a subagent's session, tool calls and results, files and the model's reasoning are left out) in a spool, `<entry>\scope-recall\dsh-spool\`, one file per session and dsh process. When the turn ends it runs the `Stop` hook with them: the reply under the turn, what the model said while it worked and what the person sent meanwhile, read as a remote client's record lines (`transcript.dsh_lines`, at most 500 per hook). The hook answers how many lines it stored (`through`), and those leave the spool. A message sent twice is stored once.
+  - A `Stop` stores what it can in its time (the hook reads at most 3 s of lines); the next takes the rest at once, and only one that stores nothing ends the store. A failed store keeps the messages: they are stored at the session's next turn end, or by a pass every minute over files idle for 2 minutes, one session at a time, a store that stores nothing ending the pass and the next waiting longer (up to 30 minutes). Only the process that wrote a file rewrites it; the file of a dsh that is gone (or idle for 6 hours) is taken whole by a rename, which one process alone wins. Bounded: a message's text up to 20,000 characters and 36 KB; a message waiting longer than 14 days, or past 5,000 of a session, is dropped and said.
+  - A completed turn's reply goes with its `Stop` only when it was said at most a minute before: the store recognises the reply among the turn's messages by its words and a moment at most 120 s away, and the reply's moment is the hook's. A reply said earlier, and the last words of a turn that did not complete, are stored from the turn's messages alone.
+  - `<entry>\scope-recall\dsh-plugin-status.json`: the last recall and store, what waits, what was dropped, the next pass, and a privacy alarm should dsh report a session log delivered to its API. A hook that fails is shown with the end of its stderr.
+  - The MCP server runs under dsh's own MCP client (`@deepseek-ai/dsh-mcp-client`, stdio); its tools are `mcp__scope-recall__*`.
+  - The prompt's recall comes from the entry's resident recall server (3.6.0), which outlives a dsh process; `resident_recall_minutes` is 120 by default for dsh.
+- **The installer writes into dsh's home** (`--target-plugin-dir`, default `DSH_HOME`, else `~/.dsh`; `maintenance/install_dsh.py`).
+  - The plugin file goes to `<dsh home>\scope-recall\dsh-plugin\index.mjs`, in the receipt.
+  - Two rows go into dsh's home patch, `cordis.patch.yml`, as one `insert` between markers: `scope-recall` (the plugin) and `mcp-scope-recall` (the MCP server). dsh composes every profile with that file after the profile's own layers. Every other line is kept, the file is copied to the backups first, a second install changes nothing, and uninstall takes out only this entry's rows. A file that is not a YAML block list at column 0, rows of these names that something else inserts, another MCP server named `scope-recall`, or another entry's rows are refused, and nothing is written. A re-install writes the block where it stood, so that an operation of the person's after it (switching the plugin off, say) stays after it: dsh applies a patch's operations in order.
+  - dsh uploads each session's log to its model API by default (`session-log-deepseek`), recalled memories with it. Unless the file already leaves it off, worked out as dsh does (the last `disabled` and the last `config` given for the row decide), the install adds `enabled: false` for it, after every other operation on it, between markers of their own. Uninstall leaves that in place.
+  - Every other line is kept byte for byte (lines split at line feeds alone, an indented `[]` kept as the value it is). An install after an uninstall writes the block before an operation of the person's that names one of its rows.
+- The host `dsh` is known wherever a client host is: `attach`, `hook_entry`, `mcp_entry`, `resident`, `doctor` and the install commands.
+
+### Known limits
+
+- Local only: the remote client (`remote-entries.md`) does not take dsh yet.
+- dsh 0.2.0-rc.2 is a candidate; the plugin relies on its plugin interface and session format V4.
+- dsh's feedback upload (`session-telemetry-otel`, a session sent when you send feedback on it) is not changed by the install; `DSH_TELEMETRY_DISABLED=1` switches it off.
+
+### Upgrading from 3.6.2
+
+Nothing changes for the hosts already attached: install the package and run `plan-install` and `apply-install` where you upgrade. Every process on a store must run 3.7.0 or later before a dsh entry attaches to it: an older one does not know the host and cannot replay a capture the entry queued. The store's schema is unchanged (1110).
+
+## [3.6.2] - 2026-10-04
+
+3.6.2 stops a WorkBuddy entry from storing an error notice as WorkBuddy's reply, and says how long its resident recall server really lives.
+
+### Fixes
+
+- When WorkBuddy's model cannot answer (not signed in, a model or network failure), WorkBuddy shows an error in place of the reply and hands it to the `Stop` hook as `last_assistant_message`. The hook stored it as the reply. Seen 2026-10-04 with WorkBuddy's own agent (2.147.0) not signed in: `Authentication required. Please use /login command to sign in to your account` was stored as the assistant's visible words.
+  - WorkBuddy's session record marks such a message: `providerData.error` names the error, and the message's words are the error's.
+  - The `Stop` hook now reads the record's last model message. When it carries an error whose words are the reply's (whitespace aside), nothing is stored for the reply (`client_error_reply`); the person's prompt is kept. The record read skips that message too.
+  - The error's words are kept with the session's turns, so a later turn that is stopped and hands its `Stop` the error again stores nothing either.
+  - A reply that broke off with an error (a stream timeout) keeps the words that were shown.
+  - A WorkBuddy on another machine judges its reply from its own record and tells its entry's server (`error_reply`), which never opens a record for a request. A client or server of 3.6.1 leaves the field out or ignores it, and the reply is stored as before.
+  - A record that cannot be found or read leaves the reply stored as before.
+
+### Known limits, measured
+
+- WorkBuddy's agent (2.147.0) puts itself and every process it starts in a Windows job that ends them all when the agent's process ends. The resident recall server cannot leave that job, so it lives only as long as the conversation's agent process that started it, not apart from WorkBuddy's processes as 3.6.0 said.
+  - While one conversation's process runs, another conversation's first prompt finds it warm: answered in 1.48 s with its vector search, measured 2026-10-04 with WorkBuddy's own agent.
+  - The first conversation's first prompt after WorkBuddy starts, and a prompt right after the conversation holding the server ended, are recalled without it, usually by words and the stored structure alone. A conversation whose MCP server still runs starts a new one within 30 s, and no sooner than a minute after the last start.
+  - [docs/install.md](docs/install.md), section 12, now says so.
+
+### Upgrading from 3.6.1
+
+Quit WorkBuddy, install the package, run `plan-install` and `apply-install` for each host, and restart the clients and the Hermes gateways. The store's schema is unchanged (1110).
+
+## [3.6.1] - 2026-10-04
+
+3.6.1 stores the Hermes tool results that met a busy store, where some were lost.
+
+### Fixes
+
+- A Hermes tool result whose write met the shared store's writer busy past its 1 s was kept in memory, to be written again at the end of the turn. Some never were stored: 10 of tianji's on 2026-10-04, and 6 of tianxuan's, 6 of yuheng's and 2 of tianquan's in the days before. Each was logged once as `not stored (exception), kept to retry at the next turn` and is not in the store.
+  - Hermes runs the end-of-turn hook only after a turn with a message and a reply. A turn it injected (a watch notification), one it interrupted and one without a reply wrote nothing again.
+  - The retry at a turn's end had a capture's own 1 s for all of them: it wrote about one of up to 16 each time.
+  - An idle agent evicted from Hermes' cache keeps its adapter without a shutdown, so nothing wrote them again until a gateway restart dropped them. A session started again in the same adapter cleared them too.
+- Now:
+  - A retry thread writes the kept tool results every 30 s while there are any, whatever the turns, in passes of up to 5 s, off any hook's time and off Hermes' memory worker. A turn's end still tries for 1 s.
+  - Kept across a session switch, each is written in the session it was said in, under its own scope's grant as the installation's manifest gives it now, whatever audience the session that is current has.
+  - A shutdown writes them once more, for up to 2 s.
+  - One still failing after 30 minutes is given up.
+  - Each is logged once when it is kept (`not stored (<reason>), kept to retry`) and once at its end, with its key:
+    - `stored on retry`, or `queued on retry` (into the store's inbox);
+    - `not stored (authorization revoked), dropped`, when its scope was taken away;
+    - `not stored (still failing after 30 minutes), lost`, or `not stored (still failing at shutdown), lost`;
+    - `not stored (<reason>)`, when the store refuses it for good.
+
+    A capture still being written at shutdown is said so, and its end is said when it comes.
+
+### Upgrading from 3.6.0
+
+Install the package, run `plan-install` and `apply-install` for each host, and restart the Hermes gateways. A gateway still on 3.6.0 or earlier drops at its restart what it keeps to retry. The log line of a kept capture now ends `kept to retry`, not `kept to retry at the next turn`. The store's schema is unchanged (1110).
+
+## [3.6.0] - 2026-10-04
+
+3.6.0 recalls a WorkBuddy entry's prompts with the vector search, a new conversation's first prompt included.
+
+### Features
+
+- **A resident recall server** keeps the entry's vector search and embedding connection warm apart from the client's own processes (`adapters/codex/resident_entry.py`).
+  - WorkBuddy 5.6.2 runs the entry's MCP server, and with it the recall server its hooks asked, only inside a conversation's agent process. A prompt that started one met a server still opening its vector store: a cold server answered with its vector search 12.7 s after its start (measured 2026-10-03), past the prompt hook's 6 s. All three prompts measured on 3.5.0 went without it.
+  - The prompt hook starts the resident server after its answer when none runs, at most once a minute. The MCP server WorkBuddy runs with a conversation starts it too, and looks again every 30 s while that process runs. It is started through a process that ends at once, in a process group of its own, broken away from the client's job where Windows allows it, so ending a conversation's process tree does not end it. No task or service is registered with the system.
+  - It names itself resident in the entry's endpoint folder, and a hook asks it before any other server.
+  - It ends `resident_recall_minutes` after the last prompt's recall and the last look of a running MCP server: 120 for WorkBuddy by default, set in the entry's runtime config, 0 for none. It reads the value every 30 s. Claude Code and Codex keep none by default, since their server runs as long as the client.
+  - It ends within 30 s once its package on disk is replaced or removed. A prompt hook that finds one of another version running (from another venv, say) stops it and starts its own where it can prove the process is that server and may end it, and `apply-install` stops the entry's resident. No hook or MCP server keeps one of another version up, so one that cannot be stopped ends at its idle end, and hooks of two versions against one entry switch it at most once a minute.
+  - It ends once a recall has run 5 minutes past its time, since such a server answers every hook that it is busy; the next look starts a new one.
+  - While it runs it holds a vector helper, about 1 GB. The MCP server WorkBuddy runs with each conversation then answers no hook and warms nothing.
+  - One runs for each entry and client, held by a file lock; a second of the same version gives way to the first. It writes nothing to the store.
+  - `scope-recall resident status|stop --home <entry> --host workbuddy` shows it or stops it; `stop` exits 1 when one still holds the lock. A process whose identity cannot be proven (no start time, as on macOS) is never stopped. Stop it before a `package-upgrade` of the entry's package, after quitting the client; `apply-install` and `apply-uninstall` stop it.
+  - The first prompt after it ended, or after a reboot, starts it and is recalled the old way.
+- **A recall server's start warms its query embedding as well as its vector store**, once, for every client, within 10 s. Warmed by the store alone, a cold server lost the vector search of its first two recalls to the embedding's time (`AuxiliaryModelError:timeout`).
+
+### Upgrading from 3.5.1
+
+Install the package, run `plan-install` and `apply-install` for each host, and restart the clients and the Hermes gateways. Quit WorkBuddy before its entry's upgrade. A WorkBuddy entry starts its resident recall server at its next conversation or prompt, with nothing to configure; `resident_recall_minutes` in the entry's runtime config changes its minutes, and 0 keeps none. From 3.6.0 on, stop a running resident with `scope-recall resident stop` before a `package-upgrade` of the entry's package; left running, it ends itself within 30 s of the upgrade. The store's schema is unchanged (1110).
+
+## [3.5.1] - 2026-10-03
+
+3.5.1 keeps every tool result of a Hermes step whose tools run in parallel.
+
+### Fixes
+
+- Hermes calls the tool hook for each of a step's parallel tool calls at once. Each capture held its session across its store write, which took 1.4-4.4 s on the shared store, and the hooks behind it waited. A hook waits for its session at most 10 s, so those past that were not taken, and their tool results were lost: 6 on yuheng and 2 on tianji on 2026-10-03, each logged as `post_tool_call not taken`.
+  - A tool result is now written without holding its session, as a finished turn's captures already were. The step's other tool hooks no longer wait for it. Their writes still take turns at the store's single writer, each within its own budget.
+  - A shutdown waits up to 10 s for a tool result being written. One still writing after that is counted in the shutdown state (`captures_still_writing`).
+  - A capture is kept to retry only once its write fails for a reason that may pass, so a retry pass never writes again a tool result that is still being written.
+  - A hook still cannot wait out a session held by a message's capture. That case is logged and counted as before.
+- `--target-plugin-dir`'s help names `mcp.json`, the file the WorkBuddy installer writes, instead of `.mcp.json`.
+
+### Upgrading from 3.5.0
+
+Install the package, run `plan-install` and `apply-install` for each host, and restart the Hermes gateways. The store's schema is unchanged (1110).
+
+## [3.5.0] - 2026-10-03
+
+3.5.0 brings WorkBuddy into the shared store, and keeps the first recall after an idle stretch whole. Measured on this machine's Claude Code, on the prompts that came after 40 or more idle minutes:
+
+- On 3.4.10 and 3.5.0rc1 (2026-10-01 15:55 to 2026-10-02 13:18, UTC-4), 7 of 18 such prompts lost their vector search or ran past their time in the store's own search: 4 lost the vector search, 5 ran past their time, and 2 did both.
+- On 3.5.0rc3 and rc4 (2026-10-02 18:30 to 2026-10-03 05:30), none of 6 did either.
+- Left out of the second count: a prompt that met a server still starting after a session restart, and one at 17:30, when a copy of the store had just read the whole file into the system's cache.
+
+### Requirements
+
+- WorkBuddy on Windows needs Git for Windows. WorkBuddy runs hook commands through Git Bash, and without it through PowerShell, which cannot run them.
+
+### WorkBuddy
+
+- WorkBuddy (the CodeBuddy team's desktop agent workbench) joins a shared store as an entry, the owner at this machine. Run `attach --host workbuddy`, then `apply-install --host workbuddy` with WorkBuddy quit, then approve the MCP server `scope-recall` once in WorkBuddy ([docs/install.md, section 12](https://github.com/410979729/scope-recall-hermes/blob/v3.5.0/docs/install.md#12-workbuddy)).
+- Each prompt is stored, and what is remembered is put in front of it. Each reply is stored at `Stop`, together with the text shown between tool calls, read from WorkBuddy's session record. On WorkBuddy 5.6.2, the prompts and replies of three turns were stored as the entry's, and its recalls brought back what other entries had stored.
+- `apply-install` adds three command hooks to `settings.json` in WorkBuddy's home: `UserPromptSubmit` waits 15 s, `Stop` and `SessionEnd` 10 s each. It adds the server `scope-recall` to `mcp.json` there.
+  - It keeps every other key, hook and server, and copies each file to the entry's backups first.
+  - It refuses beside another Scope Recall hook, beside a `scope-recall` server that is not this entry's, and on a file with comments.
+  - `apply-uninstall` takes out only this entry's hooks and server.
+- A WorkBuddy on another machine joins through the remote client (`"host": "workbuddy"` in `client.json`).
+- Known limits:
+  - The prompt that makes WorkBuddy start a conversation's agent process is recalled without the vector search, by its words and the stored structure only (`helper_lock_timeout`).
+    - WorkBuddy 5.6.2 starts its MCP servers with that process: when a conversation opens, or when a prompt comes to a conversation that has none. That prompt's recall meets this entry's server still opening its vector store. All three prompts measured were such prompts.
+    - WorkBuddy keeps the process between turns, and a prompt to a running process is answered by its server. One that had run 74 minutes without a turn answered a test recall, asked as the hook asks, with its vector search in 3.1 s.
+    - A WorkBuddy on another machine is answered by its entry's server here, which runs on.
+  - A multi-line message is stored as one line. Of the messages sent while a turn runs, the last is stored twice.
+  - A subagent's work is not recorded. A session cron's or a goal's first prompt is stored as the owner's.
+  - `doctor` does not read WorkBuddy's settings, and the `scope-recall-memory` skill is not installed into WorkBuddy.
+
+### Recall after an idle stretch
+
+- A server that answers its client's prompt recalls now searches its vector store once more after each 10 minutes without a recall that searched it. That covers the MCP servers of Codex, Claude Code and WorkBuddy entries of a shared store (WorkBuddy's while its conversation's process runs), and an entry's server for another machine. Left alone, the OS gave the index's pages to other work, and the first recall after an idle hour searched past its time and recalled by words alone.
+- The store's operations read it through a memory map (`SQLiteStorage`). A hook recall read every page it touched with a read call of its own: 151,000 of them for a 3,800-character prompt. Through the map the pages come from the system's file cache, and a recall takes about 40 % less time, warm or cold. On a copy of the shared store, that prompt's recall took 0.73-0.76 s instead of 1.20-1.76 s warm, and 1.64-1.69 s instead of 2.68-3.11 s cold.
+  - SQLite maps at most its build's limit, 2,147,418,112 bytes in Python's builds. Past it, the rest of the file is read as before, so the gain fades as a store grows beyond it.
+  - An I/O error on a mapped page ends the process instead of failing the read. On Windows, a file another process maps cannot shrink: `VACUUM` leaves it at its size, and nothing here runs one.
+
+### Fixes
+
+- A transaction whose first statements failed left its connection open: reading the store's version, or switching a writer to WAL. A writable one kept the writer lease until its process ended, and every other process's writes failed. The connection is now closed before the failure returns.
+- On Windows, a Hermes gateway keeps one vector helper for all the agents it makes.
+  - Before, it attached a runtime, with a helper of about 1.15 GB, for every agent. Hermes did not always shut down the one it made before: yuheng's gateway held two on 2026-10-02.
+  - The gateway's sessions take turns on that helper, as a server's prompts do.
+  - No spare helper starts while a store the process shares holds a live helper.
+  - A provider's shutdown no longer stops the helper; it ends with the gateway.
+
+### Upgrading from 3.4.10
+
+1. Stop the hosts, the Scope Recall worker and any remote entry's server, and take a `backup`.
+2. Install the 3.5.0 package, then run `plan-install` and `apply-install` for each host.
+3. Start the hosts and any remote entry's server again, and run `doctor`. A Claude Code or Codex server keeps the code it started with until its client restarts.
+4. Attach a WorkBuddy entry only once every process on the store runs 3.5.0, the shared worker first. An older process does not know the host and cannot replay that entry's queued captures.
+5. Before going back to 3.4.x or older, take WorkBuddy's hooks out with `apply-uninstall`, or a remote client's by hand. An older package does not know `--host workbuddy`, so every hook would fail on every turn. Each hook command ends in `|| exit 1`, so WorkBuddy reports the failure and lets the prompt through, but an older package cannot take the hooks out.
+
+The store's schema is unchanged (1110). Every change, with its details, is in [CHANGELOG.md](https://github.com/410979729/scope-recall-hermes/blob/v3.5.0/CHANGELOG.md).
+
+## [3.5.0 candidates] - 2026-10-02 to 2026-10-03
+
+### Scope Recall 3.5.0rc4 - 2026-10-03
+
+- The version moves past the `v3.5.0rc3` tag.
+- A Hermes gateway keeps one vector helper, whatever number of agents it makes. Every runtime of the process searches one store of each table through one helper, as a server's runtimes already did (`vector.process_store.share`).
+  - Before, the gateway attached a runtime, with a helper of its own (about 1.15 GB), for every agent it made. Hermes did not always shut down the one it made before.
+  - On 2026-10-02, yuheng's gateway held two helpers after its agent was made again: one per registration of the provider, at 19:20 and 22:42. Tianji's held one for its one registration. The machine stood at 96 % of its commit limit.
+  - The gateway's sessions take turns on the helper, as a server's do. A provider's shutdown no longer stops it: it serves the gateway's other runtimes and ends with the process.
+- A process that shares its stores starts no spare helper while a store it shares holds a live helper. A gateway asks for one each time it binds an agent, and that spare would never have been taken (about 0.55 GB idle).
+  - A store that has just taken the spare counts, before it asks for its table.
+  - A helper that ended outside any request does not count, so the next bind starts a spare for the reopen.
+
+### Scope Recall 3.5.0rc3 - 2026-10-02
+
+- The version moves past the `v3.5.0rc2` tag.
+- The connections the store's operations open read the store through a memory map (`SQLiteStorage`; maintenance and `doctor` open their own, unmapped). Each operation opens its own connection, and on a shared store another process writes between any two recalls, so SQLite's own page cache never carries over. A hook recall read every page it touched with a read call of its own: 151,000 of them, 586 MiB, for a 3,800-character prompt. Through the map the pages come straight from the system's file cache, and a recall takes about 40 % less time.
+  - Measured on a copy of the shared store, two series of runs. That recall took 0.73-0.76 s instead of 1.20-1.76 s with the file cache warm, and 1.64-1.69 s instead of 2.68-3.11 s with it cold. A short prompt took 0.70-0.73 s instead of 1.07-1.24 s warm, and 1.56-1.58 s instead of 2.43-2.52 s cold.
+  - The cold case is meant to model a server's first recall after an idle stretch. On this machine's Claude Code, 9 of 40 prompts after 40 to 90 idle minutes recalled past their time (`deadline_exceeded_collect`, `_hydrate`, `_relation`), with or without the vector search.
+  - SQLite maps no more than the file holds and at most its build's limit: 2,147,418,112 bytes in Python's builds (SQLite 3.53.1). The shared store here is 2,031,501,312 bytes, so all of it is mapped. Past the limit a store is read as before, and new pages land at the end of the file, so the gain fades as a store grows beyond it. Writes are unchanged.
+  - Two behaviours change. An I/O error on a mapped page ends the process instead of failing the read. A file that another process maps cannot shrink: a `VACUUM` leaves it at its size, as SQLite documents (nothing here runs one), and a tool that truncates the live file in place is refused.
+- A transaction whose first statements failed (reading the store's version, switching a writer to WAL) left its connection open. A writable one kept the writer lease until its process ended, and every other process's writes failed. A busy store can answer those statements with "database is locked". The connection is now closed before the failure returns.
+
+### Scope Recall 3.5.0rc2 - 2026-10-02
+
+- The version moves past the `v3.5.0rc1` tag.
+- A server that answers its client's prompt recalls searches its vector store once more after each 10 minutes without a recall that searched it. That is the MCP server of Codex, Claude Code and WorkBuddy, and an entry's server for another machine. The vector helper keeps the index in its memory, and a search touches the part its filter keeps. Left alone, the OS gave those pages to other work. The first recall after an idle hour then searched past its time and recalled by words alone.
+  - This machine's Claude Code lost the vector search on 2 of the 4 prompts it had after an idle hour.
+  - It lost it on none of the 5 it had while another process searched the same index every 10 minutes.
+  - The search filters on every partition the entry's recalls search. Filtered on one, it held no rows for any entry of the shared store and touched 26 MB of the 306 MB a recall needs (copy of the store).
+  - What the search finds is not looked at, and it writes nothing. A moment when a recall holds the server's handler is skipped. A search that failed is tried once more at once, and closing the server does not wait for one.
+
+### Scope Recall 3.5.0rc1 - 2026-10-02
+
+- WorkBuddy (the CodeBuddy team's desktop agent workbench) joins a shared store as an entry, the owner at this machine: `attach --host workbuddy`. It runs the hook client and MCP server that Claude Code and Codex run. Each prompt is stored and what is remembered is put in front of it. Each reply is stored at `Stop`, and so is the text shown between tool calls, read from WorkBuddy's session record. The hook payloads and the record's layout were checked against a live WorkBuddy 5.3.14.
+- `apply-install --host workbuddy` adds three command hooks to `settings.json` in WorkBuddy's home: `UserPromptSubmit` (15 s), `Stop` and `SessionEnd` (10 s each). It adds the MCP server `scope-recall` to `mcp.json` there, the file of the user's own servers. WorkBuddy starts its agent with its connector proxy alone and never reads another server from `.mcp.json`. It starts a server from `mcp.json` once that server is approved in its MCP settings.
+  - Every other key, hook and server stays, and each file is copied to the entry's backups before it changes.
+  - Neither file enters the receipt. `apply-uninstall` takes out only this entry's hooks and server.
+  - The install refuses beside another Scope Recall hook, beside a `scope-recall` server that is not this entry's, and on a file with comments.
+  - See [docs/install.md](docs/install.md), section 12.
+- WorkBuddy's hooks name no turn they share. A prompt opens one: under its `generation_id` when that id is new to the session, else under an id made from the session, the words and the moment. Its `Stop` closes that turn. The session record's messages are matched to the kept turns, so each message is stored once, although WorkBuddy hands the hook its words without their line breaks.
+- In the record, a user message counts as the owner's only inside its `<user_query>` blocks. WorkBuddy's own user messages are not stored as the owner's words: command and shell output, a teammate's report, a slash command's expansion. Messages sent while a turn runs are merged into one, and the prompt hook gets only the last. The others are stored from the record when that turn ends, together with the last, which is so stored twice.
+- A reply that repeats the session's last one is what WorkBuddy hands the `Stop` of a turn stopped before it said anything, and the hook does not store it. When the record shows the turn did say those words again, they are stored from the record.
+- Prompts WorkBuddy sends on its own are not the owner's: a background task's notice, and a Stop hook's or a goal's request to go on (`Stop hook feedback:`). A session cron's or a goal's first prompt cannot be told from the owner's, and is stored as theirs.
+- WorkBuddy pastes a prompt hook's raw output into the prompt when that output carries no `additionalContext`. For this host, a hook with nothing to recall prints nothing, even when its remote client cannot load its configuration. The other hosts still get `{}`.
+- WorkBuddy blocks a prompt whose hook exits 2, which is what argparse exits with when an older package does not know `--host workbuddy`. Every WorkBuddy hook command ends in `|| exit 1`, so a failing hook is reported and the prompt goes through. Take the hooks out with `apply-uninstall` before rolling back below this release.
+- A WorkBuddy on another machine joins through the remote client (`"host": "workbuddy"` in `client.json`). Its `install` merges into WorkBuddy's own two files the same way ([docs/remote-entries.md](docs/remote-entries.md)).
+- Upgrade order: every process on the store must run 3.5.0rc1 before a WorkBuddy entry attaches, the shared worker first. An older process does not know the host and cannot replay that entry's queued captures.
+- Known limits: a multi-line message is stored as one line, a subagent's work is not recorded, and `doctor` does not read WorkBuddy's settings.
+
 ## [3.4.10] - 2026-10-01
 
 3.4.10 fixes three faults reported on GitHub, all on Hermes. A session's hooks could wait out Hermes' hook timeout and then be skipped for every session (#169). The sessions of a dashboard login were never stored or recalled, and nothing said so (#175). On a host that hands its packages over on `PYTHONPATH`, the LanceDB helper could not start, so the vector search was dead (#176). Our own five gateways were not exposed to #175 or #176, and met #169 rarely.
@@ -87,55 +371,6 @@ The store's schema is unchanged (1110).
 3. Start the hosts again and run `doctor`.
 
 The store's schema is unchanged (1110). Every change, with its details, is in [CHANGELOG.md](https://github.com/410979729/scope-recall-hermes/blob/v3.4.10/CHANGELOG.md).
-## [3.4.9.2] - 2026-10-01
-
-**Fork release.** The first query embedding after idle is asked for before the recall needs it, and the search waits
-for a prefetched embedding only as long as the embedding was given.
-
-Measured on this install (2026-10-02, three times): after a few idle minutes the recall's own embedding cost
-2.4-2.8 s of its 4 s window while the collection answered 200 in 0.68 s, and the recall came back without its
-semantic channel -- the accounting line 3.4.8.3 added is what showed where the window went.  Asked for on its own
-the same embedding costs 0.66 s and leaves the recall's own at 0.42 s, so the host adapter asks for one
-(`_warm_query_route`) when the last recall was more than a minute ago: fire-and-forget, never on the recall's path,
-and not at all in a chatty exchange, which leaves the route warm by itself.  What goes cold is this process's
-connection to the provider: a fresh process's request through the same proxy measures 0.57 s cold and a warm-up in
-another process does not help.
-
-`_embedding_wait` (runtime/instance.py) ends the search's wait for a prefetched embedding at the embedding's own
-deadline, so a provider that never answers no longer holds the recall for the search's share instead.
-
-### Upgrading from 3.4.9.1
-
-1. Stop the hosts and the Scope Recall worker, and take a `backup`.
-2. Install the 3.4.9.2 package, then run `plan-install` and `apply-install` for each host.
-3. Start the hosts again and run `doctor`.
-
-The store's schema is unchanged (1110).
-
-## [3.4.9.1] - 2026-10-01
-
-**Fork release.** Upstream v3.4.9 is merged over v3.4.8 (16 files, +540/-53): a store left with no
-table is opened again instead of failing every search until the process ends, and the helpers of
-one server are shared.  This fork keeps its qdrant backend and the change below.
-
-The vector search's share of a recall's window is measured from the moment the query embedding
-lands, not from the recall's start: a cold connection to the embedding provider spent that share
-before the search could use any of it.  Measured on this install: a prompt after five idle minutes
-embeds in 2.43 s of the search's 3.00 s share, leaving the collection 0.57 s to answer in; its
-0.57-0.68 s answer missed the deadline, and the recall came back without the semantic channel
-(`vector_error:QdrantHTTPError:timeout`) while the collection itself answered 200 in 0.68 s.  The
-helper's open (0.22 s) and its start (0.09 s) were measured too, and are not the cost.
-`_QuerySearch.deadline_for` takes the share from `_QueryEmbedding.finished`, capped by the recall's
-own deadline, and `_LazyVectorPort._search` runs the collection under that deadline.  How long a
-recall waits for the search is Core's call, unchanged.
-
-### Upgrading from 3.4.8.3
-
-1. Stop the hosts and the Scope Recall worker, and take a `backup`.
-2. Install the 3.4.9.1 package, then run `plan-install` and `apply-install` for each host.
-3. Start the hosts again and run `doctor`.
-
-The store's schema is unchanged (1110).
 
 ## [3.4.9] - 2026-10-01
 
@@ -158,95 +393,6 @@ The store's schema is unchanged (1110).
 3. Start the hosts again and run `doctor`. Restart a remote entry's server so that it serves with the shared helper.
 
 The store's schema is unchanged (1110). Every change, with its details, is in [CHANGELOG.md](https://github.com/410979729/scope-recall-hermes/blob/v3.4.9/CHANGELOG.md).
-## [3.4.8.3] - 2026-10-01
-
-**Fork release.** A recall that comes back without the semantic channel says so, once, with the
-stages that took its share.
-
-`_QuerySearch.timeline` reports the query embedding's provider round trip, the helper's open and
-the search beside each other; `RetrievalPipeline.last_vector_failure` carries that reading out of
-the read-only pass, and the host adapter logs it when a packet's gaps name a lost vector channel.
-Measured on this install (2026-10-01): a prompt after a few idle minutes embeds in 2.4 s of the
-search's 3.0 s share -- the connection to the provider has gone cold -- and the collection's
-0.57-0.68 s answer then misses the deadline.  The helper's open costs 0.22 s.  Until now the loss
-was counted by hand, from a probe run beside the install.
-
-## [3.4.8.2] - 2026-10-01
-
-**Fork release.** The semantic search starts with the recall, and the thread that ran it beside
-the local channels is out of `core/recall.py`.
-
-`runtime/instance.py`'s `_LazyVectorPort.prefetch_query` starts the whole search when the recall
-starts -- the embedding, the store's open and the search -- instead of asking for the embedding
-alone. The search runs under its own deadline inside `_QuerySearch`, and the round that asks for
-the same query takes what it found within its own `remaining_seconds`, so a search that leaves
-the machine costs the recall the longer of the two rather than their sum. Core stays
-single-threaded.
-
-What leaves `core/recall.py`: `_StartedChannel`, `_VECTOR_JOIN_GRACE`, and the join that reported
-a still-running search as `deadline_exceeded_vector`. The three objections upstream raised on
-PR #173 went with them -- a thread spent the round's `ChannelBudget` from beside it, waited past
-the recall's deadline for its 0.25 s grace, and started inside `_collect` after the read
-transaction had opened. A search that overruns now names `helper_open_deadline` or
-`helper_request_deadline`, which is what the grace existed to keep. The mechanism is upstream's:
-the maintainer's patch on PR #173, measured against their own store, and not carried there since
-their store never leaves the machine.
-
-Measured here before it: a host prefetch spent 3.66 s of its five-second window and the search,
-run last, was handed what was left -- a transport timeout and a recall without its meaning
-channel. Coverage: upstream's `test_a_slow_sqlite_channel_leaves_the_vector_search_its_window`
-(the word search takes 1.1 s of a 1.6 s window, the store answers in 0.45 s, which the 0.36 s it
-left would not cover).
-
-### Upgrading from 3.4.8.1
-
-1. Stop the hosts and the Scope Recall worker, and take a `backup`.
-2. Install the 3.4.8.2 package, then run `plan-install` and `apply-install` for each host.
-3. Start the hosts again and run `doctor`.
-
-The store's schema is unchanged (1110).
-
-## [3.4.8.1] - 2026-10-01
-
-**Fork release.** Upstream v3.4.7 and v3.4.8 are merged over the shared v3.4.2 baseline
-(33 commits, 35 files): a question that names a day is answered from that day
-(``recall_scope``), at most half the packet of the last copy's turn is raised above the best
-candidate said before it, an older copy found on the way leads to its turn, a message sent
-into a running turn waits for a key of its own, a candidate statement past the deadline is
-interrupted, and the lexical statement starts from the query's terms at both of its call
-sites.  Upstream's tree is taken whole; what follows the upstream sections is the fork's own
-surface.
-
-### Folded into upstream's tree
-
-- The lexical statement's ``CROSS JOIN`` pin (fork 3.4.7) and the contract test that guarded
-  it.  Upstream's ``WHERE ... AND +e.scope_id IN (...)`` keeps the scope filter from choosing
-  an index, in ``retrieval_storage.lexical`` and in ``storage.search_limit`` alike.  On this
-  instance's store the two forms are one plan: read-only against the live store (30 frequent
-  terms, 3 scopes, limit 40) upstream's form starts from
-  ``SEARCH t USING COVERING INDEX ... (term=?)`` and returns the same 40 rows in 1.72 s, the
-  fork's pin in 1.77 s, and the shared 3.4.2 form starts from
-  ``SEARCH e USING INDEX source_content (scope_id=?)`` and takes 5.80 s.
-- The phase timing instrumentation of fork 3.4.4 and 3.4.5, retired by upstream's 3.4.8
-  release commit, and the host adapter comment that described it.
-
-### Fork surface kept
-
-- ``vector/``: the Qdrant backend (``qdrant_config``, ``qdrant_http`` and its worker,
-  ``qdrant_mutation``, ``qdrant_store``), bound in ``runtime/instance.py`` and
-  ``runtime/resume_entry.py``, with ``maintenance/vector_migration.py``.
-- The semantic channel starts beside the local channels and is joined at its turn, with a
-  0.25 s grace for a helper that is still working (fork 3.4.6).
-- ``adapters/models.py``: the Voyage embedding path falls back where the host supplies no
-  usage.
-- ``maintenance/doctor.py``: the remote collection's facts, and the vector probe flags.
-- The fork's maintenance commands and its pip-less install path.
-
-### Numbering
-
-The fork line numbers itself as upstream plus a fourth digit (``3.4.8.1``) from this release
-on.  The fork's own 3.4.3 - 3.4.8 were released while upstream used those same numbers for a
-different tree, and a published version may not name a second one.
 
 ## [3.4.8] - 2026-09-30
 
@@ -265,7 +411,6 @@ different tree, and a published version may not name a second one.
 3. Start the hosts again and run `doctor`.
 
 The store's schema is unchanged (1110). Every change, with its details, is in [CHANGELOG.md](https://github.com/410979729/scope-recall-hermes/blob/v3.4.8/CHANGELOG.md).
-
 
 ## [3.4.7] - 2026-09-30
 
@@ -366,8 +511,6 @@ The store's schema is unchanged (1110). Every change, with its details, is in [C
 The store's schema is unchanged (1110). Every change, with its details, is in [CHANGELOG.md](https://github.com/410979729/scope-recall-hermes/blob/v3.4.3/CHANGELOG.md).
 
 ## [3.4.2] - 2026-09-29
-
-**Fork note.** This release is upstream's `3.4.2` with the remote Qdrant backend on top of it. Upstream 3.4.x fixes three things the fork had carried locally — the prompt's embedding asked for as the recall starts (the fork's `_StartedChannel`), `--python` passed on as given (#141), and Codex's hook budget — so those fork patches are retired here. What stays fork-own: the Qdrant store with its wiring and maintenance commands, and the doctor probes that measure a `PYTHONPATH` install.
 
 3.4.2 keeps a long prompt's recall within its time. The word search of a prompt looked up every word it held: a 2,000-character prompt's 80 words held 273,000 index entries on the shared store and took 9 s, longer than the prompt's whole recall, which then went without its search by meaning as well (`deadline_exceeded_collect`). On 2026-09-29 Codex on another computer, whose prompts are often that long, was recalled for by words alone that way on 7 of about 16 prompts. Nothing else changes for a question of up to 16 search terms.
 
@@ -682,99 +825,6 @@ Two AI reviews of everything since 3.2.0, before the tag. What they found and th
 
 - The version moves past the `v3.2.0` tag.
 - The shared store's commands read a worker runtime config sized for every scope a store may hold. The worker's config lists each scope twice, about 120 bytes a scope, and `attach`, `detach` and `adopt` read it only up to 64 KB, which the pilot's 221 scopes had nearly reached (58 KB). Rehearsing two more instances on copies of the live stores, the first attach took the store to 332 scopes and 85 KB, and the second was refused with `runtime-config.json is missing or too large`; `detach` and `adopt` would have been refused as well. The limit is now 1 MB, about four times what `MAX_SHARED_SCOPES` (1024) needs, and `attach` refuses before it writes a config it could not read back. The worker and its wake never had the 64 KB limit, so no running store stopped.
-## [3.2.8] - 2026-09-25
-
-- **The doctor measures the environment the host actually runs.**  A deployment
-  can serve the package from a persistent directory on `PYTHONPATH` instead of
-  from site-packages.  The interpreter probes ran isolated (`-I`), which strips
-  that path, so a healthy install was reported as `python_package_missing`,
-  `host_registration_incomplete` and an `incomplete` version check — with no way
-  to tell it from a broken one.  `-P` alone keeps the protection that matters: a
-  checkout cannot answer for the install.
-- **`--python` is probed and recorded as given.**  The CLI resolved the path, so
-  a venv launcher arrived at its base interpreter: the doctor measured an
-  environment the host never runs — its missing dependencies reading as drift —
-  and `plan-install` recorded an interpreter that cannot import the package
-  (#87).
-
-## [3.2.7] - 2026-09-25
-
-- **A pending remote mutation has a way out that is not a hand-edited file.**
-  The gate is fail-closed: an unconfirmed write blocks later mutations and purge
-  confirmation until someone clears the marker, and until now the only way was to
-  remove the file by hand. `clear-pending-remote` does it on evidence instead: the
-  collection has to be named, the server read back, and — when the collection
-  holds points, where an interrupted upsert cannot be read back as absent — the
-  operator has to declare the work redone. The clear runs under the same advisory
-  lock a writer takes, so a write that got in between replaces the marker and the
-  identity check refuses.
-
-## [3.2.6] - 2026-09-25
-
-- **The semantic channel is collected alongside the local ones, not after them.**
-  A query embedding leaves this machine while every other channel reads it, and
-  the channel ran last: it received the deadline the local channels left, which
-  on an instance with tens of thousands of sources is less than one embedding
-  needs, so it reported `vector_unavailable` and contributed nothing. It starts
-  with collection and is joined at its turn now, so a recall costs the longer of
-  the two instead of their sum.
-
-## [3.2.5] - 2026-09-25
-
-- **A copy asks the target what it holds instead of trusting a cursor.** A pass
-  that resumed after the last id it had seen skipped rows that arrived earlier in
-  the order than that id: a live instance added 23 sources during one copy and no
-  later pass would have carried them. Every pass now reads the source page, asks
-  the target which of those ids it holds, and writes only the missing ones.
-
-## [3.2.4] - 2026-09-25
-
-- **A copy is verified without a full scan.** Verification read the target's
-  entire id set in one call, which does not fit one request budget at 26,000
-  points. It now proves coverage page by page against the source and takes the
-  target's size from one server-side count, reporting a count difference rather
-  than listing every extra id.
-
-## [3.2.3] - 2026-09-25
-
-- **A companion copy carries its own request budget.** The copy wrote through the
-  store's default per-request budget, which is sized for a recall; a 2048-dimension
-  batch and its read-back do not fit it, so a maintenance copy timed out. The copy
-  now writes through the store's fenced entry with an explicit maintenance budget,
-  and the maintenance command builds its target with that same budget.
-
-## [3.2.2] - 2026-09-25
-
-- **A full-dimension batch is not refused by the size walk.** The walk that
-  refuses a body which cannot be encoded counted nodes against a fixed 200,000;
-  a 64-point batch at 2048 dimensions is 263,619 nodes in 1.8 MB, so the worker
-  refused legitimate writes and a companion copy could not proceed. The bound
-  now follows the byte limit, where every visited node costs at least one
-  encoded byte.
-
-## [3.2.1] - 2026-09-25
-
-3.2.1 is this fork's build on `3.2.0`. It adds a remote vector companion as a selectable
-backend; SQLite stays the authority for facts, identity, permissions, lifecycle and evidence,
-and every candidate a remote store returns is filtered locally before it is used.
-
-- **A `qdrant` vector backend.** Vectors live in a Qdrant collection reached over HTTP, one
-  process per request, an absolute deadline, the API key on stdin, and a code -- never a
-  server body -- in every failure the caller sees. Plaintext HTTP is accepted only for a
-  destination that is explicitly internal, and a host written in an alternative numeric
-  notation (`0x08080808`, `134744072`, `127.1`) is refused rather than resolved. A plaintext
-  destination is resolved once and the checked address is the one dialled.
-- **A durable gate around remote changes.** A change is recorded as pending before it is
-  issued and cleared only after the server reports completion and a read-back agrees. An
-  unacknowledged removal leaves the store pending; pending state blocks later changes and
-  the confirmation of an empty purge until a controlled recovery runs.
-- **Python 3.13.** `requires-python` is `>=3.11,<3.14`, and the wheel installs there.
-- **Voyage usage.** The fallback to `prompt_tokens` applies only when `total_tokens` is
-  absent, so an explicit zero is recorded as what the provider sent.
-
-The remote backend's deployment, migration and recovery paths are verified before this
-build is deployed; the instance this work was developed for runs `3.2.0` with the
-`sqlite-bruteforce` backend.
 
 ## [3.2.0] - 2026-09-24
 
@@ -2489,94 +2539,3 @@ This is the first public release after `v1.4.0`; the GitHub release notes for `v
 - Added a `vector_only_min_score` gate so weak vector-only matches cannot auto-recall unrelated durable ops rows without lexical evidence.
 - Added alias-expanded SQL discovery so lexical-only recall still finds intended alias matches such as `response style` → `replies` without broad recency scans.
 - Added regression coverage for unrelated-query suppression, high-confidence semantic hits, relevant lexical hits, and alias-expanded discovery.
-
-## Fork release line: 3.4.3 - 3.4.8 (fork-only)
-
-Six fork releases on top of the shared v3.4.2 baseline, numbered while upstream released its
-own 3.4.3 - 3.4.8 in parallel; the sections above are upstream's tree.
-
-**Fork cleanup.** The phase timing added to account for this store's five-second window --
-3.4.4's prefetch line and 3.4.5's per-phase seconds -- is retired.  The window is accounted
-for: the semantic search ran last and lost its slice (3.4.6), and the lexical statement drove
-from the scope rather than the query's terms (3.4.7).  `RetrievalPipeline.search` returns to
-its 3.4.4 shape and the host adapter logs nothing of its own; the fixes those measurements
-produced stay.
-
-### [3.4.7] - 2026-09-30
-
-**Fork fix.** The lexical statement's join order was left to the planner, and on a large
-index the planner drove it from ``source_events`` -- every version in the scope -- looking up
-postings per version: the term filter applied after the fact, so the posting budget bounded
-nothing and a real prompt cost seconds.
-
-Measured on this store (3M postings, 81k sources): a 648-character prompt took **3.86 s** in
-the statement alone (the document-frequency read that chooses terms: 0.02 s), the recall lost
-its collect deadline, and the semantic channel with it.  Pinned term-first with ``CROSS JOIN``
--- an inner join SQLite does not reorder -- the same statement returns the **same rows in
-0.19 s**, and end to end the recall went from 4.10 s with ``deadline_exceeded_collect`` to
-1.04 s with no deadline gap at all.
-
-A contract test captures the statement the channel runs and fails if the pin goes away.
-
-### [3.4.6] - 2026-09-30
-
-**Fork fix.** The semantic channel ran after the local ones, so its slice was what they
-left.  A host prefetch that spent 3.66 s of its five-second window handed the remote
-search 0.03 s, and the recall lost its meaning channel to a transport timeout -- 3.4.5's
-phase line named ``vector`` as the largest phase and the search as the thing that ran out.
-
-The search now starts with collection, beside the local channels, and is joined when its
-turn comes: the recall costs the longer of the two instead of their sum, and the search
-keeps a slice of its own.  A contract test proves it with a local channel that spends
-0.45 s of a 0.5 s window: the search is handed 0.03 s before this change and 0.37 s after.
-
-### [3.4.5] - 2026-09-30
-
-**Fork release, temporary instrumentation.** 3.4.4's prefetch line says what the recall
-cost, not what it spent it on.  The pipeline now records each phase of the last search --
-``epoch``, the four local channels, ``vector``, ``collect``, ``relation_hydrate``,
-``select`` -- and the host adapter's line carries them.
-
-Measured on this instance (same store, same request shape): ``vector`` is the largest
-phase at 0.95-1.44 s of a 1.3-2.4 s search, and it is the query embedding's wait plus the
-search, which alone costs 0.10 s.  A gateway prefetch that spent 3.66 s of its five-second
-window therefore reached the search with almost nothing left, which is what the transport
-timeout in its gap meant.
-
-Temporary: it comes out with 3.4.4's line once the window is accounted for.
-
-### [3.4.4] - 2026-09-30
-
-**Fork release.** Two fork-side changes, both about seeing what a failing recall is doing.
-
-A vector gap named only the transport class: ``QdrantHTTPError`` stood for a timeout, a
-401 and a broken worker frame alike, and the exception is caught and discarded, so the
-name in the gap was the only place the fault survived.  The exception now carries the
-wire vocabulary ``core/vector_failure.py`` already reads, and a gap reads
-``QdrantHTTPError:timeout`` or ``QdrantHTTPError:http_status:401``.
-
-The Hermes prefetch logs its own timing when it needs to: on this instance a prefetch
-occasionally spends its whole five-second window and the packet says which phase ran out
-rather than what the work cost.  A line is written only when the recall passes three
-seconds or a phase reports ``deadline_exceeded_*``, so a healthy turn adds nothing.
-Temporary: it is removed once the window has been accounted for.
-
-### [3.4.3] - 2026-09-30
-
-**Fork release** (upstream's own numbering stops at `3.4.2`; this fix is entirely in
-fork code — `vector/qdrant_store.py` is ours).
-
-A similarity search asked for the stored vector *and* the full text of every hit, and no
-caller on that path reads either: against the production collection 40 hits answered with
-**2,031 KB**, where the same search in this shape answers with **39 KB** (measured
-2026-09-30). The vector is also stored in the payload, so each hit carried it twice. On
-this instance's 1–2 s vector budget, parsing the difference is what let the semantic
-channel run out of time and hand a recall back `vector_unavailable` while Qdrant itself
-answered 200 in 0.21–0.62 s.
-
-`QdrantVectorStore` now asks for the three fields the recall path reads (`id`,
-`scope_id`, `target`), refuses a hit that is not exactly what it asked for, and keeps
-verifying the whole record on the paths that read one back whole (retrieve, inventory,
-migration). Contract coverage asserts the request shape, the subset decode, and both
-refusals; the fake Qdrant honours `with_payload`/`with_vector` like the real service.
-

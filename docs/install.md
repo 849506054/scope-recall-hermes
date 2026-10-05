@@ -6,9 +6,11 @@ does the consolidating and embedding. It ships host adapters for Hermes and for
 Codex, the latter as a set of native hooks plus an MCP server, which Claude Code
 uses too. This guide installs Hermes and Codex with a store of their own; Claude
 Code installs only as an entry of a shared store, and Codex can join one too
-(section 11).
+(section 11). WorkBuddy runs the same hooks and installs only as an entry as well
+(section 12), and so does DeepSeek Harness (dsh), through a plugin that runs those hooks
+(section 13).
 
-> **Status.** This guide covers 3.1 to 3.4. Releases are on PyPI and on the
+> **Status.** This guide covers 3.1 to 3.7. Releases are on PyPI and on the
 > GitHub releases page; a checkout between releases carries a candidate version
 > and is installed by building its wheel. The distribution name is
 > `hermes-scope-recall`, the Python import is `scope_recall`, and the host plugin
@@ -116,6 +118,10 @@ own configuration, register the plugin for you, or approve hooks. The receipt at
 install time**: `host_registration_pending: true`, plus `hook_trust_pending: true`
 for Codex. Later enabling or trusting does not rewrite that historical receipt.
 For the current state, read `doctor` and the host's actual behaviour.
+
+WorkBuddy is the one exception: it has no plugin directory an installer could own,
+so `apply-install --host workbuddy` adds its entries to WorkBuddy's own settings
+files, and keeps everything else in them (section 12).
 
 Installation mode is an explicit boundary. Both `plan-install` and `apply-install`
 create a production binding (`test_mode=false`) by default. Only an isolated TEST
@@ -786,6 +792,291 @@ it as an entry, with every memory marked with the agent it came in through:
 only a pointer, `scope-recall\attachment.json`; `plan-install`, `apply-install` and
 `doctor` recognize it.
 
+## 12. WorkBuddy
+
+WorkBuddy runs the hooks and the MCP server of the `codex` adapter as an entry of a shared
+store, the owner at this machine. Attach its home first ([shared-store.md](shared-store.md)),
+from an environment with the `codex` extra, then install. WorkBuddy's agent reads its hooks from
+`settings.json` in WorkBuddy's own home. Its MCP servers are those listed in `mcp.json` there:
+WorkBuddy starts each one, once you have approved it in its MCP settings, and serves its tools to
+the agent. (`.mcp.json` beside it is WorkBuddy's record of its own connector proxy; its agent
+reads no other server from it.) WorkBuddy may write `settings.json` itself while it runs: quit
+WorkBuddy before `apply-install` and start it again after, then approve the server `scope-recall`,
+which WorkBuddy lists as waiting for approval. WorkBuddy reads `mcp.json` when it starts, so the
+server shows only after that restart. In WorkBuddy 5.6.2 the approval is under 专家·技能·连接器
+(Experts · Skills · Connectors) → 连接器 (Connectors) → 自定义连接器 (Custom connector, the ⊕ at
+the top right) → MCP 服务管理 (MCP Server Management) → 我的 MCP (My MCP) → 信任 (Trust).
+
+```powershell
+$Entry  = "D:\ScopeRecall\workbuddy"
+$Python = "D:\ScopeRecall\workbuddy-venv\Scripts\python.exe"
+
+scope-recall plan-install --host workbuddy --instance-root $Entry `
+  --agent-id <the store's agent id> --python $Python --env-file <the file with the embedding key>
+# quit WorkBuddy
+scope-recall apply-install --host workbuddy --instance-root $Entry `
+  --agent-id <the store's agent id> --python $Python --env-file <the file with the embedding key>
+# start WorkBuddy
+```
+
+`--target-plugin-dir` names WorkBuddy's home; without it the installer uses
+`WORKBUDDY_CONFIG_DIR`, else `%USERPROFILE%\.workbuddy`, and refuses a home that does not
+exist. `apply-install`:
+
+- adds one command hook each for `UserPromptSubmit`, `Stop` and `SessionEnd` under `hooks` in
+  `settings.json`, and the MCP server `scope-recall` under `mcpServers` in `mcp.json`;
+- keeps every other key, hook and server as it is, and copies each file it changes to
+  `<instance-root>\.scope-recall-backups\<id>\plugin\` first (`backups` and `files_merged` in
+  its output); neither file enters the receipt;
+- changes nothing when run again; this entry's hook from an older interpreter or env file is
+  updated where it stands;
+- refuses, and writes nothing, when the settings already run another Scope Recall hook (another
+  entry's, or a remote client's: WorkBuddy would run both), when `mcp.json` has a `scope-recall`
+  server that is not this entry's, or when a file is not plain JSON (WorkBuddy accepts comments;
+  rewritten as JSON they would be lost, so add the entries by hand there).
+
+On Windows WorkBuddy runs a hook through Git Bash, so Git for Windows must be installed; without
+it WorkBuddy uses PowerShell, which cannot run this command. The command is
+`"<python>" -I -B -m scope_recall.adapters.codex.hook_entry --home "<instance-root>" --host workbuddy || exit 1`
+with forward slashes, plus `--env-file "<file>"` before the `||`: keep those paths to printable ASCII without
+`"`, `$`, `` ` `` or `\`; `apply-install` refuses others. WorkBuddy's `timeout` is in seconds,
+and a prompt hook that runs past it blocks the prompt: the hooks wait 15 s (`UserPromptSubmit`)
+and 10 s (`Stop`, `SessionEnd`), the interpreter's start plus the entry's
+`hook_processing_seconds` (at most 6 s). A hook answers as soon as its work is done.
+
+What the hooks do, as for the other clients: a prompt is stored as the owner's and what is
+remembered is put in front of it; a `Stop` stores the reply and reads WorkBuddy's session record
+(the hook's `transcript_path`, else the session's file under `<WorkBuddy home>\projects\`) from
+where the last read stopped, for the text shown between tool calls and the owner's messages the
+prompt hook could not store; `SessionEnd` reads the rest and forgets the session's turns. A turn
+is named by the prompt's `generation_id` when it is new to the session, else by one derived from
+the session, the words and the moment, kept in `<instance-root>\scope-recall\turns\` until the
+session ends (a day at most). The MCP server serves the tools.
+
+The prompt's recall comes from a resident recall server (from 3.6.0), which keeps the entry's
+vector search and embedding connection warm. WorkBuddy 5.6.2 runs its MCP servers inside a
+conversation's agent process: it starts one when a conversation opens or a prompt comes to a
+conversation without one, and stops it at its own time. A server started there met the prompt
+that started it still opening its vector store, and a cold server answered with its vector search
+only 12.7 s after its start, past the hook's 6 s. The resident server is a process of its own,
+started apart from the MCP server. It still lives only as long as the conversation's agent process
+that started it: WorkBuddy's agent puts itself and every process it starts in a Windows job that
+ends them all when the agent's process ends, and the server cannot leave that job (agent 2.147.0,
+measured 2026-10-04). While one conversation's process runs, another conversation's first prompt
+finds the server warm (1.48 s, with its vector search, measured the same day); the first
+conversation after WorkBuddy starts, and a prompt right after the conversation holding the server
+ended, are recalled without it (see Known limits):
+
+- The prompt hook starts it after its answer when none runs, at most once a minute. The MCP
+  server WorkBuddy runs with a conversation starts it too, and looks again every 30 s while that
+  conversation's process runs. No task or service is registered with the system.
+- It names itself in the entry's endpoint folder; the hook asks it before any other server.
+- It ends `resident_recall_minutes` after the last prompt's recall or the last look of a running
+  MCP server, whichever is later: 120 for WorkBuddy, set in the entry's runtime config (see
+  [configuration.md](configuration.md)). It reads the value every 30 s; set to 0, it ends within
+  30 s and none is started again.
+- It ends within 30 s once its package on disk is replaced or removed; the next prompt, or a
+  running MCP server, starts the new version's. A prompt hook that finds one of another version
+  running (from another venv, say) stops it and starts its own, where it can prove the process is
+  that server and may end it; no hook or MCP server keeps one of another version up, so one it
+  cannot stop ends at its idle end. `apply-install` stops it as well. Hooks of two versions against
+  one entry switch it at most once a minute: run a canary against a copy of the entry's home, not
+  the live one.
+- It ends once a recall has run 5 minutes past its time: such a server answers every hook that it
+  is busy. The next look starts a new one.
+- While it runs it holds a vector helper, about 1 GB. The MCP server WorkBuddy runs with each
+  conversation keeps no helper warm of its own and answers no hook; a tool's vector search starts
+  one in that server.
+- The first prompt after it ended (with its conversation's process, or at its idle end), after
+  WorkBuddy started or after a reboot, starts it and is recalled the old way, usually by words and
+  the stored structure alone; the next prompts find it warm.
+- It writes nothing to the store. One runs for each entry: a second of the same version gives way
+  to the first.
+
+Stop it before a `package-upgrade` of the entry's package, after quitting WorkBuddy (a running MCP
+server starts it again): `scope-recall resident stop --home <instance-root> --host workbuddy`
+(`status` shows it; `stop` exits 1 and says `still_running` when one still holds the lock). Where
+a process's start time cannot be read (macOS), `stop` cannot tell the server from another process
+that took its id and leaves it alone (`verified: false`); it ends itself within 30 s of an upgrade
+in place, and at its idle end when the entry moved to another venv. `apply-install` and
+`apply-uninstall` stop it too, where its identity is proven, and say on stderr one they could not. Until the MCP server is
+approved, the hooks still store and recall, and start the resident server all the same.
+
+To check it: `doctor --host workbuddy --instance-root <instance-root>` checks the binding and the
+store (it does not read WorkBuddy's settings; `host_registration_status: pending` is healthy, as
+for Codex). Then open a workspace in WorkBuddy (its hooks fire only there), send a message and
+look for the entry in `scope-recall entries --root <store>` (last heard from) and for
+`scope-recall` among WorkBuddy's connected MCP servers. WorkBuddy asks for the approval again
+when the server's command, arguments or environment names change.
+
+To take it out: quit WorkBuddy, run `plan-uninstall` and `apply-uninstall --instance-root
+<instance-root>`. They take this entry's hooks and server out of WorkBuddy's two files
+(`unmerged_files`; a copy of each goes to the backups first) and leave everything else; `detach`
+then ends the entry. `detach` alone leaves WorkBuddy's settings as they are.
+
+Known limits:
+
+- The resident recall server ends with the conversation's agent process that started it, since
+  WorkBuddy's agent ends every process it started. The first conversation's first prompt after
+  WorkBuddy starts, a prompt right after the conversation holding the server ended, and the first
+  prompt after the server's idle end or a reboot are recalled without it, usually by words and the
+  stored structure alone. A conversation whose MCP server still runs starts a new one within 30 s,
+  and no sooner than a minute after the last start; one whose MCP server WorkBuddy stopped starts
+  it with its next prompt, which is recalled without it. A WorkBuddy on another machine is answered
+  by its entry's server here, which runs on ([remote-entries.md](remote-entries.md)).
+- A reply that is only an error WorkBuddy showed in place of one (not signed in, a model or network
+  failure; its session record marks that message with the error) is not stored, from 3.6.2, nor is
+  that error when a later stopped turn hands it to its `Stop` again. A WorkBuddy on another machine
+  judges this from its own record and tells its entry's server, which never opens a record for a
+  request. A reply that broke off with an error keeps what was shown.
+- WorkBuddy hands the prompt hook a prompt with its line breaks removed, so a multi-line message
+  is stored as one line.
+- WorkBuddy fires `Stop` for a cancelled or failed turn too, with the previous turn's reply; a
+  reply that repeats the session's last one is not stored by the hook. When the turn did say the
+  same words again, the record read stores them from the session record.
+- A user message in WorkBuddy's session record counts as the owner's only inside its
+  `<user_query>` blocks; command and shell output, a teammate's report or a slash command's
+  expansion there is not stored as the owner's words.
+- Messages sent while a turn runs reach the next prompt hook as the last of them only. The others
+  are stored from the session record when that turn ends, together with the last, which is so
+  stored twice.
+- A prompt WorkBuddy sends on its own, a session cron's or a goal's start, reaches the prompt hook
+  as the owner's would and is stored as theirs. A background task's notice and a Stop hook's or a
+  goal's request to go on (`Stop hook feedback:`) are skipped.
+- The hook command ends in `|| exit 1`: WorkBuddy blocks a prompt whose hook exits 2, which an
+  older package that does not know `--host workbuddy` would. Before rolling the package back below
+  3.5.0, take the hooks out with `apply-uninstall`; an older package cannot.
+- A subagent's work is not recorded: WorkBuddy fires no prompt or `Stop` hook for it, and its
+  record is not read.
+- Not done: `doctor` does not check WorkBuddy's settings, and the `scope-recall-memory` skill is
+  not installed into WorkBuddy.
+
+## 13. DeepSeek Harness (dsh)
+
+dsh runs the hooks and the MCP server of the `codex` adapter as an entry of a shared store, the
+owner at this machine (measured with dsh 0.2.0-rc.2). Its own hooks name no turn and no reply,
+and its session log is compressed, so a hook alone cannot record a turn: a dsh plugin, which the
+installer writes, runs the entry's hooks instead. Before the first step of each turn it runs the
+prompt hook with the person's message and adds what is remembered to that step; it keeps the
+turn's messages as dsh commits them and stores them when the turn ends. dsh's own MCP client runs
+the MCP server, which serves the tools (`mcp__scope-recall__recall` and the rest).
+
+Attach dsh's entry first ([shared-store.md](shared-store.md)), from an environment with the
+`codex` extra, then install:
+
+```powershell
+$Entry  = "D:\ScopeRecall\dsh"
+$Python = "D:\ScopeRecall\dsh-venv\Scripts\python.exe"
+
+scope-recall plan-install --host dsh --instance-root $Entry `
+  --agent-id <the store's agent id> --python $Python --env-file <the file with the embedding key>
+# quit every dsh: web, tui, Desktop, and headless runs
+scope-recall apply-install --host dsh --instance-root $Entry `
+  --agent-id <the store's agent id> --python $Python --env-file <the file with the embedding key>
+# start dsh
+```
+
+`--target-plugin-dir` names dsh's home; without it the installer uses `DSH_HOME`, else
+`%USERPROFILE%\.dsh`, and refuses a home that does not exist (start dsh once). `apply-install`:
+
+- writes the plugin to `<dsh home>\scope-recall\dsh-plugin\index.mjs` (in the receipt;
+  `apply-uninstall` removes it);
+- adds two rows to dsh's home patch, `<dsh home>\cordis.patch.yml`, as one `insert` between
+  `# SCOPE_RECALL_DSH_START` and `# SCOPE_RECALL_DSH_END`: `scope-recall`, the plugin (named by its
+  `file:///` URL, with the interpreter, the entry and the env file in its `config`), and
+  `mcp-scope-recall`, dsh's MCP client running the stdio server `scope-recall`. dsh composes every
+  profile with this file after the profile's own layers, so the rows reach `web`, `tui`,
+  `headless` and any profile you made;
+- switches off dsh's upload of its session logs. dsh sends each session's log to its model API by
+  default (the row `session-log-deepseek`), and what is recalled is in that log. Unless the file
+  already leaves it off, the install adds that row with `enabled: false`, after every other operation
+  on it, between `# SCOPE_RECALL_DSH_PRIVACY_START` and `# SCOPE_RECALL_DSH_PRIVACY_END`. What leaves it
+  off is worked out as dsh does (see below): the last `disabled` and the last `config` given for the
+  row, a `config` without `enabled: false` switching the upload on again. An operation that switches
+  it on again after the install's is followed by the install's own at the next install. Uninstall
+  leaves the switch there: switched on again, the upload would send what was recorded while it was
+  off;
+- keeps every other line of the file, copies the file to
+  `<instance-root>\.scope-recall-backups\<id>\plugin\` first, and changes nothing when run again;
+- refuses, and writes nothing, when the file is not a YAML list written as a block at column 0,
+  when something else inserts a row `scope-recall` or `mcp-scope-recall` or gives an MCP server the
+  name `scope-recall`, or when it holds another Scope Recall entry's rows.
+
+dsh applies the operations in the file in order, each key replacing the row's own: an operation of
+yours after the block that names a row (`- id: scope-recall` with `disabled: true` switches the
+plugin off) stays after it. A re-install writes the block where it stood, and an install after an
+uninstall writes it before the first such operation. A `config` there replaces the row's whole
+`config`. Edits inside the block are not kept.
+
+To check it: `dsh headless --dump-config` (or the profile you use) prints the composed rows;
+`scope-recall` and `mcp-scope-recall` are among them, and `session-log-deepseek` has
+`enabled: false`. `doctor --host dsh --instance-root <instance-root>` checks the binding and the
+store (it does not read dsh's files). Then send a message in dsh and look for the entry in
+`scope-recall entries --root <store>` (last heard from) and at
+`<instance-root>\scope-recall\dsh-plugin-status.json`.
+
+dsh also sends a session to DeepSeek when you send feedback on it (`session-telemetry-otel`, which
+does nothing else by default). Set the user environment variable `DSH_TELEMETRY_DISABLED=1` to
+switch that off as well; the installer does not change your environment.
+
+What the plugin does:
+
+- Before the first step of each turn it runs the prompt hook with the person's message (the last
+  of theirs that step takes): the prompt is stored as the owner's, named by the session and dsh's
+  turn number, and what is remembered is added to the step as a message of its own
+  (`source.kind: plugin:scope-recall`) after the person's. The step waits for the answer up to 9 s;
+  past that, or when the hook fails, the turn goes on without it. Cancelling the turn ends the hook.
+- It keeps each turn's messages as dsh commits them, the text of the person's and of the model's, in
+  `<instance-root>\scope-recall\dsh-spool\`, one file per session and dsh process. When the turn ends
+  it runs the `Stop` hook with them: the reply under the turn, what the model said while it worked,
+  and what the person sent meanwhile. The hook answers how many it stored, and those leave the file.
+  A `Stop` stores what it can in its time (it reads at most 3 s of messages); the next takes the rest
+  at once, and only one that stores nothing ends the store.
+- What a failed store left is stored at the session's next turn end, or by a pass that runs every
+  minute over files idle for 2 minutes, one session at a time: a store that stores nothing ends a
+  pass, and the next waits longer, up to 30 minutes. A dsh that quits waits up to 3 s for a store that is
+  running; what it left is taken up by the next dsh that runs, once that process is gone (or the
+  file has been idle for 6 hours). A message sent twice is stored once.
+- A completed turn's reply goes with its `Stop` when it was said at most a minute before: the store
+  recognises it among the turn's messages by its words and a moment 120 s away at most, and the
+  reply's moment is the hook's. A reply said earlier (before a long tool call that ended the turn,
+  say), and the last words of a turn that did not complete, are stored from the turn's messages alone,
+  as the model's words.
+- Bounds: a message's text is kept up to 20,000 characters (and 36 KB), with a marker for the rest;
+  a message waiting longer than 14 days, or past 5,000 waiting in a session, is dropped and said in
+  dsh's log.
+- `dsh-plugin-status.json` shows the last recall and store, how many messages wait, how many were
+  dropped, when the next pass may run, and a privacy alarm: should dsh report a session log
+  delivered to its API, the plugin says so there and in dsh's log. A hook that fails (an interpreter
+  that cannot import the package, say) is shown there with the end of its stderr.
+- A subagent's session is neither recalled for nor recorded. Tool calls and results, files and
+  images, and the model's reasoning are not recorded.
+
+The prompt's recall comes from the entry's resident recall server (section 12), which keeps the
+vector search warm from one dsh process to the next: the prompt hook starts it after its answer
+when none runs, at most once a minute, and so does the MCP server dsh runs, which looks again every
+30 s. It ends `resident_recall_minutes` after the last prompt's recall or the last look of a running
+MCP server, 120 by default for dsh ([configuration.md](configuration.md)). The first prompt after
+it ended, or after a reboot, is recalled without it, usually by words and the stored structure
+alone. Stop it before a `package-upgrade` of the entry's package, after quitting dsh:
+`scope-recall resident stop --home <instance-root> --host dsh`.
+
+To take it out: quit dsh, then `plan-uninstall` and `apply-uninstall --instance-root
+<instance-root>`. They remove the plugin file and this entry's rows (`unmerged_files`; a copy goes
+to the backups first) and leave the upload switched off; `detach` then ends the entry. Messages
+still waiting in the spool stay there unstored.
+
+Known limits:
+
+- Local only: a dsh on another machine cannot reach its entry over HTTP yet
+  ([remote-entries.md](remote-entries.md) covers Claude Code, Codex and WorkBuddy).
+- dsh 0.2.0-rc.2 is a candidate; the plugin relies on its plugin interface (`agent/pre-step`,
+  `session/event`, the session format V4). A dsh that changes it may run the turn without the
+  plugin; `dsh-plugin-status.json` then stops changing.
+- What is recalled stays in the session as a message, as it does in the other clients' sessions.
+- `doctor` does not read dsh's patch file, and the `scope-recall-memory` skill is not installed into
+  dsh.
+
 ## Names and paths
 
 | Concept | Value |
@@ -801,3 +1092,8 @@ only a pointer, `scope-recall\attachment.json`; `plan-install`, `apply-install` 
 | Codex installation record | `<instance-root>\codex-installation.json` |
 | Codex Core data directory | `<instance-root>\data\` |
 | Runtime config | `<core-data-directory>\runtime-config.json` |
+| WorkBuddy home | `WORKBUDDY_CONFIG_DIR`, else `%USERPROFILE%\.workbuddy` |
+| WorkBuddy hooks and MCP server | `hooks` in `<WorkBuddy home>\settings.json`, `mcpServers.scope-recall` in `<WorkBuddy home>\mcp.json` |
+| dsh home | `DSH_HOME`, else `%USERPROFILE%\.dsh` |
+| dsh plugin and rows | `<dsh home>\scope-recall\dsh-plugin\index.mjs`; rows `scope-recall` and `mcp-scope-recall` in `<dsh home>\cordis.patch.yml` |
+| dsh spool and status | `<instance-root>\scope-recall\dsh-spool\`, `<instance-root>\scope-recall\dsh-plugin-status.json` |
