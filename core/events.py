@@ -97,6 +97,35 @@ def version_suffixes(text: str) -> frozenset[str]:
     return frozenset(_VERSION_SUFFIX.findall(unicodedata.normalize("NFKC", text).casefold()))
 
 
+#: The placeholder an earlier release's capture filter left for a tool output it withheld ("Tool execution summary
+#: (terminal): tool=terminal; output_chars=377; exit_code=0; output_preview=omitted"), and the form the report filter
+#: writes today (``capture_filters.sanitize_report_text``, on no capture path).  On one instance 132,000 of 168,000
+#: sources were such lines, each embedded; the shared store imported 212,773 of them (68% of its sources).
+_WITHHELD_TOOL_OUTPUT = re.compile(r"Tool execution summary\b.*\b(?:output omitted|output_preview=omitted)\b", re.S)
+#: The same placeholders as a condition on ``source_events e``, cheap enough to test before the role.  Leading
+#: whitespace is passed over as ``withheld_tool_output`` passes it over.
+WITHHELD_TOOL_OUTPUT_SQL = ("ltrim(e.content, char(32,9,10,13)) LIKE 'Tool execution summary%' AND "
+                            "(e.content LIKE '%output omitted%' OR e.content LIKE '%output_preview=omitted%')")
+#: The tool's own error text, the one part of a placeholder that is the output's: 4,348 of the shared store's carry
+#: one ("...; error=<up to 160 characters>; output_preview=omitted").
+_WITHHELD_ERROR = re.compile(r";\s*error=(.*);\s*output_preview=", re.S)
+
+
+def withheld_tool_output(event) -> bool:
+    """Whether a source is the capture filter's placeholder for a tool output it withheld."""
+    return event.get("role") == "tool" and bool(_WITHHELD_TOOL_OUTPUT.match(str(event.get("content") or "").strip()))
+
+
+def indexed_terms(event) -> tuple[str, ...]:
+    """The terms a source is found by.  A withheld tool output's placeholder is found by its error text alone, when it
+    carries one: the rest is the envelope's own words, and indexed, the imported placeholders pushed ordinary words
+    such as "tool", "status" and "patch" past the common-term ceiling, so questions lost them (#206)."""
+    if not withheld_tool_output(event):
+        return lexical_terms(event["content"])
+    error = _WITHHELD_ERROR.search(str(event.get("content") or ""))
+    return lexical_terms(error.group(1)) if error else ()
+
+
 def lexical_terms(text: str) -> tuple[str, ...]:
     """Chinese bigrams and intact identifiers; normalization affects index only."""
     normalized = unicodedata.normalize("NFKC", text).casefold()

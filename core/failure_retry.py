@@ -24,8 +24,9 @@ marker is skipped, so running it twice does nothing and it cannot loop.
 Two classes, because they answer different questions:
 
 * **actionable** -- every code the worker already treats as transient
-  (``AUTO_RECOVERABLE_ERRORS``), plus two that are not auto-recoverable but are
-  still an operator's to clear.  These are faults.  They drive "degraded" and
+  (``AUTO_RECOVERABLE_ERRORS``), plus the few that are not auto-recoverable but
+  are still an operator's to clear (``_OPERATOR_ONLY_FAILURES``, and any HTTP
+  status not named there).  These are faults.  They drive "degraded" and
   clearing them is how an instance gets back to healthy.
 * **terminal** -- ``derivation_invalid`` and ``budget_checked``.  These are
   by-design outcomes that never clear (see ``doctor.TERMINAL_FAILURE_COUNT``);
@@ -62,6 +63,10 @@ from .work_storage import ACCOUNT_REFUSALS, AUTO_RECOVERABLE_ERRORS, DERIVATION_
 _OPERATOR_ONLY_FAILURES = frozenset({
     "http_400",
     "candidate_attempt_interrupted",
+    # The model client's own refusals of a route or a size (``runtime/_http_worker.py``, ``adapters/models.py``): a
+    # wrong or redirecting base URL, a request or an answer past its bound.  An operator fixes the route or the bound,
+    # then re-opens.
+    "endpoint_invalid", "http_redirect", "request_limit", "response_limit",
 }) | ACCOUNT_REFUSALS
 
 #: Faults.  Clearing these is what moves an instance from degraded to healthy.
@@ -124,10 +129,19 @@ def already_retried(error_code: object, *, generation: int) -> bool:
     return any(int(found) == generation for found in _MARKER_RE.findall(str(error_code or "")))
 
 
+#: Any other HTTP status a provider answered (``worker_outcomes`` records each as ``http_NNN``): a 4xx not named above
+#: (404, 409, 413, 422, ...), a 5xx the worker does not recover by itself (501, 520-524, ...).  The HTTP worker reports
+#: a redirect as ``http_redirect``, named above.  No automatic retry clears it, but an operator who has fixed the
+#: route, the model or a bound may re-open it, as ``http_400``.  Of neither class, a candidate evaluation failed
+#: with ``http_422`` on the shared store stayed failed with no command able to clear it, as ``http_protocol`` did
+#: before #201.
+_HTTP_STATUS = re.compile(r"http_[1-5]\d\d")
+
+
 def retry_class(error_code: object) -> str | None:
     """``"actionable"``, ``"terminal"``, or ``None`` for anything else."""
     kind = failure_kind(error_code)
-    if kind in ACTIONABLE_FAILURES:
+    if kind in ACTIONABLE_FAILURES or _HTTP_STATUS.fullmatch(kind):
         return "actionable"
     if kind in TERMINAL_FAILURES:
         return "terminal"

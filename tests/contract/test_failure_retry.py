@@ -232,6 +232,25 @@ def test_a_transient_model_failure_can_be_cleared(code):
     assert selects(code, include_terminal=False, generation=SCHEMA_VERSION) is True
 
 
+@pytest.mark.parametrize("code", ["http_404", "http_409", "http_413", "http_422", "http_501", "http_520",
+                                  "http_524", "endpoint_invalid", "http_redirect", "request_limit", "response_limit"])
+def test_a_refused_request_can_be_cleared_once_its_cause_is_fixed(code):
+    """An HTTP status not named elsewhere: the request, its route or its model was refused, or the provider failed in
+    a way the worker does not recover by itself, so nothing retries it by itself, but an operator who fixed the cause
+    may re-open it, as ``http_400``.  The HTTP worker's own refusals of a route or a size are its own codes, not a
+    status (a 5xx, and ``http_redirect``, left out at first: reviews of 3.7.3)."""
+    from scope_recall.core.work_storage import AUTO_RECOVERABLE_ERRORS
+
+    assert retry_class(code) == "actionable"
+    assert selects(code, include_terminal=False, generation=SCHEMA_VERSION) is True
+    assert code not in AUTO_RECOVERABLE_ERRORS
+
+
+@pytest.mark.parametrize("code", ["http_4", "http_4220", "xhttp_422", "http_422x", "http_600", "http_099"])
+def test_only_a_whole_http_status_counts(code):
+    assert retry_class(code) is None
+
+
 @pytest.mark.parametrize("code", ["http_401", "http_402", "http_403"])
 def test_an_account_refusal_left_behind_can_be_cleared(code):
     """Before the worker parked account refusals it failed their items, and no
@@ -274,6 +293,15 @@ def test_a_transient_failure_clears_through_real_storage(app):
     assert _states(core)[0].get("failed")
     report = core.retry_failed_work(ctx, limit=64, dry_run=False)
     assert report["retried"] >= 1 and report["by_kind"].get("model_unavailable")
+    assert not _states(core)[0].get("failed")
+
+
+def test_a_refused_evaluation_clears_through_real_storage(app):
+    """``http_422`` failed a candidate evaluation on the shared store, and no command could re-open it."""
+    core, ctx = app
+    _fail_one(core, ctx, "http_422")
+    report = core.retry_failed_work(ctx, limit=64, dry_run=False)
+    assert report["retried"] >= 1 and report["by_kind"].get("http_422")
     assert not _states(core)[0].get("failed")
 
 

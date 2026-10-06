@@ -4,97 +4,96 @@ All notable changes to `scope-recall` will be documented in this file.
 
 ## [Unreleased]
 
-## [3.7.2.1] - 2026-10-06
+## [3.7.4.1] - 2026-10-06
 
-**Fork release.** Upstream v3.7.2 is merged over v3.7.1 (1 non-merge commit, 15 files, +371/-22):
-a question reaches the reply to what the person added before it came, what Hermes writes into a
-conversation itself is stored as the host's, and `retry-failures` clears `http_protocol` failures
-(the fork reported that classification gap as its #201, and this release carries the upstream fix).
+**Fork release.** Upstream v3.7.4 is merged over v3.7.2.1 (11 non-merge commits, 27 files): a
+withheld tool output's placeholder is no longer indexed beyond its error text, and
+`unindex-withheld-outputs` drops what earlier releases indexed there (#206), while an embedding that
+lands as its claim is being corrected now ends as a done embed instead of leaving a point no ledger
+expects (#205). Both are fork reports, measured on this store; the second is the `coverage_delta`
+drift the fork had traced but left unpatched for upstream.
 
 Seven files conflicted and all of them are mechanical: the version, the four places
-`scripts/build.package_manifest.py` stamps it into, the changelog and the readme.  Upstream's own
-release is taken as upstream wrote it, and no fork face is touched by it.
+`scripts/build.package_manifest.py` stamps it into, the changelog and the readme. No fork face is
+touched: the Qdrant backend, the Voyage usage fix and the auxiliary routing additions merge clean,
+and the Hermes adapter changes auto-merge with the host face reviewed.
 
-### Upgrading from 3.7.1.1
+### Upgrading from 3.7.2.1
 
 1. Stop the hosts and the Scope Recall worker, and take a `backup`.
-2. Install the 3.7.2.1 package, then run `plan-install` and `apply-install` for each host.
+2. Install the 3.7.4.1 package, then run `plan-install` and `apply-install` for each host.
 3. Start the hosts again and run `doctor`.
+4. Once per store, after the upgrade: `unindex-withheld-outputs --until-done --apply` (bounded
+   pages that pause for captures; recall is unchanged case by case upstream).
 
 The store's schema is unchanged (1110).
 
-## [3.7.1.1] - 2026-10-05
+## [3.7.4] - 2026-10-06
 
-**Fork release.** Upstream v3.7.1 is merged over v3.4.10 (42 non-merge commits, 69 files, +8190/-234):
-a gateway's runtimes share one vector helper, a client's recall server can keep running beside its
-process, WorkBuddy and DeepSeek Harness join the shared store as hosts, every store connection reads
-the store through a memory map, and a tool result's capture is written without the adapter lock and
-kept to retry rather than lost.
+3.7.4 indexes a withheld tool output's placeholder by the tool's own error text alone, and adds `unindex-withheld-outputs` to drop the rest of what earlier releases indexed. It also keeps the ledger whole when a claim is corrected while its embedding is being written.
 
-Ten files conflicted.  The fork's own faces are re-applied over the rewritten code, and upstream
-carries none of them: the qdrant backend (store, HTTP worker, config, mutation, migration) with its
-runtime wiring, the query route's share accounting and warm-up (`_log_vector_loss`,
-`_warm_query_route`), the auxiliary routes' cleartext endpoints and the embedding route's own egress
-proxy, the fork's doctor probes and its maintenance commands.  Upstream's capture/retry rewrite, its
-shared vector helper and the new host entries are taken as upstream wrote them.
+### Fixes
 
-### Upgrading from 3.4.10.3
+- **A withheld tool output's placeholder is found by its error text alone (#206).** An earlier release's capture filter left a one-line summary in place of a tool output it withheld: "Tool execution summary (terminal): tool=terminal; output_chars=377; exit_code=0; output_preview=omitted".
+  - All 212,773 such placeholders on the shared store, 68% of its 311,051 sources, came with imported history. No capture path writes one today.
+  - Their words are the envelope's own, except the tool's error text that 4,348 of them carry ("...; error=...; output_preview=omitted").
+  - Admission already kept them as sources only, never embedded or derived from. But earlier releases, the 1109 upgrade and both imports indexed the whole placeholder.
+  - They held 2,015,161 of the store's 14,727,970 postings. The common-term ceiling is 10% of all sources, and the placeholders alone pushed twelve searchable terms over it: tool, summary, omitted, execution, output_preview, output_chars, terminal, exit_code, success, patch, true and status. ("0" too, but one-character terms are never searched.) The lexical channel drops such a term from a question that holds it, and 217 of the owner's 1,776 messages hold one as that channel reads them.
+  - A placeholder is now indexed by its error text, when it carries one, and otherwise not at all (`core/events.indexed_terms`). This holds at capture, in the legacy conversion and in the shared import. Indexing one again drops what an older release gave it beyond that, and its projection status agrees. The 1109 upgrade still carries an older store's index forward; run the command below after it.
+  - Measured on copies of the shared store taken at the same moment, before and after the command, with the same code. By words alone, the only channel this touches, recall is the same case by case on all 484 cases: the owner's 173 real questions, the older sets, and 36 real questions that hold one of those terms. Each of the 36 still finds what it found, through its other words.
+  - So the change is to the index, not to recall: 1,945,720 fewer postings and 43 MB of the store's pages free for what it stores next.
+- **`unindex-withheld-outputs` drops what is already there.**
+  - It works a bounded page at a time (`--limit`, 500 by default, at most 5,000). Each page is its own write transaction and holds the store's writer lease while it runs. `--until-done` goes on page after page and pauses a moment between pages, so captures get the lease. Without `--until-done`, carry `next_after_id` into `--after-id`. Without `--apply` it only counts.
+  - The sources stay, and so does the index of their error text.
+  - On a copy of the shared store it took 426 pages, the slowest 0.12 s: 18 s of work, about 1.7 minutes with the pauses. Run again on the cleaned copy, it changed nothing in a few seconds. Every placeholder ended holding exactly its error text's terms, or none.
+  - Review caught two faults in an unreleased first version, which ran on copies only. It scanned every tool row on each page while it held the lease, 1–3 s a page, and it dropped the error text with the rest.
+  - In a shared store, run it with the shared worker's config, which reaches every scope.
+- **An embedding finishing as its claim is corrected stays on the ledger (#205).** A supersede made the old revision's pending and leased work obsolete. An embedding whose vector had already landed could then never complete, so its point stayed in the store with no finished embed to account for it.
+  - An embed that has held a lease now completes against its own revision, which stays readable, as one finished a moment earlier would have. That includes one sent back to wait after it wrote, when a dependency or its deadline moved. Other work, and an embed never leased, is still made obsolete.
+  - Recall was never affected. It resolves every vector hit against SQLite, and a store keeps old revisions' vectors by design.
+  - On the shared store no obsolete embed had left a point. The 264 points its finished embeds name that the vector table lacks all belong to deleted objects, whose purge removes every revision's vectors.
 
-1. Stop the hosts and the Scope Recall worker, and take a `backup`.
-2. Install the 3.7.1.1 package, then run `plan-install` and `apply-install` for each host.
-3. Start the hosts again and run `doctor`.
+### Known limits
 
-The store's schema is unchanged (1110).
+- Automatic recovery reopens a failed embed only when its subject is a source. A claim's failed embed is made obsolete instead, so 116 of the shared store's 12,746 readable claim heads have no vector and are found by their words alone. This predates 3.7.4 and is next.
 
-## [3.4.10.3] - 2026-10-05
+### Upgrading from 3.7.3
 
-**Fork release.** A route may now state the proxy its own requests leave through. The embedding
-route accepts `proxy_url`, and the helper that carries those requests is the only process given it:
-the rest of the runtime, and every other process on the host, keeps the egress path it had. A
-deployment whose endpoint is only reachable through a proxy no longer has to give the whole runtime
-one to reach it.
+Install the package and run `plan-install` and `apply-install` where you upgrade. Then restart the clients' MCP servers and the Hermes gateways. The store's schema is unchanged (1110). Then, once per store:
 
-The helper tunnels a TLS target through an `http://` proxy and opens a cleartext one directly, so a
-route that states no proxy is unchanged. Routing is not geometry: the space digest does not move and
-no vector is re-embedded.
+```bash
+scope-recall unindex-withheld-outputs --config <the shared worker's or the instance's runtime-config.json> --until-done --apply
+```
 
-## [3.4.10.2] - 2026-10-04
+## [3.7.3] - 2026-10-05
 
-**Fork release.** A new capability, not a relaxed guard: the auxiliary routes may now address a
-model or gateway served on the operator's own network over cleartext `http://`, which is how a
-locally deployed model and a local gateway are actually reached.
+3.7.3 reads a Hermes message by its own words, as Hermes does. A notice stays the host's when a compression folded its summary or a to-do list into it. 3.7.3 also lets `retry-failures` clear a failure of any HTTP status.
 
-`ConsolidationRouteConfig` and `ResponsesRouteConfig` accept an `http://` endpoint, the parent
-process admits the same scheme, and the worker opens a plain connection for it instead of a TLS
-one.  Cleartext is bounded to loopback and private addressing (RFC1918 and IPv6 equivalents,
-link-local) and to the names reserved for the local network; any other cleartext target is still
-`endpoint_invalid`, and a non-HTTP scheme is still refused.  Nothing about a public `https://`
-endpoint changes, so an existing install is unaffected.
+### Fixes
 
-### Upgrading from 3.4.10.1
+- **A notice stays the host's after a compression.** 3.7.2 found the message that opened a turn by its text, in the run of user messages that ends the conversation `pre_llm_call` hands over. A compression at the turn's start changes that message in two ways:
+  - It can fold its summary into it (`ContextCompressor._merge_summary_into_tail_row`). The message then holds more than the turn's text, and it need not be last. One of tianshu's three delegation results after the 3.7.2 upgrade was stored as the owner's that way.
+  - It appends the open to-do list to the last user message Hermes counts as a real one, a delegation's result included (`_fold_todo_snapshot`). A background process's notice and a folded message get the list as a message of its own.
+- **How the adapter reads a message now.** It reads each message's own words as Hermes reads them back. It drops an appended to-do list, and on a message Hermes marked as folded (`_compressed_summary`) the folded summary, in either of Hermes' two layouts. A message counts as the turn's own only when those words are exactly the turn's text.
+  - The latest user message with words of its own decides. Past the last reply it must be a message Hermes folded and marked.
+  - It is the host's when it carries a display kind other than steer, and other than hidden on a folded message (`split_user_originated_turn`).
+  - The owner's own message carries no kind, so it stays the owner's.
+  - A request Hermes restores after a notice decides in its place, and the notice stays the owner's. That is the safe side.
+- **What review changed before release.** Three versions were never released:
+  - The first took a folded notice that merely contained the turn's text. A summary quotes the person's messages word for word, so the person's words could be stored as the host's.
+  - The second took any older folded notice with the same words. The person's later message, which Hermes had prefixed with a note of its own, could be stored as the host's. It also unwrapped an unmarked message that quoted Hermes' lines.
+  - The third still looked past such a prefixed message in the run of user messages at the end, to an unanswered notice with the same words. 3.7.2 did the same with a plain notice, so its notes were wrong to say the owner's words are never stored as the host's: with a note before their message, they could be.
+- **Every HTTP status failure can be cleared.** Any status a provider answered that is not named elsewhere is now operator-actionable, as `http_400` is. This covers a 4xx such as 404, 409, 413 or 422, and a 5xx the worker does not recover by itself such as 501 or 520–524. So are the HTTP worker's own refusals: `http_redirect` from a wrong base URL, `endpoint_invalid`, `request_limit` and `response_limit`. Once failed, nothing re-opens these by itself. An operator who fixed the cause can re-open them with `retry-failures`.
+  - Before, these codes were in neither class. An `http_422` candidate evaluation on the shared store stayed failed, and no command could clear it, as with `http_protocol` before #201.
 
-1. Stop the hosts and the Scope Recall worker, and take a `backup`.
-2. Install the 3.4.10.2 package, then run `plan-install` and `apply-install` for each host.
-3. Start the hosts again and run `doctor`.
+### Known limits
 
-## [3.4.10.1] - 2026-10-02
+- The adapter reads a folded message with Hermes 0.21.5's own boundary lines. If Hermes changes them, a folded notice is stored as the owner's again. That is the safe side.
+- When no message Hermes counts as the person's survives a compression, it puts one back (`_ensure_compressed_has_user_turn`): a copy of a delegation's result, or for a background process's notice the person's previous request. A copy merged into the to-do message loses its kind, and the person's request after a folded notice hides the notice: either way the notice is stored as the owner's. A copy put back on its own keeps its kind and is stored as the host's.
 
-**Fork release.** Upstream v3.4.10 is merged over v3.4.9 (33 files, +1628/-180): a session's hooks no longer wait
-out Hermes' hook timeout (#169), a dashboard login's sessions are stored and recalled (#175), and on a host that
-hands its packages over on `PYTHONPATH` the LanceDB helper starts (#176).  This fork keeps its qdrant backend, its
-own accounting and warm-up, and the changes below.
+### Upgrading from 3.7.2
 
-`_log_vector_loss` and `_warm_query_route` are re-applied over upstream's rewritten prefetch (it now recalls
-outside the adapter lock): the accounting line still names where a lost vector channel's window went, and the
-query route is still warmed before the recall needs it when the last recall was more than a minute ago.
-
-### Upgrading from 3.4.9.2
-
-1. Stop the hosts and the Scope Recall worker, and take a `backup`.
-2. Install the 3.4.10.1 package, then run `plan-install` and `apply-install` for each host.
-3. Start the hosts again and run `doctor`.
-
-The store's schema is unchanged (1110).
+Install the package and run `plan-install` and `apply-install` where you upgrade, and restart the clients' MCP servers and the Hermes gateways. The store's schema is unchanged (1110).
 
 ## [3.7.2] - 2026-10-05
 

@@ -3,7 +3,7 @@
 Scope Recall v3 is a bounded local memory core with SQLite as the authority and rebuildable vector companions. It provides host adapters for Hermes, Codex and Claude Code (the last two share one adapter of hooks and an MCP server), with the MCP tools when the optional `codex` extra is installed. The public package is `hermes-scope-recall`; the Python import is `scope_recall`; the host wrapper identity remains `scope-recall`.
 WorkBuddy runs that same hook adapter and MCP server, as an entry of a shared store, and so does DeepSeek Harness (dsh), through a plugin.
 
-This checkout is `3.7.2.1`, in which a question keeps the reply to what the person added before it came, and what Hermes writes into a conversation itself is stored as the host's, not the owner's; since 3.7.0 DeepSeek Harness (dsh) joins the shared store too: a dsh plugin recalls before each turn and stores each turn's messages, and dsh's upload of its session logs is switched off ([docs/install.md](docs/install.md), section 13). Hermes, Codex, Claude Code, WorkBuddy and dsh can keep one memory: each attaches to a shared
+This checkout is `3.7.4.1`, in which a withheld tool output's placeholder is indexed by the tool's own error text alone (`unindex-withheld-outputs` drops the rest of what earlier releases indexed), and what Hermes writes into a conversation itself is stored as the host's, not the owner's, also when a compression folded its summary or a to-do list into it; since 3.7.0 DeepSeek Harness (dsh) joins the shared store too: a dsh plugin recalls before each turn and stores each turn's messages, and dsh's upload of its session logs is switched off ([docs/install.md](docs/install.md), section 13). Hermes, Codex, Claude Code, WorkBuddy and dsh can keep one memory: each attaches to a shared
 store as an entry, what the owner tells one of them another can recall, and each memory says
 which agent it came in through ([docs/shared-store.md](docs/shared-store.md)). Hermes agents
 could share a store from 3.2.0; Codex and Claude Code join in 3.3.0. An agent that is not
@@ -57,10 +57,6 @@ environment the host uses:
 python -m pip install hermes-scope-recall==3.7.0
 python -m pip install "hermes-scope-recall[codex]==3.7.0"
 ```
-
-This fork's `3.7.2.1` build is installed from a wheel file built out of this branch
-(`python -m pip install <path-to-wheel>`); the PyPI package and the release below carry
-upstream's `3.7.2`.  The fork numbers its own releases as upstream plus a fourth digit.
 
 The same wheel and sdist are attached to the
 [GitHub Release](https://github.com/410979729/scope-recall-hermes/releases/tag/v3.7.0)

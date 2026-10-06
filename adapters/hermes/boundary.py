@@ -274,27 +274,80 @@ def _steer_words(content: object) -> str:
     return words
 
 
+#: Hermes' mark on a user message it folded a compression summary into (``COMPRESSED_SUMMARY_METADATA_KEY``).
+_COMPRESSED_SUMMARY = "_compressed_summary"
+#: The lines that bound a folded summary (``agent.context_compressor``: ``_MERGED_PRIOR_CONTEXT_HEADER``,
+#: ``_MERGED_SUMMARY_DELIMITER``, ``_SUMMARY_END_MARKER``) and the header of a to-do list a compression appends to the
+#: last user message (``tools.todo_tool.TODO_INJECTION_HEADER``), as Hermes 0.21.5 writes them.  Should Hermes change
+#: them, a folded message is no longer recognised: the turn is then the person's, as before.
+_PRIOR_CONTEXT_HEADER = "[PRIOR CONTEXT \u2014 for reference only; not a new message]"
+_SUMMARY_DELIMITER = "[END OF PRIOR CONTEXT \u2014 COMPACTION SUMMARY BELOW]"
+_SUMMARY_END = "--- END OF CONTEXT SUMMARY \u2014 respond to the message below, not the summary above ---"
+_TODO_HEADER = "[Your active task list was preserved across context compression]"
+
+
+def _own_text(message: dict[str, Any]) -> str:
+    """A user message's own words, as Hermes reads them back: without a compression summary folded into a message
+    Hermes marked as folded (``ContextCompressor._strip_context_summary_handoff_message``), and without a to-do list
+    appended to it (``_strip_stale_todo_snapshot``).  The person's words quoted inside a summary are not the
+    message's own.  An unmarked message is not unwrapped: a notice that quotes those lines keeps its words whole."""
+    text = extract_user_text(message.get("content"))
+    if message.get(_COMPRESSED_SUMMARY) is True:
+        if _SUMMARY_DELIMITER in text:
+            text = text.split(_SUMMARY_DELIMITER, 1)[0].strip()
+            if text.startswith(_PRIOR_CONTEXT_HEADER):
+                text = text[len(_PRIOR_CONTEXT_HEADER):]
+        elif _SUMMARY_END in text:
+            text = text.split(_SUMMARY_END, 1)[1]
+        else:
+            return ""
+    cut = text.find(_TODO_HEADER)
+    return (text if cut == -1 else text[:cut]).strip()
+
+
+def _notice_kind(message: dict[str, Any]) -> bool:
+    """A display kind Hermes gives the messages it writes itself: any but a steer, and on a folded message not the
+    legacy ``hidden`` either, which may wrap the person's words (``split_user_originated_turn``)."""
+    kind = message.get("display_kind")
+    if not isinstance(kind, str) or not kind or kind == STEER_KIND:
+        return False
+    return not (kind == "hidden" and message.get(_COMPRESSED_SUMMARY) is True)
+
+
 def host_notice(history: object, user_message: object) -> bool:
     """Whether the turn ``pre_llm_call`` opens is one Hermes opened itself, not the person.
 
     Hermes marks the user messages it writes itself with a display kind: a finished background process, a
     delegation's result, a wake-up, a plugin's message (``gateway.response_filters.display_kind_for_event``, the
     CLI's ``TimelineNotification``).  A steer is the one kind that holds the person's words
-    (``ContextCompressor._is_actionable_user_turn``).  The turn's own message is the last user message holding its
-    text in the run of user messages that ends the conversation: a compression at the turn's start can add others
-    after it (``agent.turn_context.reanchor_current_turn_user_idx``), and anything before the last reply belongs to
-    an earlier turn.  One not found there is the person's, as before.  Stored as the person's, a notice read as
-    something they said.
+    (``ContextCompressor._is_actionable_user_turn``).  Stored as the person's, a notice read as something they said.
+
+    The latest user message with words of its own decides: the turn is Hermes's when those words are the turn's
+    text and the message carries a notice's kind.  A to-do list a compression adds after the turn's message has no
+    words of its own (``agent.turn_context.reanchor_current_turn_user_idx``).  The latest only: when Hermes put a note
+    of its own before the person's message (a model switch, a timestamp), an unanswered notice with the same words
+    took theirs, and so did an older folded one (reviews of 3.7.3).  A request Hermes restores after a notice
+    decides in its place, and the notice stays the person's: the safe side.
+
+    Past the last reply the message must be one Hermes folded and marked.  A compression at the turn's start can
+    fold its summary into the turn's own message (``ContextCompressor._merge_summary_into_tail_row``) and put the
+    reply it folded away after it (``_reply_insertion_index``): one of tianshu's three delegation results on
+    2026-10-05 was stored as the owner's that way.  Anything else before the last reply belongs to an earlier turn.
+    Its own words only: a summary quotes the person's messages word for word, and a message merely holding the
+    turn's text took the person's words for a notice (review of 3.7.3).
     """
-    text = extract_user_text(user_message)
-    if not isinstance(history, list) or not text.strip():
+    text = extract_user_text(user_message).strip()
+    if not isinstance(history, list) or not text:
         return False
+    trailing = True
     for message in reversed(history):
         if not isinstance(message, dict) or message.get("role") != "user":
-            return False
-        if extract_user_text(message.get("content")) == text:
-            kind = message.get("display_kind")
-            return isinstance(kind, str) and bool(kind) and kind != STEER_KIND
+            trailing = False
+            continue
+        words = _own_text(message)
+        if words:
+            return (words == text and _notice_kind(message)
+                    and (trailing or message.get(_COMPRESSED_SUMMARY) is True))
     return False
 
 
