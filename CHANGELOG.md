@@ -4,29 +4,42 @@ All notable changes to `scope-recall` will be documented in this file.
 
 ## [Unreleased]
 
-## [3.8.0.1] - 2026-10-07
+## [3.8.1.1] - 2026-10-08
 
-**Fork release.** Upstream v3.8.0 is merged over v3.7.4.1 (17 non-merge commits, 37 files, +2383 -136):
-an operator can re-embed a store into a new embedding space (`respace-embeddings`), the doctor reports
-the embedding queue and its provider (`embedding_health`, and `embedding_backlog_aged` when embeddings
-wait a day), Hermes keeps what a failed tool call printed, an automatic recall reads its evidence in
-about 470 statements where it ran 16,000, a capture's write no longer grows with its text, a claim's
-vector work comes back after a provider failed it (`retry-failures` reopens what earlier releases
-dropped, and `_version.py` past the fork tag keeps the two builds apart).
+**Fork release.** Upstream v3.8.1 is merged over v3.8.0.1 (5 non-merge commits, 22 files, +1229 -49):
+a worker stays up until the candidates of a conversation's last messages settle (#214, reported, measured
+and quantified here), the doctor names work, and candidates still marked with new evidence, that have
+waited a day in any partition of the store (`due_work_unreached`, attention), and outside Windows
+`autostart plan` prints the wake as a systemd user timer and a cron line.
 
 Eight files conflicted and all of them are mechanical: the version, the four places
 `scripts/build.package_manifest.py` stamps it into, `scripts/check.py` (both sides added test entries;
-both are kept) and the changelog and the readme. No fork face is touched: the Qdrant backend, the
-Voyage usage fix and the auxiliary routing additions merge clean, and the Hermes adapter changes
-auto-merge.
+both are kept) and the changelog and the readme. No fork face is touched: the Qdrant backend, the Voyage
+usage fix and the auxiliary routing additions merge clean, and the work-queue changes in
+`maintenance/cli.py` and `maintenance/doctor.py` auto-merge.
 
-### Upgrading from 3.7.4.1
+### Upgrading from 3.8.0.1
 
 1. Stop the hosts and the Scope Recall worker, and take a `backup`.
-2. Install the 3.8.0.1 package, then run `plan-install` and `apply-install` for each host.
-3. Start the hosts again and run `doctor`.
+2. Install the 3.8.1.1 package, then run `plan-install` and `apply-install` for each host.
+3. Start the hosts again and run `doctor`. On Linux and macOS the wake needs the timer of
+   `docs/install.md` section 7.
 
 The store's schema is unchanged (1110); nothing needs running once.
+
+## [3.8.1] - 2026-10-07
+
+3.8.1 keeps a worker up until the candidates of a conversation's last messages settle (#214, reported and measured by @849506054).
+
+### Fixes
+
+- **A worker waits for a settling candidate.** A candidate inside its 15-minute quiet window is in no queue, so the pass after a channel's last message found nothing due and its supervisor stood down before the window closed; the candidate waited for the channel's next session. The wake plan now names the moment it becomes ready (`candidate_settle_window`), also for evidence that came while an earlier question about it waited. The supervisor records the last pass whose sweep saw every ready candidate (`last_pass_at`), so a candidate with nothing new to ask, or whose last question held all its evidence, does not wake the worker again; a pass that could not sweep holds that wake for 15 minutes.
+- **The doctor names work, and candidates still marked with new evidence, that have waited a day in any partition of the store** (`due_work_unreached`, attention). Its other work-queue figures still cover its own audience only.
+- **Outside Windows, `autostart plan` prints the wake as a systemd user timer and a cron line**, and `enable` writes the control file the wake reads (`docs/install.md`, section 7).
+
+### Upgrading from 3.8.0
+
+Install the package, run `plan-install` and `apply-install` where you upgrade, then restart the Hermes gateways and the clients' MCP servers. The schema is unchanged (1110). On Linux and macOS a wake needs the timer of `docs/install.md` section 7. Right after the upgrade the doctor may name work that has long waited (`due_work_unreached`, attention).
 
 ## [3.8.0] - 2026-10-06
 
