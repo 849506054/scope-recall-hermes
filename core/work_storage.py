@@ -113,6 +113,43 @@ FRESH_LANE_ORIGINS = {
 #: realistic window holds.  Fresh work beyond it is still claimed in FIFO order.
 FRESH_LANE_SCAN_ROWS = 512
 
+# --- a re-embed run after the embedding space changed ----------------------
+#
+# ``work_items`` is unique on its type and subject and says nothing of the space a vector was made in, so an
+# embedding done in one space stays done when the model changes, and the new store never receives it (#200, found
+# and reproduced by @Vivamisu).  Re-embedding a store is a deliberate, paid act: an operator starts a run
+# (``respace-embeddings``), and each drain of a worker in that space reopens a page of done embeddings
+# (``respace_page``), newest first and only while the embed queue has room, down to the bottom of the queue.
+#
+# The run is one row of the store's named cursors, the table that already keeps the store's other one-way walk
+# (``claim_backfill_1108``): a run needs a space, a position and a count, and a table of its own would have needed
+# a schema step that every entry of a shared store has to take at once.
+
+#: The run's row in ``candidate_scan_cursors``: ``position_ref`` the space it embeds into, ``position_revision`` the
+#: highest work id it has still to look at, ``processed_count`` the rows it reopened, ``completed`` once none is left.
+RESPACE_CURSOR = "embed_respace"
+#: What a reopened row says until it is embedded again.
+RESPACE_MARKER = "embedding_space_changed"
+#: Rows one page reopens at most; the embed queue's room bounds it further.
+RESPACE_PAGE = 64
+#: Work ids one page looks through at most.
+RESPACE_SCAN = 4096
+_SPACE_ID = re.compile(r"[0-9a-f]{64}")
+#: A tool output whose vector the retention window expired keeps none (``runtime/vector_retention.py``).
+_NOT_EXPIRED = """NOT EXISTS(SELECT 1 FROM expired_vectors x
+                       WHERE x.source_ref=w.subject_ref AND x.source_revision=w.subject_revision)"""
+
+
+def respace_refusal(run: dict | None, space_id: str, *, restart: bool) -> str | None:
+    """Why a run into ``space_id`` may not start now, or None.  One run at a time, and one per space: a run that is
+    going, or one into the same space that finished, is started again only on purpose (``restart``); a finished run
+    into another space gives way to the new one (the model changed again)."""
+    if run is None or restart:
+        return None
+    if not run["completed"]:
+        return "respace_running"
+    return "respace_finished" if run["embedding_space"] == space_id else None
+
 
 def fresh_since(now: str) -> str:
     """The oldest ``persisted_at`` that still counts as fresh conversation."""
@@ -320,6 +357,16 @@ def _projection_retry_reason(tx, ref: str, revision: int, *, current_epoch: int 
     return None
 
 
+def _embed_retry_reason(tx, ref: str, revision: int, *, current_epoch: int | None = None) -> str | None:
+    """An embed's subject is a source or, since every claim head is queued for the vector index, a claim, which may
+    be worked on while it is the readable head it was queued for.  Read as a source, a claim was never found: every
+    claim embed a provider failed was made obsolete instead of reopened, and 114 readable heads of the shared store
+    had no vector (review of 3.7.4)."""
+    if ref.startswith("claim-"):
+        return _projection_retry_reason(tx, ref, revision, current_epoch=current_epoch)
+    return _source_retry_reason(tx, ref, revision, current_epoch=current_epoch)
+
+
 def _purge_retry_reason(tx, ref: str, revision: int, *, current_epoch: int | None = None) -> str | None:
     try:
         from .delete_storage import purge_work_parts
@@ -339,7 +386,7 @@ def _purge_retry_reason(tx, ref: str, revision: int, *, current_epoch: int | Non
 #: most once, and new evidence makes a new row rather than a retry.
 _RETRY_SUBJECT_REASON = {
     "consolidate": _source_retry_reason,
-    "embed": _source_retry_reason,
+    "embed": _embed_retry_reason,
     "rebuild_projection": _projection_retry_reason,
     "purge": _purge_retry_reason,
 }
@@ -774,6 +821,22 @@ class WorkItems:
             kind = str(code or "").rsplit("|", 1)[-1]
             report["by_kind"][kind] = report["by_kind"].get(kind, 0) + 1
             report["retried"] += 1
+        # The automatic recovery read every embed's subject as a source, so a claim embed a provider failed was made
+        # obsolete instead of reopened (``_embed_retry_reason``).  A readable head it left without a vector is worked
+        # on again, and one an earlier conversion never queued is queued (review of 3.7.4).
+        heads = self._claim_heads_without_vectors(limit=limit)
+        report["claim_embeds_reopened"] = sum(1 for work_id, _ref, _revision in heads if work_id is not None)
+        report["claim_embeds_queued"] = sum(1 for work_id, _ref, _revision in heads if work_id is None)
+        if not dry_run:
+            from .failure_retry import marked  # imports this module
+
+            for work_id, ref, revision in heads:
+                if work_id is None:
+                    self.enqueue("embed", ref, revision, available_at=now)
+                else:
+                    conn.execute("""UPDATE work_items SET state='pending',available_at=?,lease_owner=NULL,
+                                    lease_until=NULL,last_error_code=? WHERE work_id=? AND state='obsolete'""",
+                                 (now, marked("authority_revoked", generation=SCHEMA_VERSION), work_id))
         # Captures a replay gave up after its tries (``capture_inbox._GAVE_UP``) go back to it, their tries counted
         # anew: whatever kept them out has been fixed, or they are given up again, visibly.  Only the partition this
         # config's replay takes (``replay_inbox``): returned by what the config could see, a row of another went back
@@ -806,6 +869,131 @@ class WorkItems:
                               for token, code in abandoned])
             conn.executemany("UPDATE capture_inbox SET last_error_code=NULL WHERE token=?", [(row[0],) for row in refused])
         return report
+
+    def _claim_heads_without_vectors(self, *, limit: int) -> list[tuple[int | None, str, int]]:
+        """Readable claim heads of this context whose vector work was made obsolete or never queued: (the obsolete
+        row's work id, or None when there is none, the claim, its head revision), at most ``limit``.
+
+        The query asks what ``_embed_retry_reason`` will (the exact project and branch, no block), so heads it would
+        refuse never fill the page ahead of one it takes (review of 3.7.5)."""
+        conn = self._tx._check()
+        context = self._tx.context
+        scopes = sorted(context.allowed_scope_ids)
+        rows = conn.execute(
+            f"""SELECT w.work_id, c.claim_id, c.current_revision FROM claims c
+                LEFT JOIN work_items w ON w.work_type='embed' AND w.subject_ref=c.claim_id
+                     AND w.subject_revision=c.current_revision
+                WHERE c.read_blocked=0 AND c.scope_id IN ({_marks(scopes)})
+                  AND c.project_id IS ? AND c.branch_id IS ?
+                  AND NOT EXISTS (SELECT 1 FROM restored_absence_blocks a
+                                  WHERE a.object_kind='claim' AND a.object_ref=c.claim_id)
+                  AND NOT EXISTS (SELECT 1 FROM object_blocks b WHERE b.object_kind='claim' AND b.object_ref=c.claim_id
+                                  AND (b.read_blocked<>0 OR b.scope_id NOT IN ({_marks(scopes)})))
+                  AND (w.work_id IS NULL OR (w.state='obsolete' AND w.last_error_code='authority_revoked'))
+                ORDER BY c.claim_id LIMIT ?""",
+            (*scopes, context.project_id, context.branch_id, *scopes, limit * 8)).fetchall()
+        heads: list[tuple[int | None, str, int]] = []
+        for work_id, ref, revision in rows:
+            if len(heads) >= limit:
+                break
+            if _embed_retry_reason(self._tx, ref, revision) is None:
+                heads.append((work_id, ref, revision))
+        return heads
+
+    # --- a re-embed run after the embedding space changed (``respace-embeddings``) -------------------------------
+
+    def respace_run(self) -> dict | None:
+        """The store's re-embed run (``RESPACE_CURSOR``), or None when none was started."""
+        row = self._tx._check().execute(
+            """SELECT position_ref,position_revision,processed_count,completed,updated_at FROM candidate_scan_cursors
+               WHERE cursor_name=?""", (RESPACE_CURSOR,)).fetchone()
+        if row is None:
+            return None
+        return {"embedding_space": row[0], "next_work_id": int(row[1] or 0), "reopened": int(row[2]),
+                "completed": bool(row[3]), "updated_at": row[4]}
+
+    def embed_queue(self) -> dict:
+        """The store's embed queue, every partition: pending and failed rows, and the oldest pending one's time.
+
+        A re-embed run reopens rows of every partition, so it is held by what waits anywhere; and the doctor reports
+        the store.  Read through ``work_ready`` (state first): by ``work_type`` SQLite walked every embed row."""
+        pending, failed, oldest = self._tx._check().execute(
+            """SELECT sum(state='pending'),sum(state='failed'),min(CASE WHEN state='pending' THEN available_at END)
+               FROM work_items WHERE state IN ('pending','failed') AND +work_type='embed'""").fetchone()
+        return {"pending": int(pending or 0), "failed": int(failed or 0), "oldest_pending_at": oldest}
+
+    def respace_remaining(self, *, at_most: int | None = None) -> int:
+        """Embeddings done so far that a run would reopen: at or below work id ``at_most`` (all when None), except a
+        tool output whose vector the retention window expired, which stays without one."""
+        bound = (2 ** 63 - 1) if at_most is None else int(at_most)
+        return int(self._tx._check().execute(
+            f"""SELECT count(*) FROM work_items w WHERE w.work_type='embed' AND w.state='done' AND w.work_id<=?
+                AND {_NOT_EXPIRED}""", (bound,)).fetchone()[0])
+
+    def start_respace(self, space_id: str, *, now: str, restart: bool = False) -> dict:
+        """Start a run into ``space_id`` over every embedding done so far, from the newest down (``respace_refusal``
+        says when it may).  Work queued after the start is embedded into the new space as it comes and lies above the
+        run, so it is never reopened; an embedding still waiting at the start lies below it, is embedded into the new
+        space when its turn comes, and is reopened again when the run reaches it."""
+        if type(space_id) is not str or not _SPACE_ID.fullmatch(space_id) or type(restart) is not bool:
+            raise ContractError("INPUT_INVALID", "respace_space")
+        conn = self._tx._check(write=True)
+        refusal = respace_refusal(self.respace_run(), space_id, restart=restart)
+        if refusal is not None:
+            raise ContractError("VERSION_CONFLICT", refusal)
+        top = int(conn.execute("SELECT coalesce(max(work_id),0) FROM work_items").fetchone()[0])
+        conn.execute(
+            """INSERT INTO candidate_scan_cursors(cursor_name,position_ref,position_revision,processed_count,completed,
+                   updated_at) VALUES (?,?,?,0,?,?)
+               ON CONFLICT(cursor_name) DO UPDATE SET position_ref=excluded.position_ref,
+                   position_revision=excluded.position_revision,processed_count=0,completed=excluded.completed,
+                   updated_at=excluded.updated_at""",
+            (RESPACE_CURSOR, space_id, top, int(top == 0), now))
+        return self.respace_run()
+
+    def cancel_respace(self) -> bool:
+        """Forget the run, if there is one.  What it reopened already stays queued and is embedded."""
+        return self._tx._check(write=True).execute(
+            "DELETE FROM candidate_scan_cursors WHERE cursor_name=?", (RESPACE_CURSOR,)).rowcount == 1
+
+    def respace_page(self, space_id: str, *, now: str, room: int) -> dict:
+        """Reopen the run's next page of done embeddings, newest first and at most ``room``, for a worker in
+        ``space_id``.
+
+        A reopened row is pending like a new one: its attempts count afresh, any lease is fenced off, and it is
+        available from ``now``, so it waits behind the queue it joins rather than ahead of it.  A page looks through
+        at most ``RESPACE_SCAN`` work ids, newest first by the primary key, so it holds the writer lease for a bounded
+        scan however sparse the done embeddings are among them.  A worker of another space leaves the run alone.
+        """
+        if type(room) is not int:
+            raise ContractError("INPUT_INVALID", "respace_room")
+        run = self.respace_run()
+        if run is None or run["completed"]:
+            return {"outcome": "none"}
+        if run["embedding_space"] != space_id:
+            return {"outcome": "space_mismatch", "embedding_space": run["embedding_space"]}
+        top = run["next_work_id"]
+        if room <= 0:
+            return {"outcome": "held", "reopened": 0, "next_work_id": top}
+        conn = self._tx._check(write=True)
+        bottom = max(1, top - RESPACE_SCAN + 1)
+        page = min(room, RESPACE_PAGE)
+        ids = [row[0] for row in conn.execute(
+            f"""SELECT w.work_id FROM work_items AS w NOT INDEXED
+                WHERE w.work_id BETWEEN ? AND ? AND w.work_type='embed' AND w.state='done' AND {_NOT_EXPIRED}
+                ORDER BY w.work_id DESC LIMIT ?""", (bottom, top, page))]
+        if ids:
+            conn.execute(
+                f"""UPDATE work_items SET state='pending',attempt=0,available_at=?,lease_token=lease_token+1,
+                    lease_owner=NULL,lease_until=NULL,last_error_code=? WHERE work_id IN ({_marks(ids)}) AND state='done'""",
+                (now, RESPACE_MARKER, *ids))
+        # A full page stops below its last row; a short one has looked through the whole window.
+        below = (ids[-1] if len(ids) == page else bottom) - 1
+        conn.execute(
+            """UPDATE candidate_scan_cursors SET position_revision=?,processed_count=processed_count+?,completed=?,
+               updated_at=? WHERE cursor_name=?""",
+            (below, len(ids), int(below < 1), now, RESPACE_CURSOR))
+        return {"outcome": "complete" if below < 1 else "progress", "reopened": len(ids), "next_work_id": below}
 
     def _reopen_failed(self, work_id: int, work_type: str, code: object, *, now: str, automatic: bool = False) -> bool:
         """Move one failed row, and its sibling tables when it has any."""

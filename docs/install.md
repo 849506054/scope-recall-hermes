@@ -529,6 +529,10 @@ Things that look wrong in a healthy report and are not:
 - `autostart_status: "not_registered"` and `ledger_headroom: {}` mean you have
   not configured those things, which is not a fault.
 - `terminal_failed_work: null` on a clean queue.
+- `embedding_respace: null` means no re-embed run was ever started (see
+  section 7). `embedding_health` always counts the embedding queue; its
+  `last_day` and `held_until` appear only with an external embedding route,
+  and only while the provider holds it.
 
 ### Common gaps and what they mean
 
@@ -557,6 +561,9 @@ Things that look wrong in a healthy report and are not:
 | `work_backlog_stalled` | Work is pending and the worker has not succeeded for more than twice `supervisor_seconds`. | The worker is not running. See the next section. |
 | `worker_capability_unavailable` | Work is pending and the last pass reported work types it could not do. `attention`. | Usually a missing model route, credential or budget. |
 | `capture_ingress_blocked` | Inbox rows carry a real error code, or wait for their next try. Always `degraded`. | Read `capture_inbox_blocked` and the recent work errors. A row whose stored capture a replay could not check again is tried after a minute, doubling to an hour; when its 24th try again fails it is given up and counted in `capture_inbox_given_up`. `retry-failures` without `--apply` counts them by what gave them up (`inbox_by_kind`); fix that, then `retry-failures --apply` returns them to the replay. |
+| `embedding_backlog_aged` | An external embedding route is configured, and embeddings have waited more than 24 hours. Recall goes on answering, but finds what came in since then by its words alone. The check's detail names the provider's hold and its refusals over the last day when there are any (`embedding_health`). Without a route nothing embeds, by choice, and the gap is not raised. | With a hold or refusals: a quota, a spend cap or a credential at the provider; fix it there and the queue drains by itself. Without them no worker has reached the embeddings: read `worker_status`, and where each project has a worker of its own, check that it runs. |
+| `embedding_respace_space_mismatch` | A re-embed run (`respace-embeddings`) embeds into one space while `runtime-config.json` embeds into another, after a second change of model, so no worker goes on with it. | `respace-embeddings --config <file> --restart --apply` to start again into the new space, or `--cancel --apply`. |
+| `embedding_respace_failed:<Error>` | A worker pass could not reopen the run's next page; the worker status carries it. The run is unchanged and the next pass tries again. | Read the error; a held writer lease passes by itself. |
 | `autostart_registration_missing` | The control file says enabled, but the scheduled task is gone. | Re-run `autostart enable`. |
 | `autostart_configuration_invalid` | `runtime-autostart.json` is unusable, or points at a config that will not load or does not match the binding. | Re-run `autostart enable` with the correct `--config`. |
 | `ledger_missing:<file>` | An external route is approved but its budget ledger file does not exist. | Create the ledger — see [configuration.md](configuration.md). |
@@ -647,6 +654,40 @@ with the shared worker's config (`<root>\runtime-config.json`), since an entry's
 config reaches only that entry's scopes. Run it after going back to an earlier
 release and forward again: a capture the earlier release could not read may have
 been given up meanwhile.
+
+Since 3.7.5 it also brings back the vector work of claim heads. Before 3.7.5 the
+automatic recovery made a claim's failed embedding obsolete instead of retrying
+it, and an earlier conversion left some heads without one. The command reopens
+the first (`claim_embeds_reopened`) and queues the second
+(`claim_embeds_queued`), a page at a time up to `--limit`. It does this only for
+heads that are readable in its config's scopes. A claim found by its words alone
+is then found by meaning too.
+
+After changing the embedding model (see [configuration.md](configuration.md),
+"Changing the embedding model rebuilds the vector store"), re-embed what was
+embedded so far into the new space:
+
+```bash
+scope-recall respace-embeddings --config /path/to/instance-root/scope-recall/runtime-config.json --start --apply
+```
+
+Without `--apply` nothing is written, and without `--start` the command shows
+the run, the embeddings it still has to reopen (`to_reopen`) and those still
+waiting in the store (`waiting`).
+
+- Start right after switching. The run reopens every embedding finished before
+  it starts, so whatever waited at the switch, or was embedded into the new
+  space before the start, is paid for twice. While the old route still answers,
+  let `waiting` come down before you switch.
+- The run covers the whole store and lives in SQLite. Every worker pass in that
+  space reopens a page of finished embeddings, newest first. It does so only
+  while fewer than 64 embeddings wait anywhere in the store, or half a pass's
+  worth while candidate evaluations are ready, so messages captured meanwhile
+  are embedded first. Embeddings of a project whose worker never runs hold the
+  run; the doctor's `embedding_respace` check then says how many wait.
+- `--start` refuses while a run is going, and after one into the same space has
+  finished. `--restart --apply` starts again from the newest. `--cancel --apply`
+  stops the run, and what it reopened is still embedded.
 
 Since 3.2.0 a tool output is kept and embedded, found by its words and by
 meaning, but no longer consolidated into claims: what an agent read or ran is

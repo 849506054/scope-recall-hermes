@@ -259,36 +259,42 @@ class CandidateIntake(CandidateTables):
             return []
         first_hand = is_first_hand(evidence_text(source).origin)
         context, params = self._context("l.")
-        cursor = self._read().execute(
-            f"""SELECT DISTINCT l.candidate_ref,l.candidate_revision,v.payload_json
-                FROM candidate_trigger_terms t
+        # The terms go in as one parameter and the candidates come back in one row.  A parameter per term failed a part
+        # of 63,993 distinct terms whole ("too many SQL variables", kept to retry for good), and a row per candidate
+        # waited for the GIL in a busy Hermes gateway (``lexical_index.index_terms``; review of 3.7.6).  The CROSS JOIN
+        # starts from the terms: from the candidates, SQLite looked every term up for each reachable one, 3-12 s for a
+        # tool output of 5,001 terms beside 3,000-10,000 candidates.
+        row = self._read().execute(
+            f"""SELECT json_group_array(json_array(candidate_ref,candidate_revision,payload_json,updated_at)) FROM (
+                SELECT DISTINCT l.candidate_ref,l.candidate_revision,v.payload_json,l.updated_at
+                FROM json_each(?) j CROSS JOIN candidate_trigger_terms t ON t.term=j.value
                 JOIN candidate_lifecycle l USING(candidate_ref,candidate_revision)
                 JOIN claims c ON c.claim_id=l.candidate_ref
                 JOIN claim_versions v ON v.claim_id=l.candidate_ref AND v.revision=l.candidate_revision
-                WHERE t.term IN ({','.join('?' for _ in terms)}) AND {context}
+                WHERE {context}
                   AND l.scope_id=? AND l.project_id IS ? AND l.branch_id IS ?
                   AND c.current_revision=l.candidate_revision AND c.read_blocked=0 AND c.suppressed=0
                   AND {reachable_sql('l.')}
                   AND NOT EXISTS(SELECT 1 FROM candidate_evidence e
                       WHERE e.candidate_ref=l.candidate_ref AND e.candidate_revision=l.candidate_revision
-                        AND e.source_ref=? AND e.source_revision=?)
-                ORDER BY l.updated_at,l.candidate_ref,l.candidate_revision""",
-            (*terms, *params, source.scope_id, source.project_id, source.branch_id,
+                        AND e.source_ref=? AND e.source_revision=?))""",
+            (json.dumps(terms, ensure_ascii=False), *params, source.scope_id, source.project_id, source.branch_id,
              source.ref, source.revision),
-        )
-        try:
-            if first_hand:
-                return cursor.fetchmany(limit)
-            letters = _letters_and_digits(source.event["content"])
-            matched = []
-            for row in cursor:
-                if _speaks_to(json.loads(row["payload_json"]), letters):
-                    matched.append(row)
-                    if len(matched) >= limit:
-                        break
-            return matched
-        finally:
-            cursor.close()
+        ).fetchone()
+        # In the order the statement gave them: by when each was last updated, then by ref and revision.
+        found = [{"candidate_ref": ref, "candidate_revision": revision, "payload_json": payload}
+                 for _updated, ref, revision, payload in sorted(
+                     (updated, ref, revision, payload) for ref, revision, payload, updated in json.loads(row[0]))]
+        if first_hand:
+            return found[:limit]
+        letters = _letters_and_digits(source.event["content"])
+        matched = []
+        for candidate in found:
+            if _speaks_to(json.loads(candidate["payload_json"]), letters):
+                matched.append(candidate)
+                if len(matched) >= limit:
+                    break
+        return matched
 
     def _schedule_when_settled(self, candidate, *, now: str, rule_version: str) -> tuple[int | None, bool]:
         """Schedule only once this candidate has stopped collecting evidence.

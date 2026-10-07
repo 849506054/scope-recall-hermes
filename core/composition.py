@@ -406,6 +406,44 @@ class MemoryCore:
             return tx.work.retry_failed(now=self.clock.utc_now(), include_terminal=include_terminal,
                                         limit=limit, dry_run=dry_run)
 
+    def respace_embeddings(self, context: TrustedContext, *, space_id: str, action: str = "status",
+                           dry_run: bool = True, remaining_seconds: float | None = None) -> dict:
+        """Report, start or cancel the store's re-embed run into ``space_id`` (``core/work_storage.py``).
+
+        ``run`` is the run as it stands after the action (before it, in a preview).  ``to_reopen`` is what a run that
+        is going still has to look at, or else what a new one would reopen; ``waiting`` the embeddings still waiting
+        anywhere, which a run started now reopens once they are done: paid twice, as is whatever the new space
+        embedded before the start.  The run covers the whole store:
+        each worker in the space reopens pages of it while fewer than the queue's ceiling wait anywhere, and claims
+        its own share.  A preview only reads; a start it would refuse is refused in the preview too.
+        """
+        from .work_storage import respace_refusal
+
+        if action not in ("status", "start", "restart", "cancel") or type(dry_run) is not bool:
+            raise ContractError("INPUT_INVALID", "respace_action")
+        writes = action != "status" and not dry_run
+        seconds = self.config.write_timeout_seconds if remaining_seconds is None else remaining_seconds
+        report: dict = {"embedding_space": space_id, "action": action, "applied": writes}
+        if writes:
+            with self.storage.write(context, remaining_seconds=seconds) as tx:
+                if action == "cancel":
+                    report["cancelled"] = tx.work.cancel_respace()
+                else:
+                    tx.work.start_respace(space_id, now=self.clock.utc_now(), restart=action == "restart")
+        # Counting walks the queue: kept out of the write, and so off the writer lease.
+        with self.storage.read(context, remaining_seconds=seconds) as tx:
+            run = tx.work.respace_run()
+            if not writes and action in ("start", "restart"):
+                refusal = respace_refusal(run, space_id, restart=action == "restart")
+                if refusal is not None:
+                    raise ContractError("VERSION_CONFLICT", refusal)
+            going = run is not None and not run["completed"] and (writes or action == "status")
+            report["run"] = run
+            report["space_matches"] = run is None or run["embedding_space"] == space_id
+            report["to_reopen"] = tx.work.respace_remaining(at_most=run["next_work_id"] if going else None)
+            report["waiting"] = tx.work.embed_queue()["pending"]
+        return report
+
     def forget(self, context: TrustedContext, value, *, remaining_seconds: float | None = None):
         from .deletion import forget
         return forget(self.storage,self.clock,context,value,

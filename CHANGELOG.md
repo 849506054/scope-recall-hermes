@@ -4,6 +4,141 @@ All notable changes to `scope-recall` will be documented in this file.
 
 ## [Unreleased]
 
+## [3.8.0.1] - 2026-10-07
+
+**Fork release.** Upstream v3.8.0 is merged over v3.7.4.1 (17 non-merge commits, 37 files, +2383 -136):
+an operator can re-embed a store into a new embedding space (`respace-embeddings`), the doctor reports
+the embedding queue and its provider (`embedding_health`, and `embedding_backlog_aged` when embeddings
+wait a day), Hermes keeps what a failed tool call printed, an automatic recall reads its evidence in
+about 470 statements where it ran 16,000, a capture's write no longer grows with its text, a claim's
+vector work comes back after a provider failed it (`retry-failures` reopens what earlier releases
+dropped, and `_version.py` past the fork tag keeps the two builds apart).
+
+Eight files conflicted and all of them are mechanical: the version, the four places
+`scripts/build.package_manifest.py` stamps it into, `scripts/check.py` (both sides added test entries;
+both are kept) and the changelog and the readme. No fork face is touched: the Qdrant backend, the
+Voyage usage fix and the auxiliary routing additions merge clean, and the Hermes adapter changes
+auto-merge.
+
+### Upgrading from 3.7.4.1
+
+1. Stop the hosts and the Scope Recall worker, and take a `backup`.
+2. Install the 3.8.0.1 package, then run `plan-install` and `apply-install` for each host.
+3. Start the hosts again and run `doctor`.
+
+The store's schema is unchanged (1110); nothing needs running once.
+
+## [3.8.0] - 2026-10-06
+
+3.8.0 re-embeds a store into a new embedding space when an operator asks for it, and the doctor says when embeddings have waited a day.
+
+### Added
+
+- **`respace-embeddings` re-embeds what was embedded so far after the embedding model changed.** Found and reproduced by @Vivamisu (#200). `work_items` is unique on its type and subject and says nothing of the space a vector was made in, so an embedding done in one space stayed done when the model changed. The new space received only what came in afterwards, and older memory was found by its words alone.
+  - `respace-embeddings --config <file> --start --apply` starts a run over every embedding done so far. Every source and claim is then embedded again and paid for, so a run starts only when asked.
+  - Each worker pass in that space reopens a page of done embeddings, newest first. It does so only while fewer than 64 embeddings wait anywhere in the store, or half a pass's worth while candidate evaluations are ready, so what is captured meanwhile is embedded first. A page looks through at most 4,096 work ids. Embeddings of a project whose worker never runs hold the run.
+  - A reopened row is pending like new work: its attempts count afresh and any lease on it is fenced off. A tool output whose vector the retention window removed stays without one. Work queued after the start is embedded into the new space as it arrives and is never reopened. The run reopens everything finished before it starts, so whatever waited at the switch or was embedded into the new space before the start is paid for twice: the docs say to let the queue come down before switching, while the old route still answers, and to start right after. The preview shows how many wait (`waiting`).
+  - The run lives in SQLite, as one of the store's named cursors, so there is no schema change. `--start` refuses while a run is going and after one into the same space has finished; `--restart` starts again from the newest, `--cancel` stops it, and the plain command shows the run and what it still has to reopen.
+  - A worker in another space leaves the run alone, and the doctor names that (`embedding_respace_space_mismatch`). A page that failed is reported in the worker's status (`embedding_respace_failed:<Error>`) and tried again on the next pass.
+  - `tests/contract/test_embedding_respace.py`; the model switch is also run end to end on the native vector store (`tests/storage_native/test_runtime_instance_seam.py`).
+- **The doctor reports the embedding queue and the provider beside it** (`embedding_health`), as suggested in #200. It shows pending and failed embeddings and the oldest one waiting; with an external route, also the provider's hold and its answers over the last day.
+  - With an external embedding route, embeddings that have waited more than 24 hours raise `embedding_backlog_aged`, with the hold and the refusals in the check's detail, or a pointer to the worker when the provider refused nothing. While they wait, recall answers by words alone, and before this nothing said so.
+
+### Upgrading from 3.7.8
+
+Install the package, run `plan-install` and `apply-install` where you upgrade, then restart the Hermes gateways and the clients' MCP servers, so that every entry of a shared store runs one version. The store's schema is unchanged (1110), and nothing needs running once. After a change of embedding model, see `docs/configuration.md`, "Changing the embedding model rebuilds the vector store".
+
+## [3.7.8] - 2026-10-06
+
+3.7.8 keeps what a failed tool call printed in Hermes.
+
+### Fixes
+
+- **Hermes keeps a tool call that failed.** Hermes calls a tool result failed when a command exits non-zero or the result carries an error field. The plugin then refused the result as having no scope: what the agent had seen (a traceback, a failing test, a refused command) was never stored, and each one was logged as a failed capture (`not stored (capability_gap)`). On the five instances that was 460 tool results from 2026-10-01 to 2026-10-06, about 6% of their tool output. Codex already kept its failed calls.
+  - A failed, cancelled or interrupted call that returned something is now stored like any other tool output: indexed by its words and queued for an embedding, and, like any tool output, rooting no claim and no resume field. It is stored `partial`.
+  - It does not end its task either. A tool output's non-zero exit code marks its task failed, and a grep that finds nothing exits 1; a `partial` output tells its own outcome, not the task's, so it now leaves the task's state alone (`core/episodes.py`). Resume offers only an open or interrupted task, so a task marked failed this way would have dropped out of it. This holds for every `partial` tool output, including one the hook adapter of Codex, Claude Code, WorkBuddy and dsh stores cut off past 65,536 characters; a person's or the host's own words still move the task as before.
+  - A call whose result is empty keeps only its outcome, in the session's diagnostics, and is no longer logged as a failed capture.
+  - `tests/host/hermes/test_bounded_corrections.py`, `tests/contract/test_v11_episode_authority.py`.
+
+### Upgrading from 3.7.7
+
+Install the package, run `plan-install` and `apply-install` where you upgrade, then restart the Hermes gateways and the clients' MCP servers, so that every entry of a shared store runs one version. The store's schema is unchanged (1110), and nothing needs running once.
+
+## [3.7.7] - 2026-10-06
+
+3.7.7 makes an automatic recall read what it needs once, and together. A recall on yuheng's questions ran 16,222 statements and read 7,087 rows; it now runs 469 and reads 755, and finds the same.
+
+### Fixes
+
+- **A read transaction keeps what it loaded, and hydration loads its candidates together.**
+  - A recall loaded each evidence source of its candidates up to five times (whether it may be delivered, whether it is its group's newest version, its origin, its context, its entry), each load three statements: two for visibility and one for the row. Each candidate claim's versions were read on their own, and so was every candidate's visibility.
+  - In a Hermes gateway every statement and every row waits for the GIL while another thread is busy (3.7.6). Beside one thread that kept the CPU busy, yuheng's recall of 12 real questions ran past its 5 s deadline in every stage and found none of them.
+  - A read transaction reads one snapshot, so what it loaded stays true until it ends: it now keeps sources, their visibility, whether each is its group's newest, and claims' versions (`Transaction.remembered`). It keeps at most 16,384 answers and 32 million characters of text (about 70 MB in Python), so one that reads a whole store keeps no more; over 483 recalls the largest kept 13 million. A write transaction keeps nothing, and a transaction lets go of what it kept when it ends.
+  - Before hydrating, a recall loads every candidate's visibility, the events' rows and the claims' versions in a few statements, and a claim's evidence in three whatever its count: its lineage, its visibility and its rows (`RetrievalStorage.prefetch`, `Transaction.prefetch_sources`, `Claims.prefetch_versions`). Hydrating a claim of 16 sources takes 15 statements, as one of 2 does, where they took 221 and 39. Nothing is loaded ahead once the deadline is gone. Every reader still gets objects of its own.
+  - The same packets: on a copy of the shared store, words only and at one fixed time, 483 of 483 cases gave the identical packet, byte for byte but its diagnostic ref (173 real questions from eight entries, Codex having none, and 310 of the older sets).
+  - Faster alone, and much faster beside a busy thread. Over the 173 real questions, the two releases alternated twice on the same copy, the median recall went from 0.78 s to 0.72 s and the 90th percentile from 0.99 s to 0.91 s; on yuheng's 12 questions beside a thread busy 10% or 30% of the time, from 1.64 s to 1.31 s and from 1.95 s to 1.45 s, all 12 found either way. Beside a thread that keeps the CPU busy all the time, from 9.4 s to 6.5 s: still past the deadline.
+  - `tests/contract/test_recall_row_crossings.py`: loaded together reads as loaded alone (a part of a message whose other part never came, a whole one, a version a newer one replaced, a claim of two versions), nothing is read twice, readers never share an event, a write transaction reads what it wrote, past its limits a transaction answers alike, hydrating a claim of 16 sources costs what one of 2 does, a recall answers alike whether or not it keeps what it loads, and what is loaded together keeps the reader's audience: another project's source or claim, a source blocked from reading, a claim in a scope the reader lacks, and a part whose other part was blocked (review of 3.7.7).
+
+### Known limits
+
+- Beside a thread that keeps the CPU busy all the time, a recall still runs past its 5 s deadline; about 470 statements and 750 rows remain, and its own Python work runs at half speed. Hermes logged no prefetch past its own limit in the last six days.
+- A person's message that reads as a correction still loads the versions of every claim it may correct, up to 200, inside its write (3.7.6).
+
+### Upgrading from 3.7.6
+
+Install the package, run `plan-install` and `apply-install` where you upgrade, then restart the clients' MCP servers and the Hermes gateways. The store's schema is unchanged (1110), and nothing needs running once.
+
+## [3.7.6] - 2026-10-06
+
+3.7.6 keeps a capture's write from growing with its words, its session's episode, the store's scopes and the candidates its words reach. In a busy Hermes gateway one long tool output held the shared store's writer lease for 30 to 43 s, four times in two days. Every other entry's write failed meanwhile, and Hermes skipped the tool hook of every session for a minute, so the tool results of that minute were never stored.
+
+### Fixes
+
+- **A capture's write no longer grows with its words, its episode, the store's scopes or the candidates its words reach.**
+  - Every statement, and every row read in Python, hands Python's GIL over and back. In a Hermes gateway whose other threads were busy, each handoff waited out their switch interval.
+  - A capture wrote two statements per term and read its terms back one row at a time. On yuheng, terminal outputs of 52,137 characters took 37.1 s (2026-10-04 12:22), of 51,283 characters (9,348 terms) 42.9 s (10-05 15:12) and of 25,067 characters 30.3 s (20:40); on tianshu a file of 11,502 characters took 36.2 s (10-05 12:43), beside ten other captures of the same step.
+  - Each of those writes was stored at once and committed tens of seconds later, holding the writer lease all that time. The other entries' captures failed with it, and were kept to retry. Hermes gave up on the hook at 30 s and skipped it for every session for the next minute: 36 tool results of those two days were never stored.
+  - Now the terms go in with one statement each way and come back in one row (`lexical_index.index_terms`, `terms_of`). Joining an episode reads its members' lineage, states, visibility, latest time and resume proofs in one row each, where it read up to 200 rows and ran two statements per member (`episode_storage`, `lineage.evidence`, `visibility.allowed_refs`). Every transaction counts the store's scopes in one row, where it read the shared store's 760 one by one (`storage._verify`). A source that is not first-hand, such as what the assistant said, reads the candidates it shares a word with in one row, where it read one row per candidate until sixteen were restated, and the match starts from its words: from the candidates, SQLite looked every word up for each candidate it could reach. On a copy of the shared store, matching an entry's 40 latest messages took 1.3 s where it took 3.2-3.8 s, and found the same candidates for every one (`candidate_intake`, review of 3.7.6).
+  - A source restating a muted claim is still muted with it, and the muted claims are now picked before the content is searched. SQLite had searched the content for the subject and predicate of every claim in the scope first: 8,995 claims for yuheng's, 11 of them muted, 1 s for that output.
+  - Replayed on a copy of the shared store with one busy thread beside it, as a gateway has, the 51,283-character write took 408 s and now takes 7.9 s; 7.6 s for the 25,067-character one and 7.1 s for 18 characters. Alone, 1.6 s became 0.65 s.
+  - `tests/contract/test_capture_row_crossings.py` counts what crosses the boundary: a tool output of 3,000 terms against one of a few, a capture joining an episode of 152 members against one joining an episode of 1, a store of 502 scopes against one of 2, and what the assistant said beside 65 candidates against 5.
+- **A part of more distinct terms than SQLite takes parameters is stored (review of 3.7.6).** Matching a source to the candidates bound one parameter per term. A part of 64,000 characters can hold more distinct terms than SQLite takes parameters (32,766 by default), and the whole capture then failed as the store being unavailable, to be kept and retried for good. The terms now go in as one parameter.
+
+### Known limits
+
+- Two paths of a capture still read per item. A person's message that reads as a correction or a confirmation loads the versions of every claim it may touch, up to 200 (1,311 statements in a scope of 252 claims, against about 100 for a plain message). And each further part of a message over 65,536 characters adds about 90 statements.
+- An automatic recall reads its candidates one statement and one row at a time too. Replayed on the same copy beside one thread that keeps the CPU busy, yuheng's recall of 12 real questions ran past its 5 s deadline in every stage and found none of them; alone it finds all 12 in about 1.5 s, and beside a thread busy 10% or 30% of the time it still finds all 12. Hermes logged no prefetch past its own limit in the last six days. This is next.
+
+### Upgrading from 3.7.5
+
+Install the package, run `plan-install` and `apply-install` where you upgrade, then restart the clients' MCP servers and the Hermes gateways. The store's schema is unchanged (1110), and nothing needs running once. From 3.7.4, also run 3.7.5's `retry-failures` step below.
+
+## [3.7.5] - 2026-10-06
+
+3.7.5 brings back the vector work of claims a provider failed. The automatic recovery read every embedding's subject as a source, so a claim's failed embedding was made obsolete instead of retried. On the shared store, 116 readable claim heads had no vector and were found by their words alone. `retry-failures` now brings back the vector work of 115 of them; the other one was refused on purpose.
+
+### Fixes
+
+- **The automatic recovery retries a claim's embedding (`_embed_retry_reason`).** Every claim head is queued for the vector index, and its embedding can fail as a source's does: a network error, a timeout, a lease that ran out.
+  - The recovery reopens such failures after its cooldown. It checked an embedding's subject as a source, though, and a claim is no source, so the claim's embedding was made obsolete (`authority_revoked`).
+  - Now a claim's embedding is reopened while its revision is the readable head it was queued for. An older revision's is still made obsolete: only the head needs a vector.
+- **`retry-failures` reopens what the recovery dropped (`claim_embeds_reopened`), and queues a head no earlier conversion queued (`claim_embeds_queued`).**
+  - It touches only readable heads in its config's scopes.
+  - A head refused on purpose stays as it is, for example text the request guard would not send. A muted head gets its vector work back like every other head, and automatic recall still leaves it out.
+  - It asks for the heads its config's context can take, so heads of another project never fill a page ahead of them (review of 3.7.5).
+  - On a copy of the shared store, the preview reopens 114 and queues 1. One head stays without a vector, refused as sensitive.
+  - Review of 3.7.4 found the gap. 114 of the 116 heads without a vector had an obsolete embedding marked `authority_revoked`, one had never been queued, and one was refused as sensitive.
+
+### Upgrading from 3.7.4
+
+Install the package and run `plan-install` and `apply-install` where you upgrade. Then restart the clients' MCP servers and the Hermes gateways. The store's schema is unchanged (1110). Then run once per store:
+
+```bash
+scope-recall retry-failures --config <the shared worker's or the instance's runtime-config.json> --limit 256 --apply
+```
+
+Run it again until `claim_embeds_reopened` and `claim_embeds_queued` are 0. The same command also re-opens the other failed work it always has, so those failures get one more model call each.
+
 ## [3.7.4.1] - 2026-10-06
 
 **Fork release.** Upstream v3.7.4 is merged over v3.7.2.1 (11 non-merge commits, 27 files): a
