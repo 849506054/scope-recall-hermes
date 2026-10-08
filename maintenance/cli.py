@@ -18,7 +18,6 @@ from .doctor import run_doctor
 from .doctor_store import read_journal_mode, recorded_schema_under_stale_header, schema_on_disk
 from .install import InstallError, apply_install, apply_uninstall, plan_install, plan_uninstall
 from .install_common import HostChoice, absolute
-from .install_common import absolute
 from .install_dsh import default_home as dsh_home
 from .install_hermes import LOCAL_PLATFORM_CHOICES
 from .install_workbuddy import default_home

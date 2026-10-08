@@ -507,9 +507,9 @@ def test_remote_coverage_compares_the_sqlite_expectation(tmp_path, monkeypatch):
     monkeypatch.setattr(
         "scope_recall.runtime.instance.default_vector_factory", lambda vector, *, binding, embedding_space: FakeStore()
     )
-    facts = doctor._remote_vector_facts(config, config.binding, expected_points=5)
+    facts = doctor_store._remote_vector_facts(config, config.binding, expected_points=5)
     assert facts["expected_points"] == 5 and facts["coverage_delta"] == 2
-    assert doctor._remote_vector_facts(None, config.binding, expected_points=5) is None
+    assert doctor_store._remote_vector_facts(None, config.binding, expected_points=5) is None
 
 
 def test_the_downgrade_leaves_nothing_for_the_garbage_collector(tmp_path, monkeypatch):

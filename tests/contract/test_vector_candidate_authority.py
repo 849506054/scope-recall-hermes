@@ -16,7 +16,7 @@ from scope_recall.core.recall_policy import SPACE_ID, RecallPolicy
 from scope_recall.core.retrieval import CandidateRef, SearchContext, SearchLimits
 from scope_recall.runtime.lance_port import LanceVectorPort
 
-from tests.contract.test_v11_recall_admission import _capture
+from tests.contract.test_recall_admission import _capture
 from tests.v11_support import context as trusted_context
 from tests.v11_support import recall_request
 

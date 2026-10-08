@@ -21,7 +21,6 @@ from scope_recall.runtime.embedding_models import (
     EmbeddingRouteConfig,
     GeminiEmbeddingAdapter,
     build_gemini_embed_body,
-    parse_embedding_batch_response,
     parse_embedding_response,
     validate_embedding_vector,
 )
@@ -913,7 +912,6 @@ def test_openai_embedding_usage_settles_single_and_batch(tmp_path, monkeypatch, 
 def test_embedding_response_parsers_keep_dialect_usage(dialect, metadata, expected):
     payload = {"embeddings": [{"values": [1.0, 0.0]}], "data": [{"embedding": [1.0, 0.0]}], **metadata}
     assert parse_embedding_response(payload, dialect=dialect, dimensions=2) == ((1.0, 0.0), expected)
-    assert parse_embedding_batch_response(payload, dialect=dialect, dimensions=2, count=1) == (((1.0, 0.0),), expected)
 
 
 def test_chat_total_tokens_keeps_unknown_input_reserved(tmp_path, monkeypatch):

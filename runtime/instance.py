@@ -22,7 +22,7 @@ from functools import partial
 from itertools import islice
 from typing import Any, Callable, Mapping
 
-from ..contracts import ContractError, TrustedContext
+from ..contracts import ContractError, InstanceBinding, TrustedContext
 from ..core.capture_filters import redact_private_paths
 from ..core.composition import CoreConfig, MemoryCore
 from ..core.deadline import RequestDeadline, using_request_deadline
@@ -31,7 +31,6 @@ from ..core.retrieval import SearchContext
 from ..core.storage import SQLiteStorage
 from ..vector.lance_native import helper_start_failure
 from ..vector.process_store import NativeVectorPathError
-from ..vector.qdrant_config import QdrantConfig
 from ..vector.store import build_vector_store
 from .auxiliary import build_auxiliary_runtime
 from .codex_cli import CodexCliConsolidationAdapter
