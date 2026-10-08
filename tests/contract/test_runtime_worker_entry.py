@@ -14,12 +14,8 @@ from scope_recall.contracts import ContractError, InstanceBinding, TrustedContex
 from scope_recall.core import CoreConfig, MemoryCore
 from scope_recall.core.retrieval import SearchContext, SearchLimits
 from scope_recall.runtime.auxiliary import AuxiliaryRuntimeConfig
-from scope_recall.runtime.instance import (
-    RuntimeInstanceConfig,
-    VectorRuntimeConfig,
-    build_runtime_instance,
-    default_vector_factory,
-)
+from scope_recall.runtime.instance import build_runtime_instance, default_vector_factory
+from scope_recall.runtime.instance_config import RuntimeInstanceConfig, VectorRuntimeConfig
 from scope_recall.runtime.worker_launch import launch_worker
 from v11_support import source_event
 
@@ -1056,7 +1052,7 @@ def test_worker_session_b_can_apply_evidence_backed_correction(tmp_path):
     )
     old_row = core_a.source(context_a, old.event_refs[0].ref, 1)
     assert old_row is not None
-    old_claim = core_a.accept_claim_proposals(
+    old_claim = core_a.records.accept_claim_proposals(
         context_a,
         {
             "protocol_version": "1.1",
@@ -1182,7 +1178,7 @@ def test_worker_session_b_cannot_promote_stale_proposal_past_newer_human_evidenc
     )
     old_row = core_a.source(context_a, old.event_refs[0].ref, 1)
     assert old_row is not None
-    old_claim = core_a.accept_claim_proposals(
+    old_claim = core_a.records.accept_claim_proposals(
         context_a,
         {
             "protocol_version": "1.1",
@@ -1504,9 +1500,10 @@ def test_a_rate_limited_code_stands_its_work_type_down_for_the_pass():
 
     from scope_recall.core import worker
 
-    source = inspect.getsource(worker)
-    assert 'if str(error_code or "").lower() in _RATE_LIMITED_ERRORS:' in source
+    source = inspect.getsource(worker.drain_worker)
+    assert "if _rate_limited(error_code):" in source
     assert "allowed = allowed - {item.work_type}" in source
+    assert worker._rate_limited("HTTP_429") and not worker._rate_limited(None)
 
 
 def test_the_two_stop_loss_layers_stay_distinct():

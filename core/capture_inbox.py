@@ -21,6 +21,7 @@ from ..contracts import (
     TrustedSourcePrincipal,
 )
 from .capture import CaptureReceipt, record_event
+from .delete_storage import canonical
 from .events import PreparedCapture, prepare_capture, segment_key
 from .inbox_rules import (
     GAVE_UP,
@@ -49,10 +50,6 @@ def _terminal_code(exc: ContractError) -> str:
     if exc.code == LEGACY_SOURCE_MISSING:
         return f"{exc.code}:{exc.field or 'unnamed'}"
     return exc.code
-
-
-def _json(value):
-    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
 
 
 def _context_payload(context):
@@ -89,15 +86,15 @@ def enqueue(storage, clock, context, value, *, scope_id, host_scope, remaining_s
     if host_scope is None and not context.binding.test_mode:
         raise ContractError("ACCESS_DENIED", "ingress_host_authority")
     body = dict(events=prepared.events, gaps=prepared.gaps, context=_context_payload(context), host_scope=host_scope)
-    encoded = _json(body)
+    encoded = canonical(body)
     if len(encoded.encode("utf-8")) > 2097152:
         raise ContractError("INPUT_INVALID", "ingress_item_budget")
     # The words are part of a capture's place here.  Codex gives a message sent into a running turn that turn's id, so
-    # a second such message came under the key of the first while the first still waited for its new key
-    # (``resolve_conflicted_ingress``), found that row and was refused as changed evidence: the work computer lost two
-    # of its owner's messages that way on 2026-09-30 alone.  A retried hook sends the same words and finds its own row.
+    # a second such message comes under the key of the first while the first still waits for its new key
+    # (``resolve_conflicted_ingress``): without its words in the token it would meet that row and be refused as
+    # changed evidence.  A retried hook sends the same words and meets its own row.
     token = hashlib.sha256(
-        _json(
+        canonical(
             [
                 context.binding.installation_id,
                 scope_id,
@@ -194,8 +191,8 @@ def _commit(storage, clock, context, token, prepared, scope_id, policy, deadline
         if (exc.code, exc.field) == DELETED_KEY:
             return _refused_for_a_delete(storage, context, token, prepared, deadline)
         # Terminal failures remain inspectable, but are not replayed forever.  A passing one (the store busy, the time
-        # up) leaves the row's code as it was: written over, a collision left its path, and a row put off its tries
-        # and its place across a delete (review of rc10).
+        # up) leaves the row's code as it was: written over, a collision would leave its path, and a row put off its
+        # tries and its place across a delete.
         if code not in _PASSING:
             try:
                 with storage.write(context, remaining_seconds=max(0.001, deadline - time.monotonic())) as tx:
@@ -206,13 +203,13 @@ def _commit(storage, clock, context, token, prepared, scope_id, policy, deadline
                 pass
     except _TRANSIENT:
         code = "STORAGE_UNAVAILABLE"
-    # A row the next pass takes again says so: a pass that met a busy writer here said nothing (review of rc10).
+    # A row the next pass takes again says so, or a pass that met a busy writer here would say nothing.
     pending = (INGRESS_PENDING_GAP,) if code in _PASSING else ()
     return CaptureReceipt("queued", (), "queued", "pending", "pending", (*prepared.gaps, *pending), code)
 
 
 #: How storage refuses a copy of a deleted message under that message's key, or a later version or part of the deleted
-#: one (``storage.Transaction.refuse_under_a_deleted_key``): the code and field of its ContractError, refused for good.
+#: one (``Sources.refuse_under_a_deleted_key``): the code and field of its ContractError, refused for good.
 DELETED_KEY = ("ACCESS_DENIED", "source_unavailable")
 #: What the receipt of such a capture carries when it left the inbox.
 SOURCE_DELETED_GAP = "capture_gap:source_deleted"
@@ -220,9 +217,9 @@ SOURCE_DELETED_GAP = "capture_gap:source_deleted"
 
 def _refused_for_a_delete(storage, context, token, prepared, deadline) -> CaptureReceipt:
     """A copy of a deleted message under that message's key is refused for good; another message under the key is a
-    key collision, stored under a key of its own (``storage.Transaction.refuse_under_a_deleted_key``).  Left in the
-    inbox with its code, the copy kept the doctor's ``capture_ingress_blocked`` and the patrol's line up until someone
-    removed it by hand (rc13); it leaves the inbox, and the pass counts it among the rows it cancelled."""
+    key collision, stored under a key of its own (``source_storage.Sources.refuse_under_a_deleted_key``).  Left in the
+    inbox with its code, the copy would keep the doctor's ``capture_ingress_blocked`` up until someone removed it by
+    hand; it leaves the inbox, and the pass counts it among the rows it cancelled."""
     try:
         with storage.write(context, remaining_seconds=max(0.001, deadline - time.monotonic())) as tx:
             tx._check(write=True).execute("DELETE FROM capture_inbox WHERE token=?", (token,))
@@ -243,7 +240,7 @@ def _refused_for_a_delete(storage, context, token, prepared, deadline) -> Captur
 def _capture_fingerprint(events) -> str:
     """One fingerprint of a whole capture, which every segment of a long message shares."""
     return hashlib.sha256(
-        _json(
+        canonical(
             [
                 [
                     event["source_event_key"],
@@ -292,7 +289,7 @@ def _rekeyed_event(event: dict, capture: str = "") -> dict:
     if REKEY_MARKER in original:
         return dict(event)
     fingerprint = hashlib.sha256(
-        _json(
+        canonical(
             [original, event.get("content"), event.get("origin"), event.get("role"), event.get("occurred_at")]
         ).encode("utf-8")
     ).hexdigest()[:16]
@@ -326,12 +323,36 @@ def resolve_conflicted_ingress(
     re-checked against the captured context, never trusted merely for having
     been in the inbox already.
     """
+    page = _page(
+        storage,
+        clock,
+        context,
+        limit,
+        remaining_seconds,
+        "(last_error_code='VERSION_CONFLICT' OR last_error_code LIKE 'DEFERRED|%')",
+        (),
+        lambda code, now: code == "VERSION_CONFLICT" or (deferred_path(code) == "rekey" and replayable(code, now)),
+    )
+    if page is None:
+        return ()
+    rows, deadline = page
+    return _replay_rows(storage, clock, context, rows, authorize, admission_policy, deadline, rekey=True)
+
+
+def _page(storage, clock, context, limit, remaining_seconds, condition, params, takes):
+    """The rows of one page of the caller's inbox partition that ``condition`` (with ``params``) selects and
+    ``takes(code, now)`` keeps, oldest first, and the deadline the page's replay has; None when the context reaches no
+    scope.
+
+    A row put off is passed over, not the head of the page.  Its code is read first and its payload only when it is
+    taken: the inbox holds up to 256 rows and 64 MB.
+    """
     if not 1 <= limit <= 32:
         raise ContractError("INPUT_INVALID", "ingress_limit")
     deadline = time.monotonic() + remaining_seconds
     scopes = tuple(sorted(context.allowed_scope_ids))
     if not scopes:
-        return ()
+        return None
     now = _utc(clock)
     with storage.read(context, remaining_seconds=remaining_seconds) as tx:
         conn = tx._check()
@@ -339,19 +360,18 @@ def resolve_conflicted_ingress(
             token
             for token, code in conn.execute(
                 f"""SELECT token,last_error_code FROM capture_inbox WHERE scope_id IN ({",".join("?" for _ in scopes)})
-            AND project_id IS ? AND branch_id IS ?
-            AND (last_error_code='VERSION_CONFLICT' OR last_error_code LIKE 'DEFERRED|%')
+            AND project_id IS ? AND branch_id IS ? AND {condition}
             ORDER BY created_at,token""",
-                (*scopes, context.project_id, context.branch_id),
+                (*scopes, context.project_id, context.branch_id, *params),
             )
-            if code == "VERSION_CONFLICT" or (deferred_path(code) == "rekey" and replayable(code, now))
+            if takes(code, now)
         ][:limit]
         rows = [
             row
             for token in tokens
             if (row := conn.execute("SELECT * FROM capture_inbox WHERE token=?", (token,)).fetchone()) is not None
         ]
-    return _replay_rows(storage, clock, context, rows, authorize, admission_policy, deadline, rekey=True)
+    return rows, deadline
 
 
 def _replay_rows(storage, clock, context, rows, authorize, admission_policy, deadline, *, rekey):
@@ -362,8 +382,8 @@ def _replay_rows(storage, clock, context, rows, authorize, admission_policy, dea
         try:
             revalidated = _revalidated(storage, context, row, authorize, deadline, rekey=rekey)
         except _TRANSIENT:
-            # The store itself: the rest of the page waits for the next pass.  Raised, it lost what this replay had
-            # done, and the rekey replay after it did not run (review of rc10).
+            # The store itself: the rest of the page waits for the next pass.  Raised, it would lose what this replay
+            # had done, and the rekey replay after it would not run.
             receipts.append(
                 CaptureReceipt(
                     "queued", (), "queued", "pending", "pending", (INGRESS_PENDING_GAP,), "STORAGE_UNAVAILABLE"
@@ -426,7 +446,7 @@ def _revalidated(storage, context, row, authorize, deadline, *, rekey):
         raise
     except (KeyError, TypeError, ValueError) as exc:
         # A field a newer release wrote into the stored context, or one this release needs and it lacks: named, where
-        # a bare TypeError said nothing of where to look (review of rc10).
+        # a bare TypeError would say nothing of where to look.
         raise ContractError("INPUT_INVALID", "ingress_context") from exc
     # Revalidate the stored envelope; trust is from the captured context,
     # never inferred from a payload role or text claiming to be a user.
@@ -458,7 +478,7 @@ def _defer(storage, clock, context, row, exc, deadline, *, path) -> CaptureRecei
             )
     except (*_TRANSIENT, ContractError):
         # Not written: the row keeps its code and a later pass takes it again.  Said as put off or given up, a pass
-        # reported a give-up the store never saw, and the next reported it again (review of rc10).
+        # would report a give-up the store never saw, and the next would report it again.
         return CaptureReceipt(
             "queued", (), "queued", "pending", "pending", (INGRESS_PENDING_GAP,), "STORAGE_UNAVAILABLE"
         )
@@ -469,30 +489,17 @@ def _defer(storage, clock, context, row, exc, deadline, *, path) -> CaptureRecei
 
 def replay_inbox(storage, clock, context, *, authorize, admission_policy=None, limit=8, remaining_seconds=1.0):
     """Replay only the caller's partition; the callback verifies current host ACLs."""
-    if not 1 <= limit <= 32:
-        raise ContractError("INPUT_INVALID", "ingress_limit")
-    deadline = time.monotonic() + remaining_seconds
-    scopes = tuple(sorted(context.allowed_scope_ids))
-    if not scopes:
+    page = _page(
+        storage,
+        clock,
+        context,
+        limit,
+        remaining_seconds,
+        REPLAY_CANDIDATES,
+        RETRIED,
+        lambda code, now: replayable(code, now) and deferred_path(code) != "rekey",
+    )
+    if page is None:
         return ()
-    # A row put off is passed over, not the head of the page.  Its code is read first and its payload only when it
-    # is taken: the inbox holds up to 256 rows and 64 MB.
-    now = _utc(clock)
-    with storage.read(context, remaining_seconds=remaining_seconds) as tx:
-        conn = tx._check()
-        tokens = [
-            token
-            for token, code in conn.execute(
-                f"""SELECT token,last_error_code FROM capture_inbox WHERE scope_id IN ({",".join("?" for _ in scopes)})
-            AND project_id IS ? AND branch_id IS ? AND {REPLAY_CANDIDATES}
-            ORDER BY created_at,token""",
-                (*scopes, context.project_id, context.branch_id, *RETRIED),
-            )
-            if replayable(code, now) and deferred_path(code) != "rekey"
-        ][:limit]
-        rows = [
-            row
-            for token in tokens
-            if (row := conn.execute("SELECT * FROM capture_inbox WHERE token=?", (token,)).fetchone()) is not None
-        ]
+    rows, deadline = page
     return _replay_rows(storage, clock, context, rows, authorize, admission_policy, deadline, rekey=False)

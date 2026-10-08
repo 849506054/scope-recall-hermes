@@ -15,7 +15,7 @@ from .validation import absolute_path, strict_bool, strict_float, strict_int
 #: A per-pass copy of a runtime config is written beside it as ``<stem>-worker-<8 random>.json``
 #: (``adapters.runtime_wiring.write_ephemeral_worker_config``).  ``--cleanup-config`` deletes a
 #: file of that name and nothing else: given an operator's real ``runtime-config.json`` it
-#: deleted that, silently, and every host dropped to basic mode (#118).
+#: would delete that, silently, and every host would drop to basic mode.
 EPHEMERAL_CONFIG_INFIX = "-worker-"
 #: A runtime config's file name, beside the binding's data or an entry's attachment.
 RUNTIME_CONFIG_FILENAME = "runtime-config.json"
@@ -50,7 +50,10 @@ def detached_creationflags() -> int:
 
 def taskkill_tree(process: subprocess.Popen) -> None:
     """Windows: kill the whole Popen-owned tree at once; terminating the parent
-    first can orphan native children."""
+    first can orphan native children.  ``taskkill`` is a console program started
+    from a process without a console (the task's ``pythonw``, a windowless
+    worker), so without ``CREATE_NO_WINDOW`` Windows gives it a console window of
+    its own, which flashed on the desktop at every worker teardown."""
     try:
         if process.poll() is None:
             subprocess.run(
@@ -59,6 +62,7 @@ def taskkill_tree(process: subprocess.Popen) -> None:
                 stderr=subprocess.DEVNULL,
                 check=False,
                 timeout=5.0,
+                creationflags=detached_creationflags(),
             )
     except (OSError, subprocess.TimeoutExpired):
         if process.poll() is None:

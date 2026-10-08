@@ -14,8 +14,17 @@ from threading import Barrier
 import pytest
 from scope_recall.contracts import ContractError, SourceEvent
 from scope_recall.core.recall_policy import EMBEDDING_SPACE, encode_embedding_text
-from scope_recall.core.storage import StoredSource
+from scope_recall.core.source_records import StoredSource
 from scope_recall.runtime.auxiliary import AuxiliaryRuntimeConfig, auxiliary_runtime_status, build_auxiliary_runtime
+from scope_recall.runtime.consolidation_models import ConsolidationRouteConfig, OpenAIConsolidationAdapter
+from scope_recall.runtime.embedding_models import (
+    EmbeddingRouteConfig,
+    GeminiEmbeddingAdapter,
+    build_gemini_embed_body,
+    parse_embedding_batch_response,
+    parse_embedding_response,
+    validate_embedding_vector,
+)
 from scope_recall.runtime.model_budget import (
     AuxiliaryBudgetLedger,
     BudgetPolicy,
@@ -23,17 +32,7 @@ from scope_recall.runtime.model_budget import (
     initialize_auxiliary_budget_ledger,
     read_auxiliary_budget_status,
 )
-from scope_recall.runtime.models import (
-    AuxiliaryModelError,
-    ConsolidationRouteConfig,
-    EmbeddingRouteConfig,
-    GeminiEmbeddingAdapter,
-    OpenAIConsolidationAdapter,
-    build_gemini_embed_body,
-    parse_embedding_batch_response,
-    parse_embedding_response,
-    validate_embedding_vector,
-)
+from scope_recall.runtime.models import AuxiliaryModelError
 
 
 def _source(content: str = "标题 A") -> StoredSource:

@@ -36,6 +36,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+from ..._version import __version__
 from ...runtime.worker_entry import host_process_credential_environment
 from . import transcript
 from .boundary import without_lone_surrogates
@@ -61,7 +62,7 @@ class RemoteServerError(ValueError):
 
 
 #: How far a client's clock may run ahead of this machine's.  A recall drops what is dated after its now, so a
-#: message dated a day ahead by a fast client clock was found by no recall for a day.  Within the minute a time is
+#: message dated a day ahead by a fast client clock would reach no recall for a day.  Within the minute a time is
 #: kept as sent, so a correct client's hook sent again is the same source.  Beyond it every time in the request
 #: moves back by the same lead, so its latest is this machine's now and the order the turn was said in holds.  (A
 #: client more than a minute fast gets a new lead each time, and a hook it sends twice may be stored twice: the
@@ -265,8 +266,8 @@ def handle_request(
     payload = body.get("payload")
     if not isinstance(payload, dict):
         raise RemoteServerError("payload must be the hook's object")
-    # Half of a broken emoji (a lone surrogate) is stored as U+FFFD, as a hook here stores it; it failed the size check
-    # below, and the client was told to keep the request for good (review of rc11).
+    # Half of a broken emoji (a lone surrogate) is stored as U+FFFD, as a hook here stores it; it would fail the size
+    # check below, and the client would be told to keep the request for good.
     payload = without_lone_surrogates(payload)
     if len(json.dumps(payload, ensure_ascii=False).encode("utf-8")) > MAX_PAYLOAD_BYTES:
         raise RemoteServerError("payload too large")
@@ -302,9 +303,9 @@ def handle_request(
     # this one again.  The answer (a recall) is good either way.
     # ``build_ms``, ``capture_ms``, ``attach_ms`` and ``close_ms``: how much of the hook's time making the handler, the
     # capture, attaching the handler's own runtime and closing it took, so a slow prompt's log says where its time went;
-    # the rest is its recall (rc13).
+    # the rest is its recall.
     # ``error``: the capture's code, or the class of what failed it when it was no contract error (a store that is
-    # locked or broken), which the log would otherwise not name (review of rc13).
+    # locked or broken), which the log would otherwise not name.
     return {
         "result": result,
         "through": record.through if record is not None else None,
@@ -406,8 +407,6 @@ def build_app(config: RemoteServerConfig, *, warm: bool = False):
         return JSONResponse(answer)
 
     async def health(request: Request) -> JSONResponse:
-        from ..._version import __version__
-
         return JSONResponse({"entry_id": client.entry_id, "host": config.host, "version": __version__})
 
     app.router.routes.append(Route("/hook", hook, methods=["POST"]))
@@ -485,7 +484,6 @@ def serve(config: RemoteServerConfig, *, env_file: Path | None = None) -> None:
         except OSError as exc:
             # Without it each recall starts its own helper, as before: slower, never a reason not to serve.
             _log.warning("could not start a vector helper ahead: %s", type(exc).__name__)
-    from ..._version import __version__
 
     _log.info(
         "serving the %s entry at %s on %s:%d (%s)", config.host, config.home, config.listen, config.port, __version__

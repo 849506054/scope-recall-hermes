@@ -12,7 +12,7 @@ from scope_recall.core.restore import (
     ledger_digest,
     replay_deletion_ledger,
 )
-from test_v11_deletion import app, authorize, capture, initial, request, sqlite_backup
+from test_deletion import app, authorize, capture, initial, request, sqlite_backup
 from v11_support import source_event
 
 
@@ -110,7 +110,7 @@ def test_writer_preopened_before_restore_cannot_cross_the_new_fence(app, monkeyp
 
 
 def test_restored_attachments_and_vectors_require_fresh_physical_purge(app, tmp_path):
-    from test_v11_episodes import artifact
+    from test_episodes import artifact
 
     core, ctx = app
     item, source, _ = artifact(core, ctx, tmp_path)
@@ -138,7 +138,7 @@ def test_restored_attachments_and_vectors_require_fresh_physical_purge(app, tmp_
     sqlite_backup(snapshot, core.storage.path)
     blob_path.write_bytes(original_bytes)  # Simulate restoring the old retained backup.
     replay_deletion_ledger(core.storage, authority, ledger)
-    assert core.source(ctx, source.ref, 1) is None and core.artifact(ctx, item.ref, 1) is None
+    assert core.source(ctx, source.ref, 1) is None and core.records.artifact(ctx, item.ref, 1) is None
     with core.storage.read(ctx) as tx:
         receipt = tx.deletions.receipt(deleted["operation_id"])
         assert not receipt["active_content_removed"]

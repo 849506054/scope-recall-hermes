@@ -207,12 +207,34 @@ class Deletions:
             declared_scope_complete=False if row["mode"] == "delete" else True,
         )
 
-    def physical_members(self, operation_id: str) -> tuple[dict, ...]:
-        """Return opaque active object identities for an external purge port."""
-        conn = self._tx._check()
+    def _deletion(self, operation_id: str) -> dict:
+        """The receipt of a delete operation this context may see; anything else is refused."""
         receipt = self.receipt(operation_id)
         if receipt is None or receipt["mode"] != "delete":
             raise ContractError("ACCESS_DENIED", "operation_unavailable")
+        return receipt
+
+    def _record_layers(self, conn, operation_id: str, layers: dict) -> dict:
+        """Write a delete operation's layers, its active content counted removed once its SQLite rows, its active
+        vectors and its attachments all are; the receipt as it then reads."""
+        active_removed = (
+            layers.get("sqlite_active") == "removed"
+            and layers.get("vector_active") == "removed"
+            and layers.get("attachments") in {"removed", "shared_authorized_copy_retained"}
+        )
+        conn.execute(
+            "UPDATE deletion_operations SET active_content_removed=?,layers_json=? WHERE operation_id=?",
+            (int(active_removed), canonical(layers), operation_id),
+        )
+        updated = self.receipt(operation_id)
+        if updated is None:
+            raise ContractError("STORAGE_UNAVAILABLE", "deletion_receipt")
+        return updated
+
+    def physical_members(self, operation_id: str) -> tuple[dict, ...]:
+        """Return opaque active object identities for an external purge port."""
+        conn = self._tx._check()
+        self._deletion(operation_id)
         members: list[dict] = []
         for row in conn.execute(
             "SELECT object_kind,object_ref FROM deletion_members WHERE operation_id=? ORDER BY object_kind,object_ref",
@@ -344,13 +366,13 @@ class Deletions:
         # targets are the whole closure, a deleted claim's sources included) is
         # cancelled, so that a delayed capture cannot undo the delete.  Every
         # other row is kept, whichever client sent it: cancelling the whole
-        # partition lost words nothing had forgotten, from a row put off for
-        # hours, a key collision waiting for its new key (reviews of rc10), or
-        # another client's capture waiting for the next pass (rc13).  A suppress
-        # leaves the inbox alone: what arrives of the same message, or restates
-        # a suppressed claim, is suppressed as it is stored, and cancelling what
-        # merely held its words lost captures the contract keeps
-        # (``docs/deletion-contract.md``, reviews of rc10).
+        # partition would lose words nothing had forgotten, from a row put off
+        # for hours, a key collision waiting for its new key, or another
+        # client's capture waiting for the next pass.  A suppress leaves the
+        # inbox alone: what arrives of the same message, or restates a
+        # suppressed claim, is suppressed as it is stored, and cancelling what
+        # merely held its words would lose captures the contract keeps
+        # (``docs/deletion-contract.md``).
 
         digests, groups, versions = set(), set(), set()
         for target in targets:
@@ -444,9 +466,7 @@ class Deletions:
 
     def purge_sqlite(self, operation_id: str) -> dict:
         conn = self._tx._check(write=True)
-        receipt = self.receipt(operation_id)
-        if receipt is None or receipt["mode"] != "delete":
-            raise ContractError("ACCESS_DENIED", "operation_unavailable")
+        receipt = self._deletion(operation_id)
         # This is deliberately only the SQLite scrub phase.  The active vector
         # layer is owned by the native purge port and cannot be acknowledged by
         # a truth-database transaction.  A repeated call after the scrub is
@@ -462,8 +482,8 @@ class Deletions:
         ).fetchall()
         # What a purge keeps of each version of a deleted message to know a later copy under its key by, once its
         # words are gone: digests of them spaced otherwise and of their letters and digits (``capture_inbox.
-        # deleted_forms``, compared by ``Transaction.refuse_under_a_deleted_key``).  Read before any group key below
-        # is replaced (review of rc13).
+        # deleted_forms``, compared by ``Sources.refuse_under_a_deleted_key``).  Read before any group key below
+        # is replaced.
 
         forms, versions, groups = {}, {}, set()
         for kind, ref in members:
@@ -473,7 +493,7 @@ class Deletions:
                 "SELECT source_group_key,source_revision FROM source_events WHERE event_id=?", (ref,)
             ).fetchall():
                 # Once per version, not once per part: joined and read again for each part of a long message, a purge
-                # took seconds under the writer lease (review of rc13).
+                # would take seconds under the writer lease.
                 if (group, revision) not in versions:
                     text = "".join(
                         content
@@ -486,8 +506,8 @@ class Deletions:
                 forms[ref, revision] = versions[group, revision]
                 groups.add(group)
         # Each group key is replaced once, by the key ``purged_group_key`` gives: replaced for each of its parts, a
-        # long message's key had been hashed once a part, and a later capture under it could not find its rows
-        # (review of rc13).  A key an earlier purge left stays as it is.
+        # long message's key would be hashed once a part, and a later capture under it could not reach its rows.  A
+        # key an earlier purge left stays as it is.
         for group in sorted(groups):
             if not group.startswith("removed-"):
                 conn.execute(
@@ -498,8 +518,8 @@ class Deletions:
             if kind == "event":
                 lexical_index.forget(conn, ref)
                 # A row already purged keeps what it has: a restore purges its file again, and written over from its
-                # empty text, the digests a first purge kept were lost; a row purged before rc13 keeps having none
-                # (review of rc13).
+                # empty text, the digests a first purge kept would be lost; a row an older release purged keeps
+                # having none.
                 for (revision,) in conn.execute(
                     "SELECT DISTINCT source_revision FROM source_events WHERE event_id=?", (ref,)
                 ).fetchall():
@@ -549,33 +569,17 @@ class Deletions:
         vector storage and attachments remain separate layers.
         """
         conn = self._tx._check(write=True)
-        receipt = self.receipt(operation_id)
-        if receipt is None or receipt["mode"] != "delete":
-            raise ContractError("ACCESS_DENIED", "operation_unavailable")
+        receipt = self._deletion(operation_id)
         layers = receipt["layers"]
         if layers.get("sqlite_active") != "removed":
             raise ContractError("VERSION_CONFLICT", "sqlite_scrub_required")
         layers["vector_active"] = "removed"
-        active_removed = (
-            layers.get("sqlite_active") == "removed"
-            and layers.get("vector_active") == "removed"
-            and layers.get("attachments") in {"removed", "shared_authorized_copy_retained"}
-        )
-        conn.execute(
-            "UPDATE deletion_operations SET active_content_removed=?,layers_json=? WHERE operation_id=?",
-            (int(active_removed), canonical(layers), operation_id),
-        )
-        updated = self.receipt(operation_id)
-        if updated is None:
-            raise ContractError("STORAGE_UNAVAILABLE", "deletion_receipt")
-        return updated
+        return self._record_layers(conn, operation_id, layers)
 
     def attachment_plan(self, operation_id: str) -> dict:
         """Snapshot attachment cleanup candidates without deleting files."""
         conn = self._tx._check()
-        receipt = self.receipt(operation_id)
-        if receipt is None or receipt["mode"] != "delete":
-            raise ContractError("ACCESS_DENIED", "operation_unavailable")
+        receipt = self._deletion(operation_id)
         if receipt["layers"]["attachments"] in {"removed", "shared_authorized_copy_retained"}:
             return dict(operation_id=operation_id, entries=(), already_done=True)
         rows = conn.execute(
@@ -603,9 +607,7 @@ class Deletions:
     def finalize_attachments(self, operation_id: str, plan: dict, *, erased: bool) -> dict:
         """Commit attachment metadata only after the physical phase returns."""
         conn = self._tx._check(write=True)
-        receipt = self.receipt(operation_id)
-        if receipt is None or receipt["mode"] != "delete":
-            raise ContractError("ACCESS_DENIED", "operation_unavailable")
+        receipt = self._deletion(operation_id)
         if receipt["layers"]["attachments"] in {"removed", "shared_authorized_copy_retained"}:
             return receipt
         if not isinstance(plan, dict) or plan.get("operation_id") != operation_id:
@@ -620,19 +622,7 @@ class Deletions:
             )
         layers = receipt["layers"]
         layers["attachments"] = "shared_authorized_copy_retained" if shared else "removed"
-        active_removed = (
-            layers.get("sqlite_active") == "removed"
-            and layers.get("vector_active") == "removed"
-            and layers.get("attachments") in {"removed", "shared_authorized_copy_retained"}
-        )
-        conn.execute(
-            "UPDATE deletion_operations SET active_content_removed=?,layers_json=? WHERE operation_id=?",
-            (int(active_removed), canonical(layers), operation_id),
-        )
-        updated = self.receipt(operation_id)
-        if updated is None:
-            raise ContractError("STORAGE_UNAVAILABLE", "deletion_receipt")
-        return updated
+        return self._record_layers(conn, operation_id, layers)
 
     def purge_attachments(self, operation_id: str) -> dict:
         """Compatibility shim: planning is separate from physical deletion."""

@@ -11,10 +11,10 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 from scope_recall.contracts import ContractError
-from scope_recall.maintenance import doctor
+from scope_recall.maintenance import doctor, doctor_store
 from scope_recall.runtime import vector_retention
-from scope_recall.runtime.instance import VectorRuntimeConfig
-from test_v11_claims import app, capture
+from scope_recall.runtime.instance_config import VectorRuntimeConfig
+from test_claims import app, capture
 
 SPACE = "TEST-space"
 NOW = datetime(2026, 9, 6, 12, 0, tzinfo=timezone.utc)
@@ -96,7 +96,7 @@ def test_a_tool_output_older_than_the_window_loses_its_vector_and_nothing_else(a
     assert core.source(ctx, old_tools[0].ref, 1) is not None
     assert _count(core, "SELECT count(*) FROM work_items WHERE work_type='embed' AND state='done'") == 5
     # ...so nothing refills an embed for an expired source.
-    core.resume_deferred(ctx, limit=16, remaining_seconds=1)
+    core.records.resume_deferred(ctx, limit=16, remaining_seconds=1)
     assert _count(core, "SELECT count(*) FROM work_items WHERE work_type='embed'") == 5
     # Within the hour the drain leaves it alone; an hour later a pass finds nothing due.
     assert _pass(core, ctx, store, tmp_path, now=NOW + timedelta(minutes=30)) is None
@@ -189,7 +189,9 @@ def test_the_doctor_counts_expired_vectors_and_names_the_window(app, tmp_path):
     _embedded(core, aged=[tool])
     _pass(core, ctx, Store(), tmp_path)
     report = doctor.DoctorReport(host="hermes", status="degraded")
-    doctor._check_index(report, core.storage.path.parent, store_readable=True, config=Config(_vector(tmp_path, 180)))
+    doctor_store.check_index(
+        report, core.storage.path.parent, store_readable=True, config=Config(_vector(tmp_path, 180))
+    )
     assert report.index_metadata["expired_vectors"] == 1
     assert report.index_metadata["tool_output_retention_days"] == 180
 

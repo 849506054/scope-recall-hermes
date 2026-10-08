@@ -88,8 +88,6 @@ COMMON_SECRET_PATTERNS: dict[str, re.Pattern[str]] = {
     ),
 }
 
-COMMON_SECRET_PATTERN_VALUES: tuple[re.Pattern[str], ...] = tuple(COMMON_SECRET_PATTERNS.values())
-
 #: What follows a credential word without being a credential, kept narrow on purpose: a password can be any
 #: word in any script, so only what cannot be one is let through.  Every message that said
 #: ``def login(user: str, password: str)``, ``api_key: <your-api-key>`` or "the password is required" was refused
@@ -217,8 +215,8 @@ def secret_scan_shadow(value: Any) -> str:
     A serialised line break (the two characters ``\\n``) counts as the break it
     stands for.  Serialised into a model request, a document template with an
     empty credential slot ("AppSecret:" and nothing after it) had the next line
-    swallowed as its value and was refused as ``sensitive_request``: 369
-    candidate evaluations on one instance, none holding a secret.  Text that
+    swallowed as its value and would be refused as ``sensitive_request`` (369
+    candidate evaluations in one store, none holding a secret).  Text that
     was serialised more than once (a tool output that is itself JSON holding
     JSON) writes the same break as ``\\\\n``; treating only the last two
     characters as the break left a backslash after the slot, which then read

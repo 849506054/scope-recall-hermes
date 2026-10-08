@@ -13,8 +13,8 @@ from datetime import date, datetime, time, timedelta, timezone
 import pytest
 from scope_recall.core.recall_scope import query_scope
 
-from tests.contract.test_rc33_recall_accuracy import _say
-from tests.contract.test_v11_claims import app  # noqa: F401  (fixture; its clock says 2026-09-06T12:00:00Z)
+from tests.contract.test_claims import app  # noqa: F401  (fixture; its clock says 2026-09-06T12:00:00Z)
+from tests.contract.test_recall_dating_and_order import _say
 from tests.v11_support import recall_request
 
 ENTRIES = {
@@ -659,8 +659,8 @@ def test_a_day_question_naming_an_entry_of_a_shared_store_reads_that_entry(tmp_p
     storage = SQLiteStorage(binding)
     storage.initialize()
     with storage.write(shared_context(binding)) as tx:
-        tx.register_entry("tianshu", "天枢", "hermes", now="2026-09-01T00:00:00Z")
-        tx.register_entry("tianxuan", "天璇", "hermes", now="2026-09-01T00:00:00Z")
+        tx.registry.register_entry("tianshu", "天枢", "hermes", now="2026-09-01T00:00:00Z")
+        tx.registry.register_entry("tianxuan", "天璇", "hermes", now="2026-09-01T00:00:00Z")
     said: dict[str, list[str]] = {}
     for entry in ("tianshu", "tianxuan"):
         with storage.write(shared_context(binding, entry_id=entry)) as tx:
@@ -672,7 +672,7 @@ def test_a_day_question_naming_an_entry_of_a_shared_store_reads_that_entry(tmp_p
                     recorded_at=f"2026-09-02T1{index}:00:00Z",
                 )
                 said.setdefault(entry, []).append(
-                    tx.put_source(event, scope_id="TEST-scope", persisted_at="2026-09-02T20:00:00Z").ref
+                    tx.sources.put_source(event, scope_id="TEST-scope", persisted_at="2026-09-02T20:00:00Z").ref
                 )
 
     def asked(query):

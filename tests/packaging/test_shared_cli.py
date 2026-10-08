@@ -19,14 +19,14 @@ import pytest
 from scope_recall.adapters.clients import remote_client
 from scope_recall.adapters.clients.config import load_shared_client
 from scope_recall.adapters.hermes import HermesIdentityError, bind_hermes_identity
-from scope_recall.adapters.hermes.installation import read_attachment, read_shared_payload
+from scope_recall.adapters.hermes.shared_entries import read_attachment, read_shared_payload
 from scope_recall.maintenance import cli, install_dsh, install_workbuddy
 from scope_recall.maintenance.doctor import run_doctor
 from scope_recall.maintenance.install import apply_install, apply_uninstall, plan_install, plan_uninstall
 from scope_recall.maintenance.install_common import InstallError, InstallPlan
 from scope_recall.maintenance.shared import main
-from scope_recall.runtime import instance as runtime_instance
-from scope_recall.runtime.instance import RuntimeInstanceConfig
+from scope_recall.runtime import instance_config
+from scope_recall.runtime.instance_config import RuntimeInstanceConfig
 from scope_recall.runtime.model_budget import read_auxiliary_budget_status
 from scope_recall.runtime.worker_entry import load_config
 
@@ -713,7 +713,7 @@ def test_a_workbuddy_hook_command_is_quoted_with_forward_slashes_and_its_wait_co
     assert "~" not in install_workbuddy.hook_command(tilde), "a home given with ~ is written out"
 
     # WorkBuddy's timeout is in seconds; each wait covers the interpreter's start and the most the hook may work.
-    most = runtime_instance._SECONDS_BOUNDS["hook_processing_seconds"][1]
+    most = instance_config._SECONDS_BOUNDS["hook_processing_seconds"][1]
     assert install_workbuddy.HOOK_WORK_SECONDS >= most
     assert sorted(install_workbuddy.HOOK_TIMEOUTS) == ["SessionEnd", "Stop", "UserPromptSubmit"]
     for event, seconds in install_workbuddy.HOOK_TIMEOUTS.items():

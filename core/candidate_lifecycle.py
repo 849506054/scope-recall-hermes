@@ -12,10 +12,10 @@ import unicodedata
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol
 
-from ..contracts import ContractError
+from ..contracts import ContractError, verified_human_principal_ref
 
 if TYPE_CHECKING:
-    from .storage import StoredSource
+    from .source_records import StoredSource
 
 RULE_VERSION = "r1-candidate-v1"
 SOURCE_MATCH_LIMIT = 16
@@ -106,20 +106,8 @@ class CandidateEvaluator(Protocol):
 
 
 def _verified_human_principal_refs(sources: tuple[StoredSource, ...]) -> frozenset[str]:
-    refs: set[str] = set()
-    for source in sources:
-        principal = source.event.get("source_principal")
-        if not isinstance(principal, dict):
-            continue
-        ref = principal.get("principal_ref")
-        if (
-            principal.get("kind") == "human"
-            and principal.get("resolution") == "verified"
-            and isinstance(ref, str)
-            and ref
-        ):
-            refs.add(ref)
-    return frozenset(refs)
+    refs = (verified_human_principal_ref(source.event.get("source_principal")) for source in sources)
+    return frozenset(ref for ref in refs if ref is not None)
 
 
 def candidate_model_subject(
@@ -174,7 +162,7 @@ def _plain(text: object) -> str:
 def candidate_name_matches(expected: object, proposed: object) -> bool:
     """Whether a proposed subject or predicate is the candidate's own, written differently.
 
-    Replayed against the real model on one instance's terminally failed evaluations,
+    Replayed against the real model on one store's terminally failed evaluations,
     every rejected name was the candidate's: ``embedding_retry.py`` came back as
     ``embedding_retry.py 全文`` from the document's heading, a subject holding
     ``\\"看图\\"`` came back with plain quotes, and a predicate of a whole clause

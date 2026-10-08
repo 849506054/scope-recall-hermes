@@ -1,16 +1,18 @@
 """Types and primitives shared by the install module family.
 
 ``install.py`` is the plan/apply entry.  ``install_codex.py``,
-``install_claude_code.py``, ``install_hermes.py`` and ``install_workbuddy.py``
-each render one host's wrapper files (WorkBuddy's: entries merged into its own
+``install_claude_code.py``, ``install_hermes.py``, ``install_workbuddy.py`` and ``install_dsh.py``
+each render one host's wrapper files (WorkBuddy's and dsh's: entries merged into their own
 settings) and bind its instance behind the same function names, so the
-entry picks a host module instead of branching on the host.  ``install_receipt.py`` signs and verifies
+entry picks a host module instead of branching on the host; ``install_client.py`` holds the functions
+the four clients share.  ``install_receipt.py`` signs and verifies
 the receipt; ``install_purge.py`` inventories what an explicit purge may
 delete.
 """
 
 from __future__ import annotations
 
+import codecs
 import json
 import os
 import re
@@ -208,6 +210,25 @@ def reject_symlink_chain(path: Path) -> None:
         raise InstallError(f"symlink or reparse paths are not allowed: {link}")
 
 
+def read_host_file(path: Path) -> bytes | None:
+    """What one of the host's own files that an install merges into holds; None when there is no such file yet."""
+    reject_symlink_chain(path)
+    if not path.exists():
+        return None
+    if not path.is_file() or path.stat().st_size > RUNTIME_CONFIG_LIMIT:
+        raise InstallError(f"{path} is not a file of at most {RUNTIME_CONFIG_LIMIT} bytes")
+    return path.read_bytes()
+
+
+def like_original(text: str, original: bytes | None) -> bytes:
+    """``text`` written back as the host's file was: in its line endings (CRLF when it had any) and with its byte order
+    mark if it had one."""
+    if original is not None and b"\r\n" in original:
+        text = text.replace("\n", "\r\n")
+    data = text.encode("utf-8")
+    return codecs.BOM_UTF8 + data if original is not None and original.startswith(codecs.BOM_UTF8) else data
+
+
 def absolute(value: str | Path, field: str, *, error: type[BaseException] = InstallError) -> Path:
     """Expand ``~`` and refuse a relative path; the caller resolves after its own link checks."""
     path = Path(value).expanduser()
@@ -234,7 +255,7 @@ def require_interpreter(path: Path, field: str) -> Path:
     inside the resolved chain is still refused.  What is recorded and later
     executed -- hooks, MCP launchers, the autostart task, the worker -- is the
     link itself: a venv's ``bin/python`` started by its resolved target runs
-    without the venv on ``sys.path`` and cannot import this package (#87).
+    without the venv on ``sys.path`` and cannot import this package.
     """
 
     expanded = absolute(path, field)

@@ -55,21 +55,20 @@ MINIMUM_HYDRATION_CAP = 16
 CLAIM_CANDIDATES = 16
 #: Share of its fusion score context-only evidence keeps in live modes: a bare
 #: question, or a reply restating what a recall tool returned in its turn.
-#: Asked again, one instance returned five earlier questions like the query ahead of
-#: the reply that answered one, and another instance's recall test report came back ahead
-#: of the evidence it quoted.  At 0.6 a first-ranked one falls below a reply that
+#: Asked again, a question can return five earlier questions like it ahead of the
+#: reply that answered one, and a report of a recall test can come back ahead of
+#: the evidence it quoted.  At 0.6 a first-ranked one falls below a reply that
 #: ranked in the mid-teens, and still ranks as context when nothing answers.
 CONTEXT_ONLY_WEIGHT = 0.6
 #: Meaningful terms a query needs before an older copy of it leads to what that copy was told
 #: (``RetrievalPipeline._expand``).  A short command sent again asks nothing an old turn answered.  Chinese terms
 #: are overlapping character pairs, so "继续执行" holds three and "按你说的做" four, and three let both bring back
-#: every old turn they had opened (review of 3.4.4); five is about six characters.  Of the owner's prompts over
+#: every old turn they had opened; five is about six characters.  Of the owner's prompts over
 #: two weeks, 33 of the 115 with fewer had an exact older copy; of the owner's real questions, 167 of 173 have five.
 ECHO_TURN_MIN_TERMS = 5
 #: SQLite virtual-machine steps between two looks at the recall's deadline while a candidate statement runs: one
 #: every 10-60 ms of statement time.  Each look takes the GIL back from the statement, and beside a busy thread (the
-#: MCP server's hook threads, a gateway's) waits for it: one every 10,000 steps made a 25 ms statement take 1.4 s
-#: (review of 3.4.5).
+#: MCP server's hook threads, a gateway's) waits for it: one every 10,000 steps made a 25 ms statement take 1.4 s.
 _INTERRUPT_STEPS = 1_000_000
 _CHANNELS = ("scoped", "exact", "lexical", "claim", "recent", "vector")
 #: Messages the scoped channel offers: a day of one entry, for a question that asks what was said then
@@ -706,13 +705,12 @@ class RetrievalPipeline:
         only what was said or done then; any other question has no scope.
 
         Reading the scope never fails a recall: a question it cannot read is recalled as if it named no day, and the
-        gap says so.  A prompt grown past the search's length by normalisation emptied the whole recall (review of
-        3.4.6).
+        gap says so.  A prompt grown past the search's length by normalisation would empty the whole recall.
         """
         scope = None
         try:
             if query_scope(working.query, now=working.now, zone=working.zone, entries={}) is not None:
-                entries = getattr(tx, "entries", None)
+                entries = getattr(getattr(tx, "registry", None), "entries", None)
                 names = (
                     {entry_id: str(value.get("name") or entry_id) for entry_id, value in entries().items()}
                     if callable(entries)
@@ -802,19 +800,19 @@ class RetrievalPipeline:
         """What the same question was told the last time it was asked goes before the best candidate of its time.
 
         Reached as any seed's turn is, at a first rank's fixed score, it fell below every candidate two channels agreed
-        on: with vectors on, the owner's questions asked again lost about 25 of 124 answers (the threshold sweep of
-        2026-09-30).  Only the latest copy's turn is raised, so an answer that changed since is not raised beside the
+        on: with vectors on, one person's questions asked again lost about 25 of 124 answers (a threshold sweep).
+        Only the latest copy's turn is raised, so an answer that changed since is not raised beside the
         one that replaced it.  Of that turn at most half the packet is: the replies a channel ranked highest, which say
         what was asked, then the turn's last reply, which answers it, when the turn was read to its end.  An agent's
         turn opens with what it is about to do, and raising every reply let an old turn's first messages fill the
-        packet, as raising every reply a channel found let its narration of the subject do (reviews of its first and
-        second versions); the last reply read of a turn cut by the window was narration too.  Raising only the best
+        packet, as raising every reply a channel found let its narration of the subject do; the last reply read of a
+        turn cut by the window was narration too.  Raising only the best
         found reply lost 6 of the owner's 173 questions asked again with vectors on, where more replies are found and
         the answer is not always the best of them.  They go above the best
         candidate said up to that turn, the turn's other replies included, and not above what was said after it and
         ranks higher still, which may say the answer changed.  Kept below every such candidate outranking the best of
         the turn's time, the answer fell out of the packet for 5 of the owner's 173 questions asked again: a store keeps
-        growing, and something said since matches most questions (review of its second version).
+        growing, and something said since matches most questions.
         """
         latest_turn = getattr(self.storage_reader, "latest_turn", None)
         if not echoes or not callable(latest_turn):

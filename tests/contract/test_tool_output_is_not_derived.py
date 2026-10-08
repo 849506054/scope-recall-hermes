@@ -14,9 +14,9 @@ import sqlite3
 
 import pytest
 from scope_recall.core.admission import AdmissionDecision, store_decision
-from test_r1_candidate_lifecycle import Evaluator, _candidate_rows, _finish_source_work
-from test_v11_claims import app, capture, draft  # noqa: F401 - app is a fixture
-from test_v11_worker import Clock, FakeConsolidation, consolidation_payload, procedure_proposal
+from test_candidate_lifecycle import Evaluator, _candidate_rows, _finish_source_work
+from test_claims import app, capture, draft  # noqa: F401 - app is a fixture
+from test_worker import Clock, FakeConsolidation, consolidation_payload, procedure_proposal
 
 
 @pytest.fixture
@@ -57,7 +57,7 @@ def test_a_consolidation_queued_before_the_change_finishes_without_a_model_call(
     core, ctx = worker_app
     read = capture(core, ctx, "TEST 目录里有 42 个文件。", origin="tool_observation")
     with core.storage.write(ctx, remaining_seconds=10) as tx:
-        tx.enqueue_source(read.ref, read.revision, work_type="consolidate", available_at=core.clock.utc_now())
+        tx.sources.enqueue_source(read.ref, read.revision, work_type="consolidate", available_at=core.clock.utc_now())
     model = FakeConsolidation(
         lambda sources, episode_ref=None: consolidation_payload(*sources, claims=[procedure_proposal(sources[0])])
     )
@@ -76,11 +76,11 @@ def test_a_deferred_tool_output_settles_on_refill_without_a_consolidation(worker
     read = capture(core, ctx, "TEST 构建日志第 42 行。", origin="tool_observation")
     with core.storage.write(ctx, remaining_seconds=10) as tx:
         store_decision(tx, read.ref, read.revision, AdmissionDecision("deferred", "queue_capacity", False))
-    resumed = core.resume_deferred(ctx, remaining_seconds=10)
+    resumed = core.records.resume_deferred(ctx, remaining_seconds=10)
     assert [(item.ref, item.disposition) for item in resumed] == [(read.ref, "unchanged")]
-    assert core.resume_deferred(ctx, remaining_seconds=10) == ()
+    assert core.records.resume_deferred(ctx, remaining_seconds=10) == ()
     assert _queued(core, read.ref) == ["embed"]
-    receipt = core.schedule_source(ctx, read.ref, read.revision, remaining_seconds=10)
+    receipt = core.records.schedule_source(ctx, read.ref, read.revision, remaining_seconds=10)
     assert receipt.queued_work == 0 and _queued(core, read.ref) == ["embed"]
 
 

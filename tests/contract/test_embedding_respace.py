@@ -40,7 +40,7 @@ def _finish_embeds(core) -> None:
 
 
 def _start(core, ctx, space=SPACE_B, action="start") -> dict:
-    return core.respace_embeddings(ctx, space_id=space, action=action, dry_run=False)
+    return core.operations.respace_embeddings(ctx, space_id=space, action=action, dry_run=False)
 
 
 def _page(core, ctx, space=SPACE_B, room=64) -> dict:
@@ -62,12 +62,8 @@ def _space_instance(core, ctx, model, *, backend="sqlite-bruteforce", storage_di
     """A runtime instance embedding with ``model``: its own space, its own vector directory (``storage_dir`` keeps a
     native store's path short on Windows)."""
     from scope_recall.runtime.auxiliary import AuxiliaryRuntimeConfig
-    from scope_recall.runtime.instance import (
-        RuntimeInstance,
-        RuntimeInstanceConfig,
-        VectorRuntimeConfig,
-        default_vector_factory,
-    )
+    from scope_recall.runtime.instance import RuntimeInstance, default_vector_factory
+    from scope_recall.runtime.instance_config import RuntimeInstanceConfig, VectorRuntimeConfig
 
     class Embedding:
         def embed_query(self, text, *, remaining_seconds):
@@ -170,9 +166,9 @@ def test_a_preview_counts_what_a_run_would_reopen_and_changes_nothing(app):
     edge(core, ctx, "TEST-A", "TEST-B")
     _finish_embeds(core)
     before = _embeds(core)
-    report = core.respace_embeddings(ctx, space_id=SPACE_B, action="start", dry_run=True)
+    report = core.operations.respace_embeddings(ctx, space_id=SPACE_B, action="start", dry_run=True)
     assert (report["applied"], report["run"], report["to_reopen"], report["waiting"]) == (False, None, 2, 0)
-    assert core.respace_embeddings(ctx, space_id=SPACE_B)["run"] is None
+    assert core.operations.respace_embeddings(ctx, space_id=SPACE_B)["run"] is None
     assert _embeds(core) == before
 
 
@@ -183,10 +179,10 @@ def test_the_preview_counts_what_still_waits_which_a_run_started_now_would_pay_f
     edge(core, ctx, "TEST-A", "TEST-B")
     _finish_embeds(core)
     _queue_embeds(core, 3)
-    assert core.respace_embeddings(ctx, space_id=SPACE_B, action="start", dry_run=True)["waiting"] == 3
+    assert core.operations.respace_embeddings(ctx, space_id=SPACE_B, action="start", dry_run=True)["waiting"] == 3
     _start(core, ctx)
     _finish_embeds(core)
-    assert core.respace_embeddings(ctx, space_id=SPACE_B)["to_reopen"] == 5, "the three are reopened too"
+    assert core.operations.respace_embeddings(ctx, space_id=SPACE_B)["to_reopen"] == 5, "the three are reopened too"
 
 
 def test_one_run_at_a_time_and_one_per_space_unless_started_again_on_purpose(app):
@@ -200,12 +196,12 @@ def test_one_run_at_a_time_and_one_per_space_unless_started_again_on_purpose(app
     def refused_start(space, field):
         for dry_run in (False, True):
             with pytest.raises(ContractError) as refused:
-                core.respace_embeddings(ctx, space_id=space, action="start", dry_run=dry_run)
+                core.operations.respace_embeddings(ctx, space_id=space, action="start", dry_run=dry_run)
             assert (refused.value.code, refused.value.field) == ("VERSION_CONFLICT", field)
 
     refused_start(SPACE_B, "respace_running")
     refused_start(SPACE_A, "respace_running")
-    preview = core.respace_embeddings(ctx, space_id=SPACE_B, action="restart", dry_run=True)
+    preview = core.operations.respace_embeddings(ctx, space_id=SPACE_B, action="restart", dry_run=True)
     assert preview["run"] == run, "a preview shows the run as it stands"
     assert _start(core, ctx, action="restart")["run"]["next_work_id"] == run["next_work_id"]
     assert _page(core, ctx)["outcome"] == "complete"
@@ -231,7 +227,7 @@ def test_newest_first_within_the_room_and_never_what_came_after_the_start(app):
     assert (first["outcome"], first["reopened"]) == ("progress", 1)
     states = {row[0]: row[2] for row in _embeds(core)}
     assert [states[work_id] for work_id in started] == ["done", "done", "done", "pending"]
-    assert core.respace_embeddings(ctx, space_id=SPACE_B)["to_reopen"] == 3
+    assert core.operations.respace_embeddings(ctx, space_id=SPACE_B)["to_reopen"] == 3
     rest = _page(core, ctx)
     assert (rest["outcome"], rest["reopened"]) == ("complete", 3)
     states = {row[0]: row[2] for row in _embeds(core)}
@@ -239,7 +235,7 @@ def test_newest_first_within_the_room_and_never_what_came_after_the_start(app):
     assert [state for work_id, state in states.items() if work_id not in started] == ["done", "done"], (
         "what was queued after the start is embedded in the new space already"
     )
-    run = core.respace_embeddings(ctx, space_id=SPACE_B)["run"]
+    run = core.operations.respace_embeddings(ctx, space_id=SPACE_B)["run"]
     assert (run["completed"], run["reopened"]) == (True, 4)
 
 
@@ -266,7 +262,7 @@ def test_a_worker_in_another_space_leaves_the_run_alone(app):
     _start(core, ctx, space=SPACE_A)
     assert _page(core, ctx, space=SPACE_B) == {"outcome": "space_mismatch", "embedding_space": SPACE_A}
     assert respace_if_due(SQLiteStorage(ctx.binding), ctx, SPACE_B)["outcome"] == "space_mismatch"
-    assert core.respace_embeddings(ctx, space_id=SPACE_B)["space_matches"] is False
+    assert core.operations.respace_embeddings(ctx, space_id=SPACE_B)["space_matches"] is False
     assert _embeds(core) == before
 
 
@@ -277,9 +273,9 @@ def test_cancel_forgets_the_run_and_what_it_reopened_is_still_embedded(app):
     _finish_embeds(core)
     _start(core, ctx)
     _page(core, ctx, room=1)
-    preview = core.respace_embeddings(ctx, space_id=SPACE_B, action="cancel", dry_run=True)
+    preview = core.operations.respace_embeddings(ctx, space_id=SPACE_B, action="cancel", dry_run=True)
     assert "cancelled" not in preview and preview["run"] is not None, "a preview names the run it would forget"
-    report = core.respace_embeddings(ctx, space_id=SPACE_B, action="cancel", dry_run=False)
+    report = core.operations.respace_embeddings(ctx, space_id=SPACE_B, action="cancel", dry_run=False)
     assert report["cancelled"] and report["run"] is None
     assert sorted(row[2] for row in _embeds(core)) == ["done", "done", "done", "pending"]
     assert _page(core, ctx)["outcome"] == "none"
@@ -387,7 +383,7 @@ def test_a_failed_page_is_a_receipt_and_changes_nothing(app, monkeypatch):
         "error": "OperationalError",
     }
     assert _embeds(core) == before
-    assert core.respace_embeddings(ctx, space_id=SPACE_B)["run"]["reopened"] == 0
+    assert core.operations.respace_embeddings(ctx, space_id=SPACE_B)["run"]["reopened"] == 0
 
 
 def test_the_command_maps_its_flags_and_previews_unless_applied(app, monkeypatch, capsys):
@@ -404,7 +400,7 @@ def test_the_command_maps_its_flags_and_previews_unless_applied(app, monkeypatch
         return json.loads(capsys.readouterr().out)
 
     assert (run()["action"], run("--start")["applied"]) == ("status", False)
-    assert core.respace_embeddings(ctx, space_id=SPACE_B)["run"] is None
+    assert core.operations.respace_embeddings(ctx, space_id=SPACE_B)["run"] is None
     started = run("--start", "--apply")
     assert (started["action"], started["applied"], started["run"]["embedding_space"]) == ("start", True, SPACE_B)
     assert run("--restart", "--apply")["action"] == "restart"
@@ -414,7 +410,8 @@ def test_the_command_maps_its_flags_and_previews_unless_applied(app, monkeypatch
 
 
 def test_doctor_names_a_run_no_worker_will_go_on_with():
-    from scope_recall.maintenance.doctor import DoctorReport, _check_embedding_respace
+    from scope_recall.maintenance.doctor_report import DoctorReport
+    from scope_recall.maintenance.doctor_store import check_embedding_respace
 
     run = {
         "embedding_space": SPACE_A,
@@ -429,15 +426,15 @@ def test_doctor_names_a_run_no_worker_will_go_on_with():
         embedding_respace=dict(run),
         embedding_health={"pending": 70, "failed": 0, "oldest_pending_at": None},
     )
-    _check_embedding_respace(going, SimpleNamespace(embedding_space_id=lambda: SPACE_A))
+    check_embedding_respace(going, SimpleNamespace(embedding_space_id=lambda: SPACE_A))
     assert going.capability_gaps == [] and going.checks[-1]["result"] == "running"
     assert "70 embeddings wait in the store" in going.checks[-1]["detail"], "a held run says why it waits"
     stranded = DoctorReport(host="hermes", status="degraded", embedding_respace=dict(run))
-    _check_embedding_respace(stranded, SimpleNamespace(embedding_space_id=lambda: SPACE_B))
+    check_embedding_respace(stranded, SimpleNamespace(embedding_space_id=lambda: SPACE_B))
     assert stranded.capability_gaps == ["embedding_respace_space_mismatch"]
     assert stranded.checks[-1]["result"] == "space_mismatch"
     done = DoctorReport(host="hermes", status="degraded", embedding_respace={**run, "completed": True})
-    _check_embedding_respace(done, None)
+    check_embedding_respace(done, None)
     assert done.capability_gaps == [] and done.checks[-1]["result"] == "complete"
 
 
@@ -447,7 +444,8 @@ def test_doctor_names_an_embedding_backlog_that_aged_beside_a_refusing_provider(
     import time
     from datetime import datetime, timedelta, timezone
 
-    from scope_recall.maintenance.doctor import DoctorReport, _check_embedding_health
+    from scope_recall.maintenance.doctor_report import DoctorReport
+    from scope_recall.maintenance.doctor_store import check_embedding_health
     from scope_recall.runtime.model_budget import REQUESTS_TABLE, embedding_calls
 
     path = tmp_path / "auxiliary-budget.sqlite3"
@@ -483,7 +481,7 @@ def test_doctor_names_an_embedding_backlog_that_aged_beside_a_refusing_provider(
     report = DoctorReport(
         host="hermes", status="degraded", embedding_health={"pending": 12, "failed": 0, "oldest_pending_at": aged}
     )
-    _check_embedding_health(report, SimpleNamespace(auxiliary=auxiliary, vector=object()))
+    check_embedding_health(report, SimpleNamespace(auxiliary=auxiliary, vector=object()))
     assert report.capability_gaps == ["embedding_backlog_aged"]
     assert report.embedding_health["held_model"] == "TEST-embed"
     assert report.embedding_health["last_day"]["refused"] == {"http_429": 3}
@@ -495,7 +493,7 @@ def test_doctor_names_an_embedding_backlog_that_aged_beside_a_refusing_provider(
         status="degraded",
         embedding_health={"pending": 12, "failed": 0, "oldest_pending_at": datetime.now(timezone.utc).isoformat()},
     )
-    _check_embedding_health(fresh, None)
+    check_embedding_health(fresh, None)
     assert (fresh.capability_gaps, fresh.checks) == ([], [])
     assert (
         embedding_calls(SimpleNamespace(ledger_path=path, external_embedding=False, embedding=auxiliary.embedding))
@@ -508,7 +506,8 @@ def test_doctor_says_nothing_of_a_backlog_where_nothing_embeds_and_names_a_worke
     went from "attention" to "degraded" for good (review of 3.8.0)."""
     from datetime import datetime, timedelta, timezone
 
-    from scope_recall.maintenance.doctor import DoctorReport, _check_embedding_health
+    from scope_recall.maintenance.doctor_report import DoctorReport
+    from scope_recall.maintenance.doctor_store import check_embedding_health
 
     aged = (datetime.now(timezone.utc) - timedelta(hours=30)).isoformat()
     route = SimpleNamespace(
@@ -526,12 +525,12 @@ def test_doctor_says_nothing_of_a_backlog_where_nothing_embeds_and_names_a_worke
         report = DoctorReport(
             host="hermes", status="degraded", embedding_health={"pending": 12, "failed": 0, "oldest_pending_at": aged}
         )
-        _check_embedding_health(report, config)
+        check_embedding_health(report, config)
         assert (report.capability_gaps, report.checks) == ([], []), config
     report = DoctorReport(
         host="hermes", status="degraded", embedding_health={"pending": 12, "failed": 0, "oldest_pending_at": aged}
     )
-    _check_embedding_health(report, SimpleNamespace(auxiliary=route, vector=object()))
+    check_embedding_health(report, SimpleNamespace(auxiliary=route, vector=object()))
     assert report.capability_gaps == ["embedding_backlog_aged"]
     assert "provider" not in report.checks[-1]["detail"], "no ledger: nothing to say of the provider"
 
@@ -549,7 +548,8 @@ def test_doctor_blames_the_worker_only_when_nothing_asked_the_provider(tmp_path,
     import time
     from datetime import datetime, timedelta, timezone
 
-    from scope_recall.maintenance.doctor import DoctorReport, _check_embedding_health
+    from scope_recall.maintenance.doctor_report import DoctorReport
+    from scope_recall.maintenance.doctor_store import check_embedding_health
     from scope_recall.runtime.model_budget import REQUESTS_TABLE
 
     path = tmp_path / "auxiliary-budget.sqlite3"
@@ -569,7 +569,7 @@ def test_doctor_blames_the_worker_only_when_nothing_asked_the_provider(tmp_path,
     report = DoctorReport(
         host="hermes", status="degraded", embedding_health={"pending": 12, "failed": 0, "oldest_pending_at": aged}
     )
-    _check_embedding_health(report, SimpleNamespace(auxiliary=route, vector=object()))
+    check_embedding_health(report, SimpleNamespace(auxiliary=route, vector=object()))
     detail = report.checks[-1]["detail"]
     assert said in detail and ("no worker" in detail) is (not statuses), detail
 

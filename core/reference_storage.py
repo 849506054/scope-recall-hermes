@@ -161,23 +161,8 @@ class References:
                     return True
         return False
 
-    def apply(self, proposal, scope_id, now):
-        conn, ctx = self.tx._check(write=True), self.tx.context
-        sources = [self.tx.source(*parse_source_ref(r)) for r in proposal["evidence_refs"]]
-        if any(
-            s is None or (s.scope_id, s.project_id, s.branch_id) != (scope_id, ctx.project_id, ctx.branch_id)
-            for s in sources
-        ):
-            raise ContractError("SOURCE_MISSING")
-        for source in sources:
-            self.tx.claims.require_live_source(source.ref, source.revision)
-        mentioned = [s for s in sources if proposal["mention"] in s.event["content"]]
-        if not mentioned:
-            raise ContractError("DERIVATION_INVALID", "reference_mention")
-        episodes = {self.tx.episodes.source_episode(s.ref, s.revision).ref for s in mentioned}
-        if len(episodes) != 1:
-            raise ContractError("DERIVATION_INVALID", "reference_episode")
-        episode = next(iter(episodes))
+    def _candidate_artifacts(self, proposal) -> list:
+        """The artifact versions a reference proposal offers, each of which must exist."""
         candidates = []
         for candidate in proposal["candidate_refs"]:
             ref, revision = parse_source_ref(candidate)
@@ -185,6 +170,11 @@ class References:
             if item is None:
                 raise ContractError("SOURCE_MISSING")
             candidates.append(item)
+        return candidates
+
+    def _resolve(self, proposal, mentioned, candidates) -> tuple[set, str]:
+        """The candidates the person's own complete messages pick out, and how: by position in a list they were shown
+        in order, or by naming one version so that no other visible version fits."""
         resolved = set()
         reason = "model_candidates_only"
         for source in mentioned:
@@ -219,13 +209,12 @@ class References:
                 if exact:
                     resolved.add(candidate)
                     reason = "explicit_version_mention"
-        choice = next(iter(resolved)) if len(resolved) == 1 else None
-        payload = dict(
-            proposal,
-            resolved_ref=choice,
-            resolution="resolved" if choice else "ambiguous" if len(candidates) > 1 else "unresolved",
-        )
-        primary = mentioned[-1]
+        return resolved, reason
+
+    @staticmethod
+    def _reference_id(conn, ctx, scope_id, proposal, mentioned, episode) -> str:
+        """The reference's id: from the mention and the last cited message that has it, unless the messages clarify
+        the one earlier mention of it in the episode, whose id it keeps."""
         ref = (
             "reference-"
             + hashlib.sha256(
@@ -235,7 +224,7 @@ class References:
                         scope_id,
                         ctx.project_id,
                         ctx.branch_id,
-                        primary.ref,
+                        mentioned[-1].ref,
                         proposal["mention"],
                     ]
                 ).encode()
@@ -252,6 +241,43 @@ class References:
             ).fetchall()
             if len(matches) == 1:
                 ref = matches[0][0]
+        return ref
+
+    @staticmethod
+    def _advance_binding(conn, ref, revision) -> None:
+        """Point a binding at its new revision."""
+        conn.execute(
+            "UPDATE reference_bindings SET current_revision=? WHERE reference_id=?",
+            (revision, ref),
+        )
+        # No stale dependent summary remains eligible after a binding change.
+        for kind, episode_ref in lineage.dependents_on(conn, "reference", ref):
+            if kind != "episode":
+                continue
+            conn.execute(
+                "UPDATE episode_versions SET processed_sequence=0 WHERE episode_id=?",
+                (episode_ref,),
+            )
+
+    def apply(self, proposal, scope_id, now):
+        conn, ctx = self.tx._check(write=True), self.tx.context
+        sources = self.tx.claims.live_sources(proposal["evidence_refs"], scope_id)
+        mentioned = [s for s in sources if proposal["mention"] in s.event["content"]]
+        if not mentioned:
+            raise ContractError("DERIVATION_INVALID", "reference_mention")
+        episodes = {self.tx.episodes.source_episode(s.ref, s.revision).ref for s in mentioned}
+        if len(episodes) != 1:
+            raise ContractError("DERIVATION_INVALID", "reference_episode")
+        episode = next(iter(episodes))
+        candidates = self._candidate_artifacts(proposal)
+        resolved, reason = self._resolve(proposal, mentioned, candidates)
+        choice = next(iter(resolved)) if len(resolved) == 1 else None
+        payload = dict(
+            proposal,
+            resolved_ref=choice,
+            resolution="resolved" if choice else "ambiguous" if len(candidates) > 1 else "unresolved",
+        )
+        ref = self._reference_id(conn, ctx, scope_id, proposal, mentioned, episode)
         if not allowed(self.tx, "reference", ref):
             raise ContractError("SOURCE_MISSING")
         current = self.get(ref)
@@ -260,18 +286,7 @@ class References:
             return current
         revision = (stored[0] + 1) if stored else 1
         if stored:
-            conn.execute(
-                "UPDATE reference_bindings SET current_revision=? WHERE reference_id=?",
-                (revision, ref),
-            )
-            # No stale dependent summary remains eligible after a binding change.
-            for kind, episode_ref in lineage.dependents_on(conn, "reference", ref):
-                if kind != "episode":
-                    continue
-                conn.execute(
-                    "UPDATE episode_versions SET processed_sequence=0 WHERE episode_id=?",
-                    (episode_ref,),
-                )
+            self._advance_binding(conn, ref, revision)
         else:
             conn.execute(
                 "INSERT INTO reference_bindings(reference_id,scope_id,project_id,branch_id,episode_id,current_revision,suppressed) VALUES (?,?,?,?,?,?,?)",

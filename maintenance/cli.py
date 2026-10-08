@@ -9,12 +9,20 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
-from .backup import BackupError
+from scope_recall.core.schema import SCHEMA_VERSION, STATEMENTS, UPGRADE_CHAIN, stale_header_schema
+from scope_recall.core.storage import SQLiteStorage
+from scope_recall.core.writer_lease import TruthWriterBusyError
+
+from .backup import BackupError, backup_sqlite
 from .doctor import run_doctor
+from .doctor_store import read_journal_mode, recorded_schema_under_stale_header, schema_on_disk
 from .install import InstallError, apply_install, apply_uninstall, plan_install, plan_uninstall
 from .install_common import HostChoice, absolute
+from .install_common import absolute
+from .install_dsh import default_home as dsh_home
 from .install_hermes import LOCAL_PLATFORM_CHOICES
-from .rollback import RollbackError
+from .install_workbuddy import default_home
+from .rollback import RollbackError, plan_rollback, rollback_to_verified_snapshot
 
 
 def _emit(payload: dict) -> None:
@@ -31,7 +39,7 @@ def _optional_path(value: str | None, field: str) -> Path | None:
 
 def _interpreter(value: str | None, field: str) -> Path | None:
     """An interpreter path as given, never resolved: a POSIX venv's ``bin/python`` is a symlink to the base
-    interpreter, which cannot import this package (#87, #141).  The installer and the doctor check the chain."""
+    interpreter, which cannot import this package.  The installer and the doctor check the chain."""
     return absolute(value, field, error=SystemExit) if value else None
 
 
@@ -123,7 +131,7 @@ def _add_repair_arguments(parser: argparse.ArgumentParser) -> None:
 def _repair_claim_frames(args: argparse.Namespace) -> int:
     return _run_core(
         args,
-        lambda core, config: core.repair_claim_frames(
+        lambda core, config: core.operations.repair_claim_frames(
             config.context(), after_ref=args.after_ref, limit=args.limit, remaining_seconds=config.request_seconds
         ),
         failed=lambda receipt: bool(receipt["errors"]),
@@ -138,7 +146,7 @@ def _add_requalify_arguments(parser: argparse.ArgumentParser) -> None:
 def _requalify(args: argparse.Namespace) -> int:
     return _run_core(
         args,
-        lambda core, config: core.requalify_claims(
+        lambda core, config: core.operations.requalify_claims(
             config.context(),
             after_ref=args.after_ref,
             limit=args.limit,
@@ -151,7 +159,7 @@ def _requalify(args: argparse.Namespace) -> int:
 def _retire_rootless(args: argparse.Namespace) -> int:
     return _run_core(
         args,
-        lambda core, config: core.retire_rootless_proposals(
+        lambda core, config: core.operations.retire_rootless_proposals(
             config.context(),
             after_ref=args.after_ref,
             limit=args.limit,
@@ -187,7 +195,7 @@ def _unindex_withheld(args: argparse.Namespace) -> int:
             if total["pages"]:
                 # Each page holds the store's writer lease; captures waiting for it get it between pages.
                 time.sleep(_UNINDEX_PAGE_PAUSE)
-            page = core.unindex_withheld_outputs(
+            page = core.operations.unindex_withheld_outputs(
                 config.context(),
                 after_id=total["next_after_id"],
                 limit=args.limit,
@@ -222,7 +230,7 @@ def _add_retry_arguments(parser: argparse.ArgumentParser) -> None:
 def _retry_failures(args: argparse.Namespace) -> int:
     return _run_core(
         args,
-        lambda core, config: core.retry_failed_work(
+        lambda core, config: core.operations.retry_failed_work(
             config.context(),
             limit=args.limit,
             include_terminal=args.include_terminal,
@@ -250,7 +258,7 @@ def _respace_embeddings(args: argparse.Namespace) -> int:
     action = "start" if args.start else "restart" if args.restart else "cancel" if args.cancel else "status"
     return _run_core(
         args,
-        lambda core, config: core.respace_embeddings(
+        lambda core, config: core.operations.respace_embeddings(
             config.context(),
             space_id=config.embedding_space_id(),
             action=action,
@@ -267,8 +275,6 @@ def _add_backup_arguments(parser: argparse.ArgumentParser) -> None:
 
 
 def _backup(args: argparse.Namespace) -> int:
-    from .backup import backup_sqlite
-
     target = _path(args.output, "output")
     manifest = _path(args.manifest, "manifest") if args.manifest else target.with_suffix(target.suffix + ".json")
     _emit(backup_sqlite(_path(args.database, "database"), target, manifest=manifest))
@@ -283,8 +289,6 @@ def _add_rollback_arguments(parser: argparse.ArgumentParser) -> None:
 
 
 def _rollback(args: argparse.Namespace) -> int:
-    from .rollback import plan_rollback, rollback_to_verified_snapshot
-
     current, snapshot = _path(args.current_db, "current_db"), _path(args.snapshot, "snapshot")
     output = _optional_path(args.output, "output")
     result = plan_rollback(current, snapshot, destination=output)
@@ -579,12 +583,8 @@ def _install_target(args: argparse.Namespace) -> Path:
     if args.target_plugin_dir:
         return _path(args.target_plugin_dir, "target_plugin_dir")
     if args.host == "workbuddy":
-        from .install_workbuddy import default_home
-
         return default_home()
     if args.host == "dsh":
-        from .install_dsh import default_home as dsh_home
-
         return dsh_home()
     raise SystemExit(f"--target-plugin-dir is required for --host {args.host}")
 
@@ -637,8 +637,6 @@ def _restamp_header(database: Path, recorded: int, *, timeout: float) -> bool:
     import sqlite3
     from contextlib import closing
 
-    from scope_recall.core.schema import stale_header_schema
-
     # mode=rw: a store that disappeared meanwhile is an error, never a new empty file.
     with closing(
         sqlite3.connect(f"{database.as_uri()}?mode=rw", uri=True, timeout=timeout, isolation_level=None)
@@ -662,8 +660,6 @@ def _tables_not_in_schema(database: Path) -> dict[str, int]:
     """
     import sqlite3
     from contextlib import closing
-
-    from scope_recall.core.schema import STATEMENTS
 
     with closing(sqlite3.connect(":memory:")) as scratch:
         for statement in STATEMENTS:
@@ -708,12 +704,8 @@ def _upgrade_store(args: argparse.Namespace) -> int:
     from datetime import datetime, timezone
 
     from scope_recall.contracts import ContractError
-    from scope_recall.core.schema import SCHEMA_VERSION, UPGRADE_CHAIN
-    from scope_recall.core.storage import SQLiteStorage
-    from scope_recall.core.writer_lease import TruthWriterBusyError
 
-    from .backup import backup_sqlite
-    from .doctor import load_binding, read_journal_mode, recorded_schema_under_stale_header, schema_on_disk
+    from .doctor import load_binding
 
     instance = _path(args.instance_root, "instance_root")
     binding, data_directory = load_binding(args.host, instance)
@@ -743,7 +735,7 @@ def _upgrade_store(args: argparse.Namespace) -> int:
     result["backup"] = str(snapshot)
     wait = min(max(float(args.wait_seconds), 0.0), 30.0)
     if recorded is not None:
-        # The store records its own schema and only the header was overwritten (#117): put the
+        # The store records its own schema and only the header was overwritten: put the
         # header back, in a write transaction that checks it again, and carry on from there.
         try:
             restamped = _restamp_header(database, recorded, timeout=wait)

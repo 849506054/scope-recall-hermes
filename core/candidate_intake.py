@@ -47,9 +47,9 @@ from .evidence_question import (
 #: Truncated source triggers still owe a page of candidates, joined to their
 #: source so the audience filter can apply.
 #: Read inside the worker's page writes, so it starts from the few triggers: CROSS JOIN keeps SQLite's join
-#: order.  Left to choose, it started from ``source_events`` through its scope index and looked up a trigger for
-#: every source: 2.7 s and 3.5 s a page on the shared store on 2026-09-27 (8,819 triggers, 192 truncated), with
-#: the writer lease held, where this order takes 4-5 ms.
+#: order.  Left to choose, it starts from ``source_events`` through its scope index and looks up a trigger for
+#: every source: 2.7-3.5 s a page on a shared store of 8,819 triggers (192 truncated), with the writer lease
+#: held, where this order takes 4-5 ms.
 _TRUNCATED_TRIGGERS = """FROM candidate_source_triggers t
     CROSS JOIN source_events s ON s.event_id=t.source_ref AND s.source_revision=t.source_revision
     WHERE t.truncated=1 AND {context}"""
@@ -214,7 +214,7 @@ class CandidateIntake(CandidateTables):
         now = utc(observed_at)
         rule_version = rule(rule_version)
         source = self._tx.source(source_ref, source_revision)
-        current = self._tx.source_current(source_ref)
+        current = self._tx.sources.source_current(source_ref)
         if source is None or source.suppressed or current is None or current.revision != source_revision:
             raise ContractError("SOURCE_MISSING", "candidate_trigger_source")
         conn = self._write()
@@ -303,8 +303,8 @@ class CandidateIntake(CandidateTables):
 
         A shared term is enough for first-hand testimony, which can confirm a
         value without repeating it and lend a promotion its authority.  Any
-        other source must restate the candidate or name its subject: on one instance
-        a shared bigram had attached 116,000 sources to 1,215 live candidates,
+        other source must restate the candidate or name its subject: a shared
+        bigram alone attached 116,000 sources to 1,215 live candidates in one store,
         and 6% of them restated the candidate they were attached to.
         """
         if source.event.get("origin") in ECHO_ORIGINS:
@@ -319,7 +319,7 @@ class CandidateIntake(CandidateTables):
         context, params = self._context("l.")
         # The terms go in as one parameter and the candidates come back in one row.  A parameter per term failed a part
         # of 63,993 distinct terms whole ("too many SQL variables", kept to retry for good), and a row per candidate
-        # waited for the GIL in a busy Hermes gateway (``lexical_index.index_terms``; review of 3.7.6).  The CROSS JOIN
+        # waited for the GIL in a busy Hermes gateway (``lexical_index.index_terms``).  The CROSS JOIN
         # starts from the terms: from the candidates, SQLite looked every term up for each reachable one, 3-12 s for a
         # tool output of 5,001 terms beside 3,000-10,000 candidates.
         row = (
@@ -550,6 +550,19 @@ class CandidateIntake(CandidateTables):
             .fetchone()[0]
         )
 
+    def _oldest_owed_page(self):
+        """The truncated trigger that has waited longest, as its source ref and revision; None when none waits."""
+        context, params = self._context("s.")
+        return (
+            self._read()
+            .execute(
+                f"""SELECT t.source_ref,t.source_revision {_TRUNCATED_TRIGGERS.format(context=context)}
+                ORDER BY t.processed_at,t.source_ref,t.source_revision LIMIT 1""",
+                params,
+            )
+            .fetchone()
+        )
+
     def next_source_page(self) -> tuple[str, int, list[tuple[str, int]] | None] | None:
         """The next page a truncated trigger owes, chosen in a read: its source and the candidates it names.
 
@@ -560,20 +573,11 @@ class CandidateIntake(CandidateTables):
         ``resume_source_pages(page=...)`` then links in a write of its own, checking each candidate again.
         The candidates are ``None`` when the source is gone: that write closes the trigger.
         """
-        context, params = self._context("s.")
-        row = (
-            self._read()
-            .execute(
-                f"""SELECT t.source_ref,t.source_revision {_TRUNCATED_TRIGGERS.format(context=context)}
-                ORDER BY t.processed_at,t.source_ref,t.source_revision LIMIT 1""",
-                params,
-            )
-            .fetchone()
-        )
+        row = self._oldest_owed_page()
         if row is None:
             return None
         source = self._tx.source(row["source_ref"], row["source_revision"])
-        current = self._tx.source_current(row["source_ref"])
+        current = self._tx.sources.source_current(row["source_ref"])
         if source is None or source.suppressed or current is None or current.revision != source.revision:
             return row["source_ref"], row["source_revision"], None
         return (
@@ -594,16 +598,7 @@ class CandidateIntake(CandidateTables):
         they are found here, inside this write.
         """
         if page is None:
-            context, params = self._context("s.")
-            row = (
-                self._read()
-                .execute(
-                    f"""SELECT t.source_ref,t.source_revision {_TRUNCATED_TRIGGERS.format(context=context)}
-                    ORDER BY t.processed_at,t.source_ref,t.source_revision LIMIT 1""",
-                    params,
-                )
-                .fetchone()
-            )
+            row = self._oldest_owed_page()
             if row is None:
                 return 0
             source_ref, source_revision, matched = row["source_ref"], row["source_revision"], None

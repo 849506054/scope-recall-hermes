@@ -116,6 +116,63 @@ def _ack(text):
     return re.sub(r"[\s.!。！,，~～]+", "", normalized) in _ACKS
 
 
+def _successful_tool_wrapper(text: str) -> bool:
+    """Whether a tool result is only a success wrapper: a bare "done", or a JSON status object that reports success,
+    no failure, no output and no message beyond an acknowledgement."""
+    if _TOOL_OK.fullmatch(text.strip()):
+        return True
+    try:
+        body = json.loads(text)
+    except (ValueError, TypeError):
+        return False
+    allowed = {
+        "status",
+        "success",
+        "ok",
+        "exit_code",
+        "returncode",
+        "duration_ms",
+        "elapsed_ms",
+        "stdout",
+        "stderr",
+        "output",
+        "message",
+    }
+    if not (isinstance(body, dict) and body and set(body) <= allowed):
+        return False
+    return _reports_success(body) and _says_nothing_more(body)
+
+
+def _reports_success(body: dict) -> bool:
+    """Whether a tool's status object says it succeeded, and nothing in it says it failed."""
+    success = (
+        body.get("success") is True
+        or body.get("ok") is True
+        or body.get("status") in ("ok", "success", "completed")
+        or type(body.get("exit_code")) is int
+        and body["exit_code"] == 0
+        or type(body.get("returncode")) is int
+        and body["returncode"] == 0
+    )
+    no_failure = (
+        body.get("success") is not False
+        and body.get("ok") is not False
+        and body.get("exit_code", 0) == 0
+        and body.get("returncode", 0) == 0
+    )
+    return success and no_failure
+
+
+def _says_nothing_more(body: dict) -> bool:
+    """Whether a tool's status object carries no output, and no message beyond an acknowledgement."""
+    empty_output = all(body.get(key) in (None, "", [], {}) for key in ("stdout", "stderr", "output"))
+    message = body.get("message", "")
+    empty_message = type(message) is str and (
+        not message.strip() or _ack(message) or bool(_TOOL_OK.fullmatch(message.strip()))
+    )
+    return empty_output and empty_message
+
+
 def classify(event, policy=None):
     """No semantic guesses: a keyword only raises scheduling priority."""
     policy = policy or AdmissionPolicy()
@@ -138,49 +195,8 @@ def classify(event, policy=None):
         return AdmissionDecision("source_only", "capture_gap")
     if _ack(text):
         return AdmissionDecision("source_only", "acknowledgement")
-    if event.get("role") == "tool":
-        if _TOOL_OK.fullmatch(text.strip()):
-            return AdmissionDecision("source_only", "successful_tool_wrapper")
-        try:
-            body = json.loads(text)
-        except (ValueError, TypeError):
-            body = None
-        allowed = {
-            "status",
-            "success",
-            "ok",
-            "exit_code",
-            "returncode",
-            "duration_ms",
-            "elapsed_ms",
-            "stdout",
-            "stderr",
-            "output",
-            "message",
-        }
-        if isinstance(body, dict) and body and set(body) <= allowed:
-            success = (
-                body.get("success") is True
-                or body.get("ok") is True
-                or body.get("status") in ("ok", "success", "completed")
-                or type(body.get("exit_code")) is int
-                and body["exit_code"] == 0
-                or type(body.get("returncode")) is int
-                and body["returncode"] == 0
-            )
-            no_failure = (
-                body.get("success") is not False
-                and body.get("ok") is not False
-                and body.get("exit_code", 0) == 0
-                and body.get("returncode", 0) == 0
-            )
-            empty_output = all(body.get(key) in (None, "", [], {}) for key in ("stdout", "stderr", "output"))
-            message = body.get("message", "")
-            empty_message = type(message) is str and (
-                not message.strip() or _ack(message) or bool(_TOOL_OK.fullmatch(message.strip()))
-            )
-            if success and no_failure and empty_output and empty_message:
-                return AdmissionDecision("source_only", "successful_tool_wrapper")
+    if event.get("role") == "tool" and _successful_tool_wrapper(text):
+        return AdmissionDecision("source_only", "successful_tool_wrapper")
     return AdmissionDecision("schedule", "content_not_classified_low_value")
 
 
@@ -218,8 +234,8 @@ def _available_types(tx, scope_id, policy, important, candidates=WORK_TYPES):
 def _repeated_tool_output(tx, scope_id, text) -> bool:
     """Whether an earlier, still readable tool output in this scope has exactly this content.
 
-    On one instance 77% of 132,000 tool outputs were byte-identical to an
-    earlier one, and each was embedded again.  The earlier copy already carries
+    Measured in one store, 77% of 132,000 tool outputs were byte-identical to
+    an earlier one, and each was embedded again.  The earlier copy already carries
     the vector and the lexical index lists both, so a repeat is kept as a
     source only.  An earlier copy that was itself kept as a source only (recall
     output, a repeat, a withheld summary) carries no vector and does not count.
@@ -238,7 +254,7 @@ def _repeated_tool_output(tx, scope_id, text) -> bool:
     )
 
 
-#: What a tool output earns: an embedding, so it is found by meaning.  It is not consolidated;
+#: What a tool output earns: an embedding, so it is recalled by meaning.  It is not consolidated;
 #: tool output is no derivation root (``evidence_question.DERIVATION_ROOT_ORIGINS``), so a
 #: consolidation of it would show the model nothing.
 TOOL_OUTPUT_WORK_TYPES = frozenset({"embed"})
@@ -303,7 +319,7 @@ def decision_marker(tx, ref, revision):
 
 def _schedule(tx, clock, ref, revision, policy, *, on_demand=True, fresh=False):
     source = tx.source(ref, revision)
-    current = tx.source_current(ref)
+    current = tx.sources.source_current(ref)
 
     if (
         source is None
@@ -351,7 +367,7 @@ def _schedule(tx, clock, ref, revision, policy, *, on_demand=True, fresh=False):
     if not ready:
         return SourceScheduleReceipt(ref, revision, "deferred", "queue_capacity")
     for kind in sorted(ready):
-        tx.enqueue_source(ref, revision, work_type=kind, available_at=clock.utc_now())
+        tx.sources.enqueue_source(ref, revision, work_type=kind, available_at=clock.utc_now())
     if ready != missing:
         store_decision(tx, ref, revision, AdmissionDecision("deferred", "queue_capacity", priority))
         return SourceScheduleReceipt(ref, revision, "partial", "queue_capacity", len(ready))
@@ -392,8 +408,8 @@ def resume_deferred(storage, clock, context, policy=None, *, limit=16, remaining
     # Which deferred sources to try is a scan of every source the context reaches, and the queue counts next to
     # it: all read without the writer lease, and the write touches only the page found, each source checked
     # again there by ``_schedule`` (its revision, visibility and the queue's room).  Under the lease the scan held
-    # it 9.8 s on 2026-09-27 with nothing deferred; with one deferred source that had no room, or an older
-    # revision's marker the page never selects, it ran on every pass and selected nothing.  The probe asks
+    # it 9.8 s on a large store with nothing deferred; with one deferred source that had no room, or an older
+    # revision's marker the page never selects, it would run on every pass and select nothing.  The probe asks
     # for the newest revision as the page does: nothing clears an older revision's marker, so one was
     # enough to start the page's scan on every pass, forever.
     with storage.read(context, remaining_seconds=remaining_seconds) as tx:

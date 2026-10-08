@@ -21,7 +21,7 @@ from .mutate import Mutation, MutationReceipt, apply_claim_frames, validate_clai
 from .worker_outcomes import DerivationFence, claim_versions_mark, claims_changed, derivation_changed
 
 if TYPE_CHECKING:
-    from .storage import StoredSource
+    from .source_records import StoredSource
 
 
 @dataclass(frozen=True)
@@ -174,9 +174,9 @@ def consolidation_messages(sources, *, episode_ref=None, budget=CONSOLIDATION_IN
     # text above is byte-identical on every call, so the longest prefix two
     # requests can share is that text followed by the same sources.  The refs and
     # watermark differ as soon as any one source does; placed first, they ended
-    # the shared prefix before a single source.  Replayed over one instance's 1,850
-    # candidate evaluations of 2026-09-17, an ideal prefix cache could reuse 68%
-    # of prompt tokens in this order against 54% in the old one.
+    # the shared prefix before a single source.  Replayed over one store's 1,850
+    # candidate evaluations of a day, an ideal prefix cache could reuse 68% of
+    # prompt tokens in this order against 54% in the other.
     body = dict(
         sources=records,
         episode_ref=episode_ref,

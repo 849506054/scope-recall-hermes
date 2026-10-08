@@ -15,6 +15,7 @@ import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from ..core.storage import SQLiteStorage
 from ..runtime.scheduling import control_path, read_control
 from ..runtime.worker_entry import load_config, write_worker_metadata
 
@@ -62,22 +63,26 @@ def plan(config_path, python_executable, *, user_id, env_file=None):
     config = load_config(config_path)
     if config_path.resolve().parent != config.binding.data_directory.resolve():
         raise ValueError("autostart_config_outside_binding")
-    from ..core.storage import SQLiteStorage
 
     with SQLiteStorage(config.binding).read(config.context()) as tx:
         tx.status()
     if env_file and (not Path(env_file).is_absolute() or not Path(env_file).is_file()):
         raise ValueError("autostart_environment_missing")
     name = "ScopeRecall-" + hashlib.sha256(config.binding.installation_id.encode()).hexdigest()[:20]
+    recorded = dict(
+        installation_id=config.binding.installation_id,
+        enabled=True,
+        task_name=name,
+        # The interpreter is recorded as given: the task must start the
+        # venv launcher, not the base interpreter its symlink points at.
+        config_path=str(config_path.resolve()),
+        python_executable=str(python),
+        env_file=str(Path(env_file).resolve()) if env_file else None,
+    )
     if not _windows():
         # No task to register and no principal to run it as: the operator's timer runs the wake as its own user.
         return dict(
-            installation_id=config.binding.installation_id,
-            enabled=True,
-            task_name=name,
-            config_path=str(config_path.resolve()),
-            python_executable=str(python),
-            env_file=str(Path(env_file).resolve()) if env_file else None,
+            recorded,
             trigger="every_5_minutes_from_the_operator_timer",
             registration=OPERATOR_TIMER,
             **_posix_wake(name, config_path.resolve(), python),
@@ -132,14 +137,7 @@ def plan(config_path, python_executable, *, user_id, env_file=None):
     )
     node(action, "WorkingDirectory", str(config.binding.data_directory))
     return dict(
-        installation_id=config.binding.installation_id,
-        enabled=True,
-        task_name=name,
-        # The interpreter is recorded as given: the task must start the
-        # venv launcher, not the base interpreter its symlink points at.
-        config_path=str(config_path.resolve()),
-        python_executable=str(python),
-        env_file=str(Path(env_file).resolve()) if env_file else None,
+        recorded,
         trigger="user_logon_and_every_5_minutes",
         xml=ET.tostring(task, encoding="unicode"),
     )

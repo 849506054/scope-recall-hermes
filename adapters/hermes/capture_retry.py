@@ -25,7 +25,8 @@ from .identity import (
     HermesIdentityError,
     resolve_runtime_audience,
 )
-from .installation import assert_binding_matches_manifest, load_binding_for_home
+from .installation import assert_binding_matches_manifest
+from .shared_entries import load_binding_for_home
 
 if TYPE_CHECKING:
     from .provider import ScopeRecallHermesAdapter
@@ -35,22 +36,22 @@ if TYPE_CHECKING:
 _log = logging.getLogger("scope_recall.adapters.hermes.provider")
 
 #: What the retry thread's pass may spend, off any hook's time and off Hermes' single memory worker.  At a capture's
-#: own ``CAPTURE_TIMEOUT_S`` a pass wrote about one of up to 16 buffered tool results, each write 1-4 s on the busy
-#: shared store (2026-10-04).  A turn's end keeps that 1 s: it runs on Hermes' memory worker, which the next turn's
-#: writes queue behind (review of 3.6.1).
+#: own ``CAPTURE_TIMEOUT_S`` a pass would write about one of up to 16 buffered tool results, each write 1-4 s on a
+#: busy shared store.  A turn's end keeps that 1 s: it runs on Hermes' memory worker, which the next turn's writes
+#: queue behind.
 _RETRY_PASS_SECONDS = 5.0
 #: What a shutdown's last pass may spend: the thread wrote again within the last ``_RETRY_EVERY_S``, and on a busy store
-#: a longer pass seldom changes the outcome while it holds up a gateway's planned stop (review of 3.6.1).
+#: a longer pass seldom changes the outcome while it holds up a gateway's planned stop.
 SHUTDOWN_RETRY_SECONDS = 2.0
 #: How long a capture is kept to retry: one that cannot be written by then is dropped and logged as lost.  Kept for
 #: good, a capture of a full inbox or of an installation whose scopes changed under a running gateway was retried every
-#: ``_RETRY_EVERY_S`` for the life of the process, and its thread held an evicted agent's adapter (review of 3.6.1).
+#: ``_RETRY_EVERY_S`` for the life of the process, and its thread would hold an evicted agent's adapter.
 _RETRY_GIVE_UP_S = 1800.0
 #: How often the retry thread writes again what the buffer holds, for as long as it holds anything.  Hermes runs
 #: ``sync_turn`` only after a turn with a message and a reply: a turn it injected (a watch notification), one it
 #: interrupted, or one with no reply ran no retry.  An idle agent evicted from Hermes' cache keeps its adapter without
-#: a shutdown, so nothing wrote the buffer again until a gateway restart dropped it.  tianji lost 10 tool results so on
-#: 2026-10-04 (``capture_failure`` logged once, never in the store).
+#: a shutdown, so without this thread nothing writes the buffer again until a gateway restart drops it, and the tool
+#: results it held are lost (``capture_failure`` logged once, never in the store).
 _RETRY_EVERY_S = 30.0
 
 
@@ -139,7 +140,7 @@ class CaptureRetry:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 break
-            with self._adapter._lock, self._adapter._holding("retry_buffered_captures"):
+            with self._adapter._lock, self._adapter._calls.holding("retry_buffered_captures"):
                 if self._adapter._identity is not identity or not (self._adapter._initialized or force):
                     # A session switch or a shutdown came in between: what is left stays for the next pass.
                     break
@@ -233,6 +234,30 @@ class CaptureRetry:
             except Exception as exc:  # noqa: BLE001 - the next pass, a turn's end or the shutdown writes it
                 _log.warning("scope-recall: a retry of buffered captures failed (%s)", type(exc).__name__)
                 # A pass that raised before its captures' own check still gives up the expired ones: it would hold
-                # them, and an evicted agent's adapter, for good (review of 3.6.1).
+                # them, and an evicted agent's adapter, for good.
                 with self._adapter._lock:
                     self.give_up_expired(tuple(self.captures.items()))
+
+    def durable_pending_count(self):
+        if not isinstance(self._adapter._core, MemoryCore) or self._adapter._identity is None:
+            return None
+        try:
+            context = self._adapter._identity.trusted_context()
+            scopes = sorted(context.allowed_scope_ids)
+            with self._adapter._core.storage.read(context, remaining_seconds=0.1) as tx:
+                return (
+                    tx._check()
+                    .execute(
+                        f"SELECT count(*) FROM capture_inbox WHERE scope_id IN ({','.join('?' for _ in scopes)}) AND project_id IS ? AND branch_id IS ?",
+                        (*scopes, context.project_id, context.branch_id),
+                    )
+                    .fetchone()[0]
+                )
+        except (ContractError, OSError, RuntimeError, sqlite3.Error):
+            return None
+
+    def pending_identities(self) -> tuple[SourceIdentity, ...]:
+        with self._adapter._lock:
+            # Failed writes roll back the observation ledger, but their DTO
+            # may still occupy the bounded memory retry buffer.
+            return tuple(sorted(set(self._adapter._ledger.pending_identities()) | set(self.captures)))

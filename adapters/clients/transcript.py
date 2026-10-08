@@ -98,30 +98,10 @@ def said(row: object) -> Said | None:
     if type(entry_id) is not str or not entry_id.strip() or len(entry_id) > 100 or occurred_at is None:
         return None
     message = row.get("message") if isinstance(row.get("message"), dict) else {}
-    kind = row.get("type")
-    if kind == "user" and _human(row.get("origin")) and message.get("role") == "user":
-        content = message.get("content")
-        if isinstance(content, list) and any(
-            isinstance(block, dict) and block.get("type") == "tool_result" for block in content
-        ):
-            return None
-        role, text = "user", _text(content)
-    elif kind == "attachment":
-        # A message the person sent while a turn was running reaches the model as a queued command.
-        attachment = row.get("attachment") if isinstance(row.get("attachment"), dict) else {}
-        if (
-            attachment.get("type") != "queued_command"
-            or attachment.get("commandMode") != "prompt"
-            or not _human(attachment.get("origin"))
-        ):
-            return None
-        role, text = "user", _text(attachment.get("prompt"))
-    elif kind == "assistant" and message.get("role") == "assistant":
-        if row.get("isApiErrorMessage") or message.get("model") == "<synthetic>":
-            return None
-        role, text = "assistant", _text(message.get("content"))
-    else:
+    spoken = _spoken(row, message)
+    if spoken is None:
         return None
+    role, text = spoken
     if not text.strip():
         return None
     # Half of a broken emoji is kept as U+FFFD, with the rest of the message (``boundary.without_lone_surrogates``);
@@ -131,17 +111,49 @@ def said(row: object) -> Said | None:
         entry_id.encode("utf-8")
     except UnicodeEncodeError:
         return None
-    prompt_id = row.get("promptId") if role == "user" else None
+    return Said(entry_id.strip(), role, text, occurred_at, _prompt_id(row) if role == "user" else None)
+
+
+def _spoken(row: dict, message) -> tuple[str, str] | None:
+    """Who speaks in a record entry, and the words: a person's message, a message they queued while a turn was
+    running, or the model's answer; None for every other entry."""
+    kind = row.get("type")
+    if kind == "user" and _human(row.get("origin")) and message.get("role") == "user":
+        content = message.get("content")
+        if isinstance(content, list) and any(
+            isinstance(block, dict) and block.get("type") == "tool_result" for block in content
+        ):
+            return None
+        return "user", _text(content)
+    if kind == "attachment":
+        # A message the person sent while a turn was running reaches the model as a queued command.
+        attachment = row.get("attachment") if isinstance(row.get("attachment"), dict) else {}
+        if (
+            attachment.get("type") != "queued_command"
+            or attachment.get("commandMode") != "prompt"
+            or not _human(attachment.get("origin"))
+        ):
+            return None
+        return "user", _text(attachment.get("prompt"))
+    if kind == "assistant" and message.get("role") == "assistant":
+        if row.get("isApiErrorMessage") or message.get("model") == "<synthetic>":
+            return None
+        return "assistant", _text(message.get("content"))
+    return None
+
+
+def _prompt_id(row: dict) -> str | None:
+    """The prompt id of a person's message, when it is one the store can bind."""
+    prompt_id = row.get("promptId")
     if type(prompt_id) is not str or not prompt_id.strip() or len(prompt_id) > 240:
-        prompt_id = None
-    else:
-        try:
-            prompt_id.encode("utf-8")
-        except UnicodeEncodeError:
-            # An id the store cannot bind would stop every later read at this line; the message is still
-            # matched by its words and moment.
-            prompt_id = None
-    return Said(entry_id.strip(), role, text, occurred_at, prompt_id.strip() if prompt_id else None)
+        return None
+    try:
+        prompt_id.encode("utf-8")
+    except UnicodeEncodeError:
+        # An id the store cannot bind would stop every later read at this line; the message is still
+        # matched by its words and moment.
+        return None
+    return prompt_id.strip()
 
 
 def _milliseconds(value: object) -> str | None:
@@ -176,6 +188,24 @@ def _error_words(text: str, error: str | None) -> bool:
     return error is not None and "".join(text.split()) == "".join(error.split())
 
 
+def _workbuddy_internal(provider) -> bool:
+    """Whether WorkBuddy marked a user message as its own (a meta note, or the compaction's internal prompt)."""
+    return provider.get("isMeta") is True or provider.get("isCompactInternal") is True
+
+
+def _workbuddy_blocks(content, kind) -> list | None:
+    """A message's text blocks of one kind (a string is one block); None for any other content."""
+    if isinstance(content, str):
+        return [content]
+    if isinstance(content, list):
+        return [
+            block["text"]
+            for block in content
+            if isinstance(block, dict) and block.get("type") == kind and isinstance(block.get("text"), str)
+        ]
+    return None
+
+
 def workbuddy_said(row: object) -> Said | None:
     """What one line of a WorkBuddy session record shows being said, or None for everything else.
 
@@ -190,26 +220,18 @@ def workbuddy_said(row: object) -> Said | None:
     if kind is None or type(entry_id) is not str or not entry_id.strip() or len(entry_id) > 100 or occurred_at is None:
         return None
     provider = row.get("providerData") if isinstance(row.get("providerData"), dict) else {}
-    if role == "user" and (provider.get("isMeta") is True or provider.get("isCompactInternal") is True):
+    if role == "user" and _workbuddy_internal(provider):
         return None
-    content = row.get("content")
-    if isinstance(content, str):
-        blocks = [content]
-    elif isinstance(content, list):
-        blocks = [
-            block["text"]
-            for block in content
-            if isinstance(block, dict) and block.get("type") == kind and isinstance(block.get("text"), str)
-        ]
-    else:
+    blocks = _workbuddy_blocks(row.get("content"), kind)
+    if blocks is None:
         return None
     text = "".join(blocks) if role == "assistant" else workbuddy_record_words("\n".join(blocks))
     if not text.strip() or (role == "user" and is_task_notification(text)):
         return None
     if role == "assistant" and _error_words(text, _workbuddy_error(provider)):
         # An error WorkBuddy showed in place of the model's reply (not signed in, a model or network failure): the
-        # message carries that error and its words are the error's.  The model said nothing (seen 2026-10-04 with
-        # WorkBuddy's agent 2.147.0 not signed in, its notice stored as the reply).
+        # message carries that error and its words are the error's.  The model said nothing (WorkBuddy's agent
+        # 2.147.0, not signed in, writes its notice as the reply).
         return None
     text = without_lone_surrogates(text)
     try:
@@ -397,7 +419,7 @@ def read(
             try:
                 row = json.loads(line)
             except (ValueError, RecursionError):
-                # A line nested past what the parser takes failed every later Stop of the session (review of rc11).
+                # A line nested past what the parser takes would fail every later Stop of the session.
                 row = None
             lines.append((position, rows(row)))
     return lines

@@ -10,14 +10,11 @@ from ..contracts import ClaimProposal, ContractError
 from . import lineage
 from .claim_normalization import PROJECT_TAG, normalize_frame
 from .claims import ClaimVersion, Qualification, RootEvidence, canonical_time, claim_slot, evidence_refs
+from .delete_storage import canonical
 from .visibility import allowed, allowed_refs
 
 if TYPE_CHECKING:
     from .storage import Transaction
-
-
-def _json(value: object) -> str:
-    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
 
 
 def parse_source_ref(value: str) -> tuple[str, int]:
@@ -155,25 +152,7 @@ class Claims:
         ).fetchone()
         if row is None:
             return None
-        return ClaimVersion(
-            row["claim_id"],
-            row["revision"],
-            row["current_revision"],
-            row["scope_id"],
-            row["project_id"],
-            row["branch_id"],
-            json.loads(row["payload_json"]),
-            row["state"],
-            row["basis"],
-            row["qualification_reason"],
-            row["valid_from"],
-            row["valid_to"],
-            row["recorded_from"],
-            row["recorded_to"],
-            row["replaces_revision"],
-            tuple(json.loads(row["conflict_revisions_json"])),
-            bool(row["suppressed"]),
-        )
+        return _claim_version(row)
 
     def current_revision(self, ref: str) -> int | None:
         """Resolve a visible claim head without loading its historical versions."""
@@ -532,7 +511,7 @@ class Claims:
             (
                 ref,
                 revision,
-                _json(proposal),
+                canonical(proposal),
                 qualification.state,
                 qualification.basis,
                 qualification.reason,
@@ -540,7 +519,7 @@ class Claims:
                 canonical_time(proposal["valid_to"]),
                 recorded,
                 previous.current_revision if previous and advance_head else None,
-                _json(conflicts),
+                canonical(conflicts),
             ),
         )
         if previous and advance_head:
@@ -592,7 +571,7 @@ class Claims:
             # The old revision's work is moot, except an embed that has held a lease: its vector may have landed
             # already, and it completes against its own revision, which stays readable, as one done a moment earlier
             # would have.  That includes one sent back to wait after it wrote (a dependency or its deadline moved).
-            # Made obsolete, it left a point in the store no ledger expected (#205; the waiting case: review of 3.7.4).
+            # Made obsolete, it would leave a point in the store no ledger expected.
             conn.execute(
                 """UPDATE work_items SET state='obsolete' WHERE subject_ref=? AND state IN ('pending','leased')
                             AND NOT (work_type='embed' AND lease_token>0)""",
@@ -619,6 +598,22 @@ class Claims:
         self._tx._scope(version.scope_id)
         if (version.project_id, version.branch_id) != (ctx.project_id, ctx.branch_id):
             raise ContractError("ACCESS_DENIED", "claim_context")
+
+    def live_sources(self, refs, scope_id: str) -> list:
+        """The sources ``refs`` cite, each in ``scope_id`` and this context's project and branch and the newest
+        version of its group; SOURCE_MISSING otherwise."""
+        ctx = self._tx.context
+        cited = [self._tx.source(*parse_source_ref(ref)) for ref in refs]
+        sources = [
+            s
+            for s in cited
+            if s is not None and (s.scope_id, s.project_id, s.branch_id) == (scope_id, ctx.project_id, ctx.branch_id)
+        ]
+        if len(sources) != len(cited):
+            raise ContractError("SOURCE_MISSING")
+        for source in sources:
+            self.require_live_source(source.ref, source.revision)
+        return sources
 
     def require_live_source(self, ref: str, revision: int) -> None:
         source = self._tx.source(ref, revision)
@@ -689,7 +684,7 @@ class Claims:
                 source.scope_id,
                 source.project_id,
                 source.branch_id,
-                _json(candidates),
+                canonical(candidates),
                 canonical_time(recorded_at),
             ),
         )

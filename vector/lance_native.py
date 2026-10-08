@@ -33,8 +33,8 @@ def helper_import_roots() -> list[str]:
     """The directories this process imports the helper's dependencies from, in its own ``sys.path`` order.
 
     The helper runs isolated (``-I``) and sees no PYTHONPATH.  Hermes Desktop's package manager boots a bundled
-    CPython and puts the environment it built on PYTHONPATH (#176): the helper died at ``import jsonschema`` before
-    its first answer, and every embed and every vector search failed as ``worker_failed``.  It is handed these
+    CPython and puts the environment it built on PYTHONPATH: without it the helper dies at ``import jsonschema``
+    before its first answer, and every embed and every vector search fails as ``worker_failed``.  It is handed these
     directories and nothing else of this process's path: not its working directory, not a host's source tree, never
     this package's own directory, whose top-level names (``packaging``, ``core``, ``tests``) ``-I`` keeps off the
     path.  ``find_spec`` finds a top-level module without running it.
@@ -72,7 +72,7 @@ def helper_start_failure(timeout: float) -> str | None:
     The helper's own stderr is discarded (``process_store._spawn_helper``), so a helper that ended before its first
     answer left nothing to say why.  This run is sent no request at all and cannot hold memory text, only an import
     or start-up traceback, of which the last 8 KiB are kept.  In UTF-8: an isolated child ignores PYTHONUTF8 and
-    wrote a localized error in the ANSI code page, which read as replacement characters (review of 3.4.10).
+    wrote a localized error in the ANSI code page, which read as replacement characters.
     """
     command = helper_command("--probe")
     command[1:1] = ["-X", "utf8"]
@@ -148,8 +148,7 @@ def native_import_is_safe() -> bool:
             completed = subprocess.run(
                 # The import this process is about to make, with this process's path: only the in-process store
                 # rehearses it (off Windows), and it imports from everywhere this process does.  The isolated
-                # helper's start-up sees only the directories handed to it, and failed layouts this import serves
-                # (review of 3.4.10).
+                # helper's start-up sees only the directories handed to it, and failed layouts this import serves.
                 [sys.executable, "-c", "import lancedb, pyarrow"],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,

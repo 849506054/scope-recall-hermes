@@ -26,8 +26,8 @@ from .installation import (
     InstallationManifest,
     assert_binding_matches_manifest,
     is_archive_scope,
-    load_binding_for_home,
 )
+from .shared_entries import load_binding_for_home
 
 _NON_PRIMARY_CONTEXTS = frozenset({"subagent", "cron", "flush"})
 _UNATTESTED_HUMAN_PLATFORMS = frozenset({"a2a"})
@@ -69,7 +69,7 @@ def _normalize_user_id(
     alternate = str(user_id_alt or "").strip()
     # The host's user_id_alt is another stable id of the same sender in another namespace
     # (Feishu's union_id beside its open_id, Signal's UUID), never a second person, so two
-    # different values are not a conflict (#116).  The principal stays user_id: the audience
+    # different values are not a conflict.  The principal stays user_id: the audience
     # rows and owner principals every earlier release wrote are keyed on it.
     resolved = primary or alternate
     # A session the host names no user for is the owner's on the CLI, and on a
@@ -299,7 +299,7 @@ def _route_matches(row: Mapping[str, object], route: Mapping[str, str]) -> bool:
     The session key is the host's own routing key, built from the platform, chat type and chat
     it names beside it, all of which the row still matches exactly.  Rows the installer and
     most operators write leave it empty, while a gateway sends one on every session, so an
-    exact empty key failed every gateway route closed (#124).  A row that names a key still
+    exact empty key would fail every gateway route closed.  A row that names a key still
     matches only that key.  The CLI sends none, so a CLI row is never relaxed: Hermes reports a
     relayed ``local`` gateway session to plugins as ``cli``, with its key, and that is not the CLI.
     """
@@ -363,7 +363,7 @@ def resolve_runtime_audience(manifest: InstallationManifest, scope: HermesRuntim
         gaps.append("capability_gap:audience_unmapped")
         # A row that differs only in how the plain chat's thread is written: the host sends
         # an empty thread_id for an unthreaded chat, and rows copied from the CLI's "main"
-        # never match it (#124).  Named for the operator to correct; it grants nothing.
+        # never match it.  Named for the operator to correct; it grants nothing.
         near = [
             row
             for row in manifest.audiences
@@ -388,9 +388,8 @@ def resolve_runtime_audience(manifest: InstallationManifest, scope: HermesRuntim
     )
 
 
-def bind_hermes_identity(session_id: str, **kwargs: object) -> HermesIdentity:
-    """Read-only bind from an existing trusted installation manifest and host kwargs."""
-
+def _hermes_home(session_id: object, kwargs: dict) -> Path:
+    """The Hermes home a bind names, absolute, after the session id it binds is checked."""
     if type(session_id) is not str or not session_id.strip() or len(session_id) > 240:
         raise HermesIdentityError("session_id is required")
     raw_home = kwargs.get("hermes_home")
@@ -399,17 +398,11 @@ def bind_hermes_identity(session_id: str, **kwargs: object) -> HermesIdentity:
     hermes_home = Path(str(raw_home)).expanduser().resolve()
     if not hermes_home.is_absolute():
         raise HermesIdentityError("hermes_home must be absolute")
+    return hermes_home
 
-    manifest = load_binding_for_home(hermes_home)
-    db_path = manifest.data_directory / "memory.sqlite3"
-    if not db_path.is_file():
-        raise HermesIdentityError("verified core database is required")
-    if manifest.entry_id is not None and len(manifest.entry_id) + 1 + len(session_id) > 240:
-        raise HermesIdentityError("session_id is required")
 
-    platform = _normalize_platform(kwargs.get("platform"))
-    local_platforms = approved_local_platforms(manifest.owner_principals)
-    user_id = _normalize_user_id(platform, kwargs.get("user_id"), kwargs.get("user_id_alt"), local_platforms)
+def _agent_fields(kwargs: dict, manifest) -> tuple[str, str, str]:
+    """The agent's identity (the installation's own), workspace and context (primary or a supported other)."""
     agent_identity = str(kwargs.get("agent_identity") or "").strip()
     agent_workspace = str(kwargs.get("agent_workspace") or "default").strip() or "default"
     agent_context = str(kwargs.get("agent_context") or "primary").strip() or "primary"
@@ -419,7 +412,11 @@ def bind_hermes_identity(session_id: str, **kwargs: object) -> HermesIdentity:
         raise HermesIdentityError("agent_identity is required")
     if agent_identity != manifest.agent_id:
         raise HermesIdentityError("agent_identity conflict")
+    return agent_identity, agent_workspace, agent_context
 
+
+def _chat_route(platform: str, user_id: str, local_platforms, kwargs: dict) -> tuple[str, str, str]:
+    """The chat type, chat id and thread a bind routes to; a local surface that names no chat gets its default."""
     chat_type = _normalize_chat_type(kwargs.get("chat_type"))
     chat_id = str(kwargs.get("chat_id") or "").strip()
     thread_id = str(kwargs.get("thread_id") or "").strip()
@@ -440,13 +437,32 @@ def bind_hermes_identity(session_id: str, **kwargs: object) -> HermesIdentity:
         if "thread_id" not in kwargs:
             thread_id = "main"
     elif platform in LOCAL_PLATFORMS and user_id != LOCAL_USER_ID and not chat_type and not chat_id:
-        # A dashboard login there names no chat either (#175): one person at
+        # A dashboard login there names no chat either: one person at
         # one window, so a one-to-one chat with that login, routed the way an
         # owner grant is written.  The login is still a user like any other and
         # binds only what an owner principal and an audience row give it.
         chat_type, chat_id = "private", user_id
         if "thread_id" not in kwargs:
             thread_id = "main"
+    return chat_type, chat_id, thread_id
+
+
+def bind_hermes_identity(session_id: str, **kwargs: object) -> HermesIdentity:
+    """Read-only bind from an existing trusted installation manifest and host kwargs."""
+
+    hermes_home = _hermes_home(session_id, kwargs)
+    manifest = load_binding_for_home(hermes_home)
+    db_path = manifest.data_directory / "memory.sqlite3"
+    if not db_path.is_file():
+        raise HermesIdentityError("verified core database is required")
+    if manifest.entry_id is not None and len(manifest.entry_id) + 1 + len(session_id) > 240:
+        raise HermesIdentityError("session_id is required")
+
+    platform = _normalize_platform(kwargs.get("platform"))
+    local_platforms = approved_local_platforms(manifest.owner_principals)
+    user_id = _normalize_user_id(platform, kwargs.get("user_id"), kwargs.get("user_id_alt"), local_platforms)
+    agent_identity, agent_workspace, agent_context = _agent_fields(kwargs, manifest)
+    chat_type, chat_id, thread_id = _chat_route(platform, user_id, local_platforms, kwargs)
     scope = HermesRuntimeScope(
         platform=platform,
         user_id=user_id,

@@ -11,10 +11,10 @@ import base64
 import json
 import math
 from dataclasses import dataclass, replace
-from datetime import datetime, timezone, tzinfo
+from datetime import tzinfo
 from typing import Literal
 
-from ..contracts import ContractError, RecallRequest, TrustedContext, validate_model_request
+from ..contracts import ContractError, RecallRequest, TrustedContext, utc_timestamp, validate_model_request
 from .recall_scope import QueryScope
 
 ObjectKind = Literal["event", "claim", "episode", "artifact", "reference"]
@@ -43,18 +43,6 @@ def optional_json(text: object) -> object:
         return json.loads(text)
     except ValueError:
         return None
-
-
-def _utc(value: str) -> str:
-    if type(value) is not str:
-        raise ContractError("INPUT_INVALID", "timestamp")
-    try:
-        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError as exc:
-        raise ContractError("INPUT_INVALID", "timestamp") from exc
-    if parsed.tzinfo is None or parsed.utcoffset() is None:
-        raise ContractError("INPUT_INVALID", "timestamp")
-    return parsed.astimezone(timezone.utc).isoformat(timespec="microseconds")
 
 
 @dataclass(frozen=True)
@@ -88,6 +76,16 @@ class SearchLimits:
         for name, (value, low, high) in checks.items():
             if type(value) is not int or not low <= value <= high:
                 raise ContractError("INPUT_INVALID", name)
+
+
+def _require_distinct_refs(refs, limit: int, longest: int, field: str) -> None:
+    """A tuple of at most ``limit`` distinct refs, each a string of 1 to ``longest`` characters."""
+    if type(refs) is not tuple or len(refs) > limit:
+        raise ContractError("INPUT_INVALID", field)
+    if any(type(ref) is not str or not 1 <= len(ref) <= longest for ref in refs):
+        raise ContractError("INPUT_INVALID", field)
+    if len(set(refs)) != len(refs):
+        raise ContractError("INPUT_INVALID", field)
 
 
 @dataclass(frozen=True)
@@ -130,26 +128,16 @@ class SearchContext:
         if self.mode == "as_of" and self.as_of is None:
             raise ContractError("INPUT_INVALID", "as_of")
         if self.as_of is not None:
-            object.__setattr__(self, "as_of", _utc(self.as_of))
-        object.__setattr__(self, "now", _utc(self.now))
+            object.__setattr__(self, "as_of", utc_timestamp(self.as_of))
+        object.__setattr__(self, "now", utc_timestamp(self.now))
         if type(self.deadline) not in (int, float) or not math.isfinite(self.deadline):
             raise ContractError("INPUT_INVALID", "deadline")
         if not isinstance(self.limits, SearchLimits):
             raise ContractError("INPUT_INVALID", "limits")
         if not isinstance(self.trusted_context, TrustedContext):
             raise ContractError("IDENTITY_UNBOUND")
-        if type(self.focus_refs) is not tuple or len(self.focus_refs) > 4:
-            raise ContractError("INPUT_INVALID", "focus_refs")
-        if any(type(ref) is not str or not 1 <= len(ref) <= 240 for ref in self.focus_refs):
-            raise ContractError("INPUT_INVALID", "focus_refs")
-        if len(set(self.focus_refs)) != len(self.focus_refs):
-            raise ContractError("INPUT_INVALID", "focus_refs")
-        if type(self.current_source_refs) is not tuple or len(self.current_source_refs) > MAX_CURRENT_SOURCE_REFS:
-            raise ContractError("INPUT_INVALID", "current_source_refs")
-        if any(type(ref) is not str or not 1 <= len(ref) <= 300 for ref in self.current_source_refs):
-            raise ContractError("INPUT_INVALID", "current_source_refs")
-        if len(set(self.current_source_refs)) != len(self.current_source_refs):
-            raise ContractError("INPUT_INVALID", "current_source_refs")
+        _require_distinct_refs(self.focus_refs, 4, 240, "focus_refs")
+        _require_distinct_refs(self.current_source_refs, MAX_CURRENT_SOURCE_REFS, 300, "current_source_refs")
 
     @classmethod
     def from_request(

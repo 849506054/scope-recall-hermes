@@ -42,20 +42,30 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable
 
+from ..._version import __version__
+from ...runtime.instance_config import RESIDENT_RECALL_MINUTES_BOUNDS
+from ...runtime.validation import strict_int
+from ...runtime.worker_launch import detached_creationflags
+from ...vector.process_store import share
+from ..hermes.installation import MANIFEST_FILENAME
+from ..hermes.shared_entries import attachment_path, read_attachment
+from .config import load_shared_client
+from .handler import CodexHookHandler
+
 #: What a hook may send: its payload (a hook's own stdin is at most 64 KiB, and written as ASCII JSON a character
 #: of it takes up to six bytes) and the refs and gaps of its capture.
 MAX_REQUEST_BYTES = 7 * 65536
 #: Seconds a hook waits to connect, and then for the server's proof.  A live server on this machine takes the
-#: connection at once; one that does not prove itself in time loses its name, with time left to try the next (a hung
-#: first name took all of ``FIND_SECONDS``, and kept, it cost every later prompt its wait, reviews of rc11).
+#: connection at once; one that does not prove itself in time loses its name, with time left to try the next: a hung
+#: first name would take all of ``FIND_SECONDS``, and kept, it would cost every later prompt its wait.
 CONNECT_SECONDS = 0.3
 #: A server serving several recalls at once proves itself in 0.15-0.3 s (each hand-over of Python's lock waits for a
-#: timer tick on Windows): at 0.3 s such a server lost its name (review of rc11).
+#: timer tick on Windows): at 0.3 s such a server would lose its name.
 PROOF_SECONDS = 0.5
 #: What a server's check of itself may take to name itself again, by the clock.  Made from inside the busy process, the
 #: check waits for its own share of Python's lock besides the answer, and reads what a hook sees times 1.3-1.9 as a
 #: rule (up to 3.7 under the heaviest load measured).  Held to ``PROOF_SECONDS`` it kept out 14% of the servers hooks
-#: reached in time; at twice, it let back 31% of those they could not; at one and a half, 4% and 10% (reviews of rc11).
+#: reached in time; at twice, it let back 31% of those they could not; at one and a half, 4% and 10%.
 SELF_CHECK_SECONDS = 1.5 * PROOF_SECONDS
 #: Servers a hook tries, newest first, and how long it may spend finding one.
 MAX_TRIED = 2
@@ -67,14 +77,14 @@ ANSWER_MARGIN_SECONDS = 0.3
 WARM_SECONDS = 60.0
 WARM_WAIT_SHARE = 0.5
 #: What a server's start may spend warming its query embedding.  The warming holds the kept handler, and a provider or
-#: proxy that took the connection and hung kept every recall off it for the whole ``WARM_SECONDS`` (review of 3.6.0rc1).
+#: proxy that took the connection and hung would keep every recall off it for the whole ``WARM_SECONDS``.
 EMBEDDING_WARM_SECONDS = 10.0
 #: A kept handler left this long without a recall searches its vector store once more, off any prompt's time, and again
 #: after each such stretch.  The helper keeps the index in its memory, and a search touches the codes of every row its
 #: filter keeps (the warm search filters as a recall does: ``runtime/instance.py warm_vector_store``): left alone, the
-#: OS gave those pages to other work, and the first recall after an idle hour searched past its time.  This machine's
-#: Claude Code lost the vector search on 2 of the 4 prompts it had after an idle hour (2026-10-02), and on none of the 5
-#: it had while another process searched the same index every 10 minutes.
+#: OS gives those pages to other work, and the first recall after an idle hour searches past its time: a Claude Code
+#: client lost the vector search on 2 of 4 prompts after an idle hour, and on none of 5 while another process searched
+#: the same index every 10 minutes.
 KEEP_WARM_IDLE_SECONDS = 600.0
 #: How often a server looks whether its kept handler has been idle that long.
 KEEP_WARM_CHECK_SECONDS = 60.0
@@ -83,12 +93,12 @@ CLOSE_WAIT_SECONDS = 10.0
 #: Recalls one server runs at once; a hook past that recalls itself.
 MAX_CONCURRENT = 8
 #: How often a server looks for its own name, and puts it back when a hook removed it: a busy server that did not
-#: prove itself in time was left out for 30 s (review of rc11).
+#: prove itself in time would otherwise be left out for 30 s.
 ADVERTISE_SECONDS = 2.0
 #: Minutes a client's resident recall server (``resident_entry``) stays up without a recall when the entry's runtime
 #: config names none (``resident_recall_minutes``).  WorkBuddy starts the entry's MCP server with each conversation's
 #: agent process, so a prompt that started one met a server still opening its vector store: a cold server answered
-#: with its vector search 12.7 s after its start (measured 2026-10-03), past the prompt hook's 6 s.  Claude Code and
+#: with its vector search 12.7 s after its start (measured), past the prompt hook's 6 s.  Claude Code and
 #: Codex keep their server for as long as the client runs, and keep none.
 RESIDENT_DEFAULT_MINUTES = {"workbuddy": 120, "dsh": 120}
 #: How often a client starts a resident server when it finds none: a start warms for several seconds, and the next
@@ -153,8 +163,8 @@ class _Handler(BaseHTTPRequestHandler):
         body = self.rfile.read(int(size))
         if endpoint._stuck():
             # A recall is past the time its hook gave it, and what holds it may hold the next: hooks go on at once
-            # until it ends.  Counted 2 s later, a hung server answered, named itself again, and the next prompt
-            # waited on it (review of rc11).
+            # until it ends.  Counted 2 s later, a hung server would answer, name itself again, and make the next
+            # prompt wait on it.
             self._refuse(503)
             return
         if self.path == "/hello":
@@ -181,8 +191,8 @@ class _Handler(BaseHTTPRequestHandler):
             try:
                 answer_body, close = endpoint.recall(request, received=received)
             except Exception as exc:  # noqa: BLE001 - answered as a failed recall; the hook recalls itself
-                # Dropped, the hook took the server for another program and removed its name, which came back and
-                # failed the same way; and the log held only the error's class (review of rc11).
+                # Dropped, the hook would take the server for another program and remove its name, which would come
+                # back and fail the same way; and the log would hold only the error's class.
                 sys.stderr.write(f"SCOPE_RECALL_ENDPOINT:recall_failed\n{traceback.format_exc(limit=-8)}")
                 code = getattr(exc, "code", None)
                 detail = f"{type(exc).__name__}:{code}" if isinstance(code, str) else type(exc).__name__
@@ -292,7 +302,6 @@ class Recaller:
     def __call__(
         self, payload: dict[str, Any], current_refs: tuple[str, ...], gaps: tuple[str, ...], budget: float
     ) -> tuple[dict[str, Any], dict[str, Any]] | None:
-        from ..._version import __version__
         from ...runtime.process_probe import probe_process
 
         started = time.monotonic()
@@ -405,8 +414,6 @@ def file_stamp(*paths: Path | None) -> tuple:
 def entry_files(home: Path | str) -> tuple[Path, ...]:
     """What a shared entry's handler is made from besides its credentials and runtime config: its pointer to the
     store, and the store's record of the entry's grants and binding."""
-    from ..hermes.installation import MANIFEST_FILENAME, attachment_path, read_attachment
-
     files = [attachment_path(Path(home))]
     try:
         attachment = read_attachment(Path(home))
@@ -439,7 +446,7 @@ class KeptRecaller:
 
     A server that made a handler for each recall opened the LanceDB table (about 2.3 s) and started the embedding
     worker and its connection (about 1 s) for every prompt: on the pilot a warm server's recall took 3.9-4.1 s and
-    two of five lost their vector search to the time; with the handler kept, 1.6-2.1 s with it (rc12).  The handler
+    two of five lost their vector search to the time; with the handler kept, 1.6-2.1 s with it.  The handler
     only recalls (``resident_recall_for``), which writes nothing.  One recall uses it at a time: another at the same
     moment gets None, and its caller recalls as it did before.  It is made anew when ``stamp`` changes (the files it
     was made from), after a recall that raised, and while its runtime is not attached from a readable config; the
@@ -486,7 +493,7 @@ class KeptRecaller:
                     except Exception:  # noqa: BLE001 - the first recall opens what is not open, as before
                         pass
                     # The query embedding route too, at the start only: warmed by the store alone, a cold server's
-                    # first recalls lost their vector search to the embedding's time (measured 2026-10-03).
+                    # first recalls lose their vector search to the embedding's time (measured).
                     warm_embedding = getattr(self._handler, "warm_embedding", None)
                     if callable(warm_embedding):
                         try:
@@ -646,8 +653,8 @@ class HookEndpoint:
         self._stopped = threading.Event()
         # A key rotated in the env file is taken up at the next prompt, as a hook of its own would read it, and one
         # taken out of it is taken out here too; so is a key the runtime config comes to name instead.  What cannot be
-        # read now is read at the next prompt: a server whose first read failed, here or at its own start, recalled
-        # by words alone until its client restarted (review of rc11).
+        # read now is read at the next prompt: a server whose first read failed, here or at its own start, would
+        # otherwise recall by words alone until its client restarted.
         self._watched = tuple(path for path in (env_file, runtime_config) if path is not None)
         self._credentials = credentials
         self._env_seen: tuple | None = None
@@ -670,8 +677,6 @@ class HookEndpoint:
         return file_stamp(*self._watched, *entry_files(self.home))
 
     def _handler(self) -> Any:
-        from .handler import CodexHookHandler
-
         return CodexHookHandler.from_home(str(self.home), self.host)
 
     def _refresh_credentials(self) -> None:
@@ -729,7 +734,6 @@ class HookEndpoint:
             return max((now - due for due in self.inflight.values() if now > due), default=0.0)
 
     def _advertise(self) -> None:
-        from ..._version import __version__
         from ...runtime.process_probe import probe_process
 
         folder = self.path.parent
@@ -757,7 +761,7 @@ class HookEndpoint:
             # A hook removed the name of a server that did not prove itself in time.  It names itself again once
             # none of its recalls is stuck and its own check comes back within ``SELF_CHECK_SECONDS``, counted by the
             # clock: from inside the server, the time its own busy threads held Python's lock did not count against
-            # the socket's, and a server hooks could not reach in time named itself again (reviews of rc11).
+            # the socket's, and a server hooks could not reach in time would name itself again.
             if self.path.exists() or self._stuck():
                 continue
             connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=CONNECT_SECONDS)
@@ -777,8 +781,6 @@ class HookEndpoint:
 
     def start(self) -> None:
         if sys.platform == "win32":
-            from ...vector.process_store import share
-
             # Before anything is served: the kept handler, a handler made for a prompt that comes meanwhile and the
             # tools search one store through one helper.
             share()
@@ -850,13 +852,9 @@ def resident_minutes(home: Path | str, host: str) -> int:
 
 def configured_minutes(home: Path | str, host: str, *, missing: int | None = 0) -> int | None:
     """``resident_minutes``, or None when the entry's files cannot be read just now: a file held for a moment, or a
-    runtime config caught half saved.  A running server looks again at its next check instead of ending on it (review
-    2 of 3.6.0rc1).  A missing file is ``missing``: 0 for a start, None for a running server, since an editor that
-    saves by moving files leaves none for a moment (review 3)."""
-    from ...runtime.instance import RESIDENT_RECALL_MINUTES_BOUNDS
-    from ...runtime.validation import strict_int
-    from .config import load_shared_client
-
+    runtime config caught half saved.  A running server looks again at its next check instead of ending on it.  A
+    missing file is ``missing``: 0 for a start, None for a running server, since an editor that saves by moving
+    files leaves none for a moment."""
     try:
         path = load_shared_client(Path(home), host).runtime_config_path
         raw = json.loads(Path(path).read_text(encoding="utf-8"))
@@ -885,8 +883,8 @@ def resident_lock(home: Path | str, host: str) -> Path:
 
 def resident_record(home: Path | str, host: str) -> Path:
     """Where the running resident server keeps its process id, start and version, beside its lock.  A hook removes the
-    name of a server that did not prove itself in time, and ``resident stop`` saw nothing until it named itself again
-    (review of 3.6.0rc1); no hook removes this.  Not a ``.json``: it is not a name hooks ask."""
+    name of a server that did not prove itself in time, and ``resident stop`` saw nothing until it named itself again;
+    no hook removes this.  Not a ``.json``: it is not a name hooks ask."""
     return endpoints(home) / f"resident-{host}.pid"
 
 
@@ -905,8 +903,7 @@ def live_residents(
     A file whose process is gone, or whose process id another process took since, is removed: its start time differs,
     or cannot be read at all where it could when the file was written (a process of another account or a service, as
     a hook's ``Recaller`` reads it).  One written where no start time can be read (macOS) is kept and marked unproven:
-    after a crash its id may belong to any of the user's processes, which a stop must not end (reviews of 3.6.0rc1)."""
-    from ..._version import __version__
+    after a crash its id may belong to any of the user's processes, which a stop must not end."""
     from ...runtime.process_probe import probe_process
 
     said: dict[int, tuple[list[Path], dict[str, Any]]] = {}
@@ -938,7 +935,7 @@ def live_residents(
 
 def resident_running(home: Path | str, host: str) -> bool:
     """Whether a resident server of this entry and client runs, of any version: the lock it holds is held.  A name or
-    a record can outlive its process, or name an id another process took since; a lock cannot (review of 3.6.0rc1)."""
+    a record can outlive its process, or name an id another process took since; a lock cannot."""
     from ...core.file_lock import advisory_file_lock
 
     lock = resident_lock(home, host)
@@ -965,14 +962,13 @@ def ensure_resident(
 
     ``replace`` is the prompt hook's.  Hooks ask only a server of their own version, and one of another version that
     held the entry's lock (an installation in another venv, a canary, a build from before its self-exit) kept every
-    prompt cold for as long as the client ran, while every hook and MCP server marked it in use (review 2 of
-    3.6.0rc1).  None marks it now.  The hook stops one it can prove and end, and starts its own; the version an
-    entry's hooks run then wins, and hooks of two versions against one entry switch it at most once a minute (review
-    3).  A client's MCP server never stops one.  The server is started apart from this process, which the client may
+    prompt cold for as long as the client ran, while every hook and MCP server marked it in use.  None marks it
+    now.  The hook stops one it can prove and end, and starts its own; the version an entry's hooks run then wins,
+    and hooks of two versions against one entry switch it at most once a minute.  A client's MCP server never stops
+    one.  The server is started apart from this process, which the client may
     end at once (WorkBuddy stops a conversation's processes): in a new process group, broken away from the client's job
     where Windows allows it, with no window and no console of its own.  It writes nothing to the store; two started at
     once settle on one."""
-    from ..._version import __version__
     from ...core.file_lock import advisory_file_lock
 
     if minutes <= 0:
@@ -1004,13 +1000,13 @@ def ensure_resident(
     try:
         folder.mkdir(parents=True, exist_ok=True)
         # The look at the stamps, the stop, the removal of a stale stamp and the new one under one lock: two starters
-        # that both found the stamp stale both started a server (review 2 of 3.6.0rc1).
+        # that both found the stamp stale both started a server.
         with advisory_file_lock(folder / f"resident-{host}.start.lock", timeout_seconds=1.0):
             if other is not None:
                 if _recent(switched):
                     return f"running:{other}"
                 # A stop that failed (a server this account may not end) said ``replaced`` at every prompt, and started
-                # one that gave way each time (review 3 of 3.6.0rc1).
+                # one that gave way each time.
                 if not stop_residents(home, host, other_versions=True):
                     return f"unstoppable:{other}"
                 switched.write_text(str(os.getpid()), encoding="ascii")
@@ -1048,8 +1044,8 @@ def ensure_resident(
 
 def _recent(stamp: Path) -> bool:
     """Whether ``stamp`` was written less than ``RESIDENT_START_EVERY_SECONDS`` ago.  One more than that far in the
-    future (a clock set back) is stale, not recent: it held off every start until the clock passed it (review of
-    3.6.0rc1); one just written can read a little ahead."""
+    future (a clock set back) is stale, not recent: it would hold off every start until the clock passed it; one
+    just written can read a little ahead."""
     try:
         age = time.time() - stamp.stat().st_mtime
     except FileNotFoundError:
@@ -1060,7 +1056,7 @@ def _recent(stamp: Path) -> bool:
 def package_upgrading() -> bool:
     """Whether ``package-upgrade`` is replacing this environment's package now (its lock in the venv is held): a server
     started meanwhile could import part of either version, and once the new ``_version.py`` was in place it would not
-    end (review 2 of 3.6.0rc1).  The client should be quit for an upgrade; its MCP servers' keeping made this
+    end.  The client should be quit for an upgrade; its MCP servers' keeping made this
     reachable without a prompt."""
     from ...core.file_lock import advisory_file_lock
 
@@ -1083,7 +1079,7 @@ def keep_resident(
     (``RESIDENT_KEEP_SECONDS``), in a daemon thread; set the event returned to stop.  The resident server then ends
     ``resident_recall_minutes`` after the client's last process, not its last prompt: WorkBuddy keeps a conversation's
     process long after its prompts, and a resident that ended meanwhile left that conversation's next prompt colder
-    than the conversation's own server had kept it (review of 3.6.0rc1).  The minutes are read each time, so at 0 this
+    than the conversation's own server had kept it.  The minutes are read each time, so at 0 this
     starts none.  Nothing it meets ends the MCP server, which serves its tools whatever this does."""
     stopped = threading.Event()
     every = RESIDENT_KEEP_SECONDS if every is None else every
@@ -1106,8 +1102,6 @@ def keep_resident(
 def start_detached(command: list[str], *, cwd: Path) -> bool:
     """Start ``command`` so that it outlives this process and its parent's job; whether it started."""
     import subprocess
-
-    from ...runtime.worker_launch import detached_creationflags
 
     quiet = {
         "stdin": subprocess.DEVNULL,
@@ -1142,8 +1136,6 @@ def stop_residents(home: Path | str, host: str, *, other_versions: bool = False)
     One whose identity is not proven (``live_residents``) is never signalled: it ends itself once its package is
     replaced or its minutes are 0.  Returns the process ids stopped."""
     import signal
-
-    from ..._version import __version__
 
     stopped = []
     for paths, info, proven in live_residents(home, host, any_version=True):

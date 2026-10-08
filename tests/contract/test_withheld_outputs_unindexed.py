@@ -18,7 +18,7 @@ from scope_recall.contracts import ContractError
 from scope_recall.core import lexical_index
 from scope_recall.core.events import lexical_terms, query_terms
 from scope_recall.core.retrieval_storage import _discriminating_terms
-from test_v11_recall_admission import _app, _capture, _item_ref, recall
+from test_recall_admission import _app, _capture, _item_ref, recall
 
 #: The tool's own error text, the one part of a placeholder that is the output's (4,348 of the shared store's).
 _ERROR = "TEST-deploy 权限不足，配置文件不可写: permission denied"
@@ -76,8 +76,8 @@ def test_a_placeholder_is_kept_and_not_indexed(tmp_path):
     assert _postings(core, placeholder.ref) == 0
     assert _postings(core, output.ref) > 0, "a tool output keeps its words"
     with core.storage.read(ctx) as tx:
-        assert tx.source_projection_status(placeholder.ref, 1)[0] == "ready", "no terms is all it should hold"
-        assert tx.source_projection_status(output.ref, 1)[0] == "ready"
+        assert tx.sources.source_projection_status(placeholder.ref, 1)[0] == "ready", "no terms is all it should hold"
+        assert tx.sources.source_projection_status(output.ref, 1)[0] == "ready"
 
 
 def test_a_placeholder_is_found_by_its_error_text_alone(tmp_path):
@@ -87,7 +87,7 @@ def test_a_placeholder_is_found_by_its_error_text_alone(tmp_path):
     assert _terms(core, placeholder.ref) == set(lexical_terms(_ERROR))
     assert not {"tool", "terminal", "status", "patch", "output_preview"} & _terms(core, placeholder.ref)
     with core.storage.read(ctx) as tx:
-        assert tx.source_projection_status(placeholder.ref, 1)[0] == "ready"
+        assert tx.sources.source_projection_status(placeholder.ref, 1)[0] == "ready"
     reader = replace(ctx, session_id="TEST-reader")
     refs = [_item_ref(item) for item in recall(core, reader, query="TEST-deploy 配置文件不可写", mode="current").items]
     assert placeholder.ref in refs, refs
@@ -100,8 +100,8 @@ def test_indexing_a_placeholder_again_drops_what_an_older_release_gave_it(tmp_pa
     (errored,) = _withheld(core, ctx, 1, error=_ERROR, key="TEST-errored")
     assert _terms(core, errored.ref) > set(lexical_terms(_ERROR))
     with core.storage.write(ctx, remaining_seconds=10) as tx:
-        tx.index_source(placeholder.ref, 1)
-        tx.index_source(errored.ref, 1)
+        tx.sources.index_source(placeholder.ref, 1)
+        tx.sources.index_source(errored.ref, 1)
     assert _postings(core, placeholder.ref) == 0
     assert _terms(core, errored.ref) == set(lexical_terms(_ERROR)), "its error text stays, the envelope goes"
 
@@ -145,22 +145,22 @@ def test_unindexing_goes_a_bounded_page_at_a_time_and_previews_first(tmp_path):
     assert _postings(core, near.ref) > 0
     held = sum(_postings(core, source.ref) for source in placeholders)
 
-    preview = core.unindex_withheld_outputs(ctx, limit=10)
+    preview = core.operations.unindex_withheld_outputs(ctx, limit=10)
     assert (preview["dry_run"], preview["sources"], preview["postings"], preview["more"]) == (True, 5, held, False)
     assert sum(_postings(core, source.ref) for source in placeholders) == held, "a preview changes nothing"
 
-    first = core.unindex_withheld_outputs(ctx, limit=2, dry_run=False)
+    first = core.operations.unindex_withheld_outputs(ctx, limit=2, dry_run=False)
     assert (first["dry_run"], first["sources"], first["more"]) == (False, 2, True)
-    rest = core.unindex_withheld_outputs(ctx, after_id=first["next_after_id"], limit=10, dry_run=False)
+    rest = core.operations.unindex_withheld_outputs(ctx, after_id=first["next_after_id"], limit=10, dry_run=False)
     assert (rest["sources"], rest["more"]) == (3, False)
     assert first["postings"] + rest["postings"] == held
     assert all(_postings(core, source.ref) == 0 for source in placeholders)
     assert all(_postings(core, source.ref) > 0 for source in (output, said, near)), "only the placeholders lose words"
-    again = core.unindex_withheld_outputs(ctx, limit=10, dry_run=False)
+    again = core.operations.unindex_withheld_outputs(ctx, limit=10, dry_run=False)
     assert (again["sources"], again["postings"], again["more"]) == (0, 0, False), "a second run finds nothing"
     for bad in ({"limit": 0}, {"limit": lexical_index.WITHHELD_PAGE_MAX + 1}, {"after_id": -1}):
         with pytest.raises(ContractError):
-            core.unindex_withheld_outputs(ctx, **bad)
+            core.operations.unindex_withheld_outputs(ctx, **bad)
 
 
 def test_unindexing_keeps_a_placeholder_s_error_text(tmp_path):
@@ -168,12 +168,12 @@ def test_unindexing_keeps_a_placeholder_s_error_text(tmp_path):
     errored = _withheld(core, ctx, 2, error=_ERROR, key="TEST-errored")
     held = sum(_postings(core, source.ref) for source in errored)
     kept = len(set(lexical_terms(_ERROR)))
-    preview = core.unindex_withheld_outputs(ctx, limit=10)
+    preview = core.operations.unindex_withheld_outputs(ctx, limit=10)
     assert (preview["sources"], preview["postings"]) == (2, held - 2 * kept)
-    page = core.unindex_withheld_outputs(ctx, limit=10, dry_run=False)
+    page = core.operations.unindex_withheld_outputs(ctx, limit=10, dry_run=False)
     assert (page["sources"], page["postings"], page["more"]) == (2, held - 2 * kept, False)
     assert all(_terms(core, source.ref) == set(lexical_terms(_ERROR)) for source in errored)
-    again = core.unindex_withheld_outputs(ctx, limit=10, dry_run=False)
+    again = core.operations.unindex_withheld_outputs(ctx, limit=10, dry_run=False)
     assert (again["sources"], again["postings"]) == (0, 0), "a placeholder holding only its error text is done"
 
 
@@ -186,14 +186,14 @@ def test_the_command_finds_a_placeholder_its_pattern_finds_whatever_leads_it(tmp
     with closing(sqlite3.connect(core.storage.path)) as conn, conn:
         ((source_id,),) = conn.execute("SELECT source_id FROM source_events WHERE event_id=?", (led.ref,))
         lexical_index.index_terms(conn, source_id, lexical_terms(led.event["content"]))
-    page = core.unindex_withheld_outputs(ctx, limit=10, dry_run=False)
+    page = core.operations.unindex_withheld_outputs(ctx, limit=10, dry_run=False)
     assert page["sources"] == 1 and _postings(core, led.ref) == 0
 
 
 def test_unindexing_stays_inside_the_context_s_scopes(tmp_path):
     from scope_recall.contracts import InstanceBinding, TrustedContext
     from scope_recall.core import CoreConfig, MemoryCore
-    from test_v11_recall_admission import FixedClock
+    from test_recall_admission import FixedClock
     from v11_support import source_event
 
     scopes = frozenset({"TEST-scope", "TEST-other"})
@@ -212,7 +212,7 @@ def test_unindexing_stays_inside_the_context_s_scopes(tmp_path):
         for ref in refs.values():
             ((source_id,),) = conn.execute("SELECT source_id FROM source_events WHERE event_id=?", (ref,))
             lexical_index.index_terms(conn, source_id, lexical_terms(_placeholder(0)))
-    page = core.unindex_withheld_outputs(
+    page = core.operations.unindex_withheld_outputs(
         replace(ctx, allowed_scope_ids=frozenset({"TEST-scope"})), limit=10, dry_run=False
     )
     assert page["sources"] == 1
@@ -234,10 +234,13 @@ def test_the_command_goes_on_page_after_page_only_when_asked(monkeypatch, capsys
     )
     asked = []
 
-    class Core:
+    class Operations:
         def unindex_withheld_outputs(self, context, **kwargs):
             asked.append(kwargs)
             return {"dry_run": kwargs["dry_run"], **next(pages)}
+
+    class Core:
+        operations = Operations()
 
     config = SimpleNamespace(context=lambda: "TEST-context", request_seconds=5.0)
     paused = []
@@ -275,7 +278,7 @@ def test_the_envelope_s_words_reach_questions_again(tmp_path):
     terms = query_terms("部署记录 patch")
     with core.storage.read(ctx) as tx:
         assert "patch" not in _discriminating_terms(tx, terms)
-    core.unindex_withheld_outputs(ctx, limit=100, dry_run=False)
+    core.operations.unindex_withheld_outputs(ctx, limit=100, dry_run=False)
     with core.storage.read(ctx) as tx:
         assert "patch" in _discriminating_terms(tx, terms)
     reader = replace(ctx, session_id="TEST-reader")

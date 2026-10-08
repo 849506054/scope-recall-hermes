@@ -109,6 +109,17 @@ def extract_user_text(value: object) -> str:
     return ""
 
 
+def _opening_key(context: TrustedContext, session_id: str, turn_id: str) -> str:
+    """The host key of a turn's opening message, the same whether ``pre_llm_call`` or the turn's sync stores it."""
+    return host_source_key(
+        installation_id=context.binding.installation_id,
+        entry_id=context.entry_id,
+        session_id=session_id,
+        event_kind="user",
+        event_id=turn_id or "turn",
+    )
+
+
 def pre_llm_source_event(
     ledger: SourceObservationLedger,
     context: TrustedContext,
@@ -132,13 +143,7 @@ def pre_llm_source_event(
     if not content.strip() and not artifact_refs:
         return None, tuple(gaps), None
     return ledger.observe(
-        source_event_key=host_source_key(
-            installation_id=context.binding.installation_id,
-            entry_id=context.entry_id,
-            session_id=session_id,
-            event_kind="user",
-            event_id=turn_id or "turn",
-        ),
+        source_event_key=_opening_key(context, session_id, turn_id),
         source_revision=1,
         role="user",
         content=content,
@@ -170,13 +175,7 @@ def sync_turn_source_events(
     events: list[tuple[SourceEvent, SourceIdentity | None]] = []
     if include_user:
         user_event, user_gaps, user_identity = ledger.observe(
-            source_event_key=host_source_key(
-                installation_id=context.binding.installation_id,
-                entry_id=context.entry_id,
-                session_id=session_id,
-                event_kind="user",
-                event_id=turn_id or "turn",
-            ),
+            source_event_key=_opening_key(context, session_id, turn_id),
             source_revision=1,
             role="user",
             content=user_content,
@@ -338,15 +337,15 @@ def host_notice(history: object, user_message: object) -> bool:
     text and the message carries a notice's kind.  A to-do list a compression adds after the turn's message has no
     words of its own (``agent.turn_context.reanchor_current_turn_user_idx``).  The latest only: when Hermes put a note
     of its own before the person's message (a model switch, a timestamp), an unanswered notice with the same words
-    took theirs, and so did an older folded one (reviews of 3.7.3).  A request Hermes restores after a notice
+    took theirs, and so did an older folded one.  A request Hermes restores after a notice
     decides in its place, and the notice stays the person's: the safe side.
 
     Past the last reply the message must be one Hermes folded and marked.  A compression at the turn's start can
     fold its summary into the turn's own message (``ContextCompressor._merge_summary_into_tail_row``) and put the
-    reply it folded away after it (``_reply_insertion_index``): one of tianshu's three delegation results on
-    2026-10-05 was stored as the owner's that way.  Anything else before the last reply belongs to an earlier turn.
-    Its own words only: a summary quotes the person's messages word for word, and a message merely holding the
-    turn's text took the person's words for a notice (review of 3.7.3).
+    reply it folded away after it (``_reply_insertion_index``), and a delegation result would be stored as the
+    person's that way.  Anything else before the last reply belongs to an earlier turn.  Its own words only: a
+    summary quotes the person's messages word for word, and a message merely holding the turn's text would take the
+    person's words for a notice.
     """
     text = extract_user_text(user_message).strip()
     if not isinstance(history, list) or not text:

@@ -20,13 +20,13 @@ import pytest
 from scope_recall.core import worker as worker_module
 from scope_recall.core.candidate_debounce import MAX_DEFERRAL_SECONDS, QUIET_SECONDS, settle_reason, settles_at
 from scope_recall.core.claims import Qualification
-from scope_recall.maintenance import doctor
+from scope_recall.maintenance import doctor, doctor_store
 from scope_recall.runtime import scheduling
-from scope_recall.runtime.instance import RuntimeInstanceConfig
+from scope_recall.runtime.instance_config import RuntimeInstanceConfig
 from scope_recall.runtime.scheduling import SupervisorControl, next_wake, supervise
 from scope_recall.runtime.worker_entry import _receipt_payload
-from test_r1_candidate_lifecycle import Evaluator, ModelRefusal, _candidate, _finish_source_work
-from test_v11_claims import app, capture  # noqa: F401  (app is a fixture)
+from test_candidate_lifecycle import Evaluator, ModelRefusal, _candidate, _finish_source_work
+from test_claims import app, capture  # noqa: F401  (app is a fixture)
 
 EVIDENCE = datetime(2026, 9, 6, 12, 0, tzinfo=timezone.utc)  # the claims fixture's clock
 EVERY_TYPE = {"purge", "rebuild_projection", "consolidate", "evaluate_candidate", "embed"}
@@ -351,7 +351,9 @@ def test_the_doctor_names_work_and_candidates_that_waited_a_day(app, monkeypatch
         conn.commit()
     result = doctor.run_doctor(host="hermes", instance_root=ctx.binding.data_directory)
     assert {row["project_id"]: row["work"] for row in result.unreached}.get("TEST-third-project") == 1
-    monkeypatch.setattr(doctor, "provider_holds", lambda auxiliary, now=None: {"rebuild_projection": ("TEST", 0.0)})
+    monkeypatch.setattr(
+        doctor_store, "provider_holds", lambda auxiliary, now=None: {"rebuild_projection": ("TEST", 0.0)}
+    )
     result = doctor.run_doctor(host="hermes", instance_root=ctx.binding.data_directory)
     assert {row["project_id"] for row in result.unreached} == {"TEST-project"}
     monkeypatch.undo()

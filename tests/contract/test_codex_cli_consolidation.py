@@ -18,7 +18,8 @@ import pytest
 from scope_recall.contracts import InstanceBinding
 from scope_recall.runtime import codex_cli as cli
 from scope_recall.runtime.auxiliary import AuxiliaryRuntimeConfig, build_auxiliary_runtime
-from scope_recall.runtime.instance import RuntimeInstanceConfig, build_runtime_instance
+from scope_recall.runtime.instance import build_runtime_instance
+from scope_recall.runtime.instance_config import RuntimeInstanceConfig
 from scope_recall.runtime.model_budget import (
     default_budget_policy,
     initialize_auxiliary_budget_ledger,
@@ -368,3 +369,28 @@ def test_native_cli_wire_has_zero_tools(tmp_path, monkeypatch):
         server.shutdown()
         server.server_close()
         thread.join(timeout=2)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="the taskkill fallback runs on Windows only")
+def test_the_fallback_kill_starts_taskkill_without_a_console_window(monkeypatch):
+    """Without a job object the Codex route ends a timed-out call's tree with ``taskkill``, from a windowless worker:
+    it must not get a console window of its own (#222)."""
+
+    class _Running:
+        pid = 4321
+
+        @staticmethod
+        def poll():
+            return None
+
+        @staticmethod
+        def wait(timeout=None):
+            return None
+
+    calls = []
+    monkeypatch.setattr(cli.subprocess, "run", lambda *args, **kwargs: calls.append((args, kwargs)))
+    cli._kill_tree(_Running(), None)
+    assert calls, "taskkill was not run"
+    args, kwargs = calls[0]
+    assert Path(args[0][0]).name.lower() == "taskkill.exe"
+    assert kwargs["creationflags"] & subprocess.CREATE_NO_WINDOW

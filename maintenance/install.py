@@ -202,10 +202,10 @@ def plan_install(
             if norm not in owned:
                 plan.conflicts.append(f"no-receipt collision: {path}")
             elif sha256(path) != owned[norm]:
-                # A Hermes agent keeps what it learns in its skills, and edited its memory skill between two
-                # releases that left that skill as it was: the upgrade stopped before its apply, which left the new
-                # package under the old wrapper and receipt (one agent, 2026-09-29).  A skill file whose packaged copy
-                # is the one installed before keeps the agent's edit; one the package changed is a conflict.
+                # A Hermes agent keeps what it learns in its skills, and may edit its memory skill between two
+                # releases that leave that skill as it was: refused, the upgrade would stop before its apply, leaving
+                # the new package under the old wrapper and receipt.  A skill file whose packaged copy is the one
+                # installed before keeps the agent's edit; one the package changed is a conflict.
                 if path.name.lower() == "skill.md" and _written_digest(planned[path]) == owned[norm]:
                     plan.kept[norm] = owned[norm]
                     plan.changes.append(
@@ -360,7 +360,7 @@ def apply_install(plan: InstallPlan) -> InstallResult:
         raise
 
     # A resident recall server runs the package it was started from: one of the installation this replaces (another
-    # venv, an older version) held the entry's lock against the new one's (review 2 of 3.6.0rc1).  The next prompt or
+    # venv, an older version) held the entry's lock against the new one's.  The next prompt or
     # conversation starts the new version's.
     _stop_residents(plan.host, plan.instance_root)
     return InstallResult(

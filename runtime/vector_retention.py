@@ -4,9 +4,9 @@ Sits beside ``vector_upkeep.py``: ``runtime/instance.py`` has the single call
 site, at the start of a drain, just before the compaction that reclaims what
 a pass deleted.  The source text, its lexical index and everything derived
 from it (claims, episodes, candidates) stay; only the vector goes.  An expired
-tool output is still found by its words and through whatever cites it, never
+tool output is still recalled by its words and through whatever cites it, never
 again by meaning alone.  (A withheld output's placeholder has no words of its
-own to be found by: ``core/events.indexed_terms``.)
+own to be recalled by: ``core/events.indexed_terms``.)
 
 Why tool outputs, and why a window: on a busy instance four in five captured
 sources were tool output, each carrying a 12 KB vector -- the bulk of the
@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from ..core.events import WITHHELD_TOOL_OUTPUT_SQL
+from ..vector.compaction import parse_time
 from .validation import utc_now
 
 #: Seconds of the drain budget set aside for one pass; below it the pass waits.
@@ -95,7 +96,7 @@ def pass_due(state: dict[str, Any], days: int, *, now: datetime) -> bool:
     """A pass is due at once after a backlog or a changed window, else hourly."""
     if state.get("retention_days") != days or state.get("backlog"):
         return True
-    last = _parse_time(state.get("finished_at"))
+    last = parse_time(state.get("finished_at"))
     return last is None or now - last >= PASS_INTERVAL
 
 
@@ -196,16 +197,6 @@ def write_state(storage_dir: Path, payload: dict[str, Any]) -> None:
 def _stamp(moment: datetime) -> str:
     """The ``Z``-suffixed form every worker receipt carries (``validation.utc_now``)."""
     return moment.isoformat().replace("+00:00", "Z")
-
-
-def _parse_time(value: Any) -> datetime | None:
-    if not isinstance(value, str) or not value.strip():
-        return None
-    try:
-        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError:
-        return None
-    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
 
 
 __all__ = ["BATCH_LIMIT", "PASS_INTERVAL", "RESERVE_SECONDS", "expire_if_due", "expire_tool_vectors", "pass_due"]

@@ -32,16 +32,18 @@ from typing import Any
 
 from ..adapters.clients.config import CONFIG_FILENAME as CODEX_CONFIG_FILENAME
 from ..adapters.hermes.installation import (
-    CLIENT_HOSTS,
-    ENTRY_HOSTS,
     MANIFEST_FILENAME,
     HermesIdentityError,
+    build_installation_manifest,
+    load_archived_installation,
+)
+from ..adapters.hermes.shared_entries import (
+    CLIENT_HOSTS,
+    ENTRY_HOSTS,
     attach_shared_entry,
     attach_shared_record,
     attachment_path,
-    build_installation_manifest,
     client_entry_record,
-    load_archived_installation,
     new_shared_payload,
     read_attachment,
     read_shared_payload,
@@ -51,7 +53,7 @@ from ..adapters.hermes.installation import (
 from ..contracts import ContractError, InstanceBinding, TrustedContext
 from ..core.storage import SQLiteStorage
 from ..runtime.auxiliary import DEFAULT_LEDGER_NAME
-from ..runtime.instance import RuntimeInstanceConfig
+from ..runtime.instance_config import RuntimeInstanceConfig
 from ..runtime.model_budget import initialize_auxiliary_budget_ledger
 from ..runtime.worker_launch import RUNTIME_CONFIG_FILENAME
 from .install_common import RUNTIME_CONFIG_LIMIT
@@ -152,8 +154,8 @@ def _entry_config(
     """An entry's config: its model routes, bound to its scopes, searching the store's vector table.
 
     The table is the worker's: the routes may come from a store that named its
-    table otherwise, and a query then searches a table the worker never fills
-    (one agent's did, from its own 3.1 store, 2026-09-24).  The spend ledger lives
+    table otherwise (a store of an older release can), and a query would then search a
+    table the worker never fills.  The spend ledger lives
     beside the entry's pointer, where ``detach`` takes it from.  A client's routes
     come from another home, so the names its runtime reports are made its own.
     """
@@ -505,7 +507,7 @@ def entries(*, root: Path) -> dict[str, Any]:
             with SQLiteStorage(binding).read(
                 TrustedContext(binding, "shared-store-entries", binding.scope_ids, "host_generated")
             ) as tx:
-                seen = tx.entries()
+                seen = tx.registry.entries()
             store = "ok"
         except ContractError as exc:
             store = f"{exc.code}:{exc.field}"

@@ -17,9 +17,7 @@ from scope_recall.adapters.hermes.installation import (
     approve_local_platforms as _approve_local_platforms,
 )
 from scope_recall.adapters.hermes.installation import (
-    attachment_path,
     install_hermes_scope_recall,
-    load_binding_for_home,
     load_installation_manifest,
     write_installation_manifest,
 )
@@ -29,6 +27,7 @@ from scope_recall.adapters.hermes.installation import (
 from scope_recall.adapters.hermes.installation import (
     unapproved_owner_logins as _unapproved_owner_logins,
 )
+from scope_recall.adapters.hermes.shared_entries import attachment_path, load_binding_for_home
 
 from .install_common import (
     REPO_ROOT,
@@ -65,7 +64,7 @@ def home_plugin_dir(instance_root: Path) -> Path:
 
     Hermes reads a provider's ``plugin.yaml``, and with it the core the wrapper declares, from
     ``<home>/plugins/<name>/`` or from the installed core's own directory.  Once the environment Hermes runs
-    has lost the core, only this one is left (#135).
+    has lost the core, only this one is left.
     """
     return instance_root / "plugins" / "scope-recall"
 
@@ -100,7 +99,7 @@ def validate_local_platforms(values: object) -> tuple[str, ...]:
 
 def validate_owner_logins(values: object) -> tuple[str, ...]:
     """Dashboard logins approved as the owner's own, each ``<platform>=<login>`` on one local surface.
-    The host passes a login there as the session's user, so it is never the local owner (#175)."""
+    The host passes a login there as the session's user, so it is never the local owner."""
     try:
         return tuple(f"{platform}={login}" for platform, login in normalize_owner_logins(list(values or ())))
     except (HermesIdentityError, TypeError) as exc:
@@ -111,7 +110,7 @@ def wrapper_manifest(template: str, version: str = __version__) -> str:
     """The wrapper's ``plugin.yaml``: the template, plus the core it runs on when that is a release on PyPI.
 
     Hermes Desktop rebuilds the Python environment it runs plugins in on updates, dropping a core installed
-    there by hand (#135), and Hermes installs what a memory provider's manifest declares
+    there by hand, and Hermes installs what a memory provider's manifest declares
     (``pip_dependencies``) when the provider is set up; it reads the manifest from ``home_plugin_dir`` once
     the core is gone.  The pin is exact, as the wrapper and the core are one release.  A
     pre-release, development or local build is not on PyPI, and a requirement that cannot be resolved fails
