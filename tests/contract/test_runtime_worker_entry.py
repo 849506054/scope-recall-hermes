@@ -1,25 +1,26 @@
 """Bounded runtime worker tests over isolated SQLite and a real subprocess."""
+
 from __future__ import annotations
 
 import json
 import os
-from pathlib import Path
 import sqlite3
 import time
 from dataclasses import replace
-import pytest
+from pathlib import Path
 
+import pytest
 from scope_recall.contracts import ContractError, InstanceBinding, TrustedContext
 from scope_recall.core import CoreConfig, MemoryCore
+from scope_recall.core.retrieval import SearchContext, SearchLimits
+from scope_recall.runtime.auxiliary import AuxiliaryRuntimeConfig
 from scope_recall.runtime.instance import (
-    VectorRuntimeConfig,
     RuntimeInstanceConfig,
+    VectorRuntimeConfig,
     build_runtime_instance,
     default_vector_factory,
 )
-from scope_recall.runtime.auxiliary import AuxiliaryRuntimeConfig
 from scope_recall.runtime.worker_launch import launch_worker
-from scope_recall.core.retrieval import SearchContext, SearchLimits
 from v11_support import source_event
 
 
@@ -68,17 +69,23 @@ def _write_config(path: Path, payload: dict) -> Path:
 @pytest.mark.skipif(os.name != "nt", reason="Windows native path boundary")
 def test_worker_reports_native_path_gap_without_starting_helper(tmp_path, monkeypatch):
     from io import StringIO
-    from scope_recall.core.recall_policy import SPACE_ID
+
     import scope_recall.vector.process_store as native_store
+    from scope_recall.core.recall_policy import SPACE_ID
     from scope_recall.runtime.worker_entry import run_worker
 
     binding = _binding(tmp_path / "data")
     binding.data_directory.mkdir()
     vector_root = binding.data_directory / "vectors" / SPACE_ID
-    payload = _config_payload(binding, vector={
-        "backend": "lancedb", "storage_dir": str(vector_root),
-        "table_name": "TEST-" + "x" * 150, "dimensions": 3072,
-    })
+    payload = _config_payload(
+        binding,
+        vector={
+            "backend": "lancedb",
+            "storage_dir": str(vector_root),
+            "table_name": "TEST-" + "x" * 150,
+            "dimensions": 3072,
+        },
+    )
     config = _write_config(tmp_path / "worker.json", payload)
     calls = []
 
@@ -117,9 +124,7 @@ def test_runtime_construction_is_pure_and_vector_opens_only_on_demand(tmp_path):
         binding=binding,
         session_id="query-session",
         allowed_scope_ids=binding.scope_ids,
-        auxiliary=AuxiliaryRuntimeConfig.from_mapping(
-            {"external_embedding": False, "external_consolidation": False}
-        ),
+        auxiliary=AuxiliaryRuntimeConfig.from_mapping({"external_embedding": False, "external_consolidation": False}),
         vector=VectorRuntimeConfig(
             backend="sqlite-bruteforce",
             storage_dir=tmp_path / "vectors",
@@ -138,7 +143,7 @@ def test_runtime_construction_is_pure_and_vector_opens_only_on_demand(tmp_path):
             calls.append("search")
             return ()
 
-    instance = build_runtime_instance(config, vector_factory=lambda _: (calls.append("build") or Vectors()))
+    instance = build_runtime_instance(config, vector_factory=lambda _: calls.append("build") or Vectors())
     assert calls == []
     instance.core.initialize()
     instance.status()
@@ -167,9 +172,7 @@ def test_existing_store_is_composed_with_trusted_lance_ports_on_demand(tmp_path)
         binding=binding,
         session_id="query-session",
         allowed_scope_ids=binding.scope_ids,
-        auxiliary=AuxiliaryRuntimeConfig.from_mapping(
-            {"external_embedding": False, "external_consolidation": False}
-        ),
+        auxiliary=AuxiliaryRuntimeConfig.from_mapping({"external_embedding": False, "external_consolidation": False}),
         vector=VectorRuntimeConfig(
             backend="lancedb",
             storage_dir=tmp_path / "vectors",
@@ -227,9 +230,7 @@ def test_lazy_vector_facade_opens_existing_store_for_each_core_search_context(tm
         binding=binding,
         session_id="construction-session",
         allowed_scope_ids=binding.scope_ids,
-        auxiliary=AuxiliaryRuntimeConfig.from_mapping(
-            {"external_embedding": False, "external_consolidation": False}
-        ),
+        auxiliary=AuxiliaryRuntimeConfig.from_mapping({"external_embedding": False, "external_consolidation": False}),
         vector=VectorRuntimeConfig(
             backend="lancedb",
             storage_dir=tmp_path / "vectors",
@@ -301,9 +302,7 @@ def test_a_store_open_that_uses_up_the_recall_s_time_is_a_gap_not_an_empty_searc
         binding=binding,
         session_id="construction-session",
         allowed_scope_ids=binding.scope_ids,
-        auxiliary=AuxiliaryRuntimeConfig.from_mapping(
-            {"external_embedding": False, "external_consolidation": False}
-        ),
+        auxiliary=AuxiliaryRuntimeConfig.from_mapping({"external_embedding": False, "external_consolidation": False}),
         vector=VectorRuntimeConfig(
             backend="lancedb",
             storage_dir=tmp_path / "vectors",
@@ -358,8 +357,13 @@ def _vector_instance(tmp_path, store, embedding):
         session_id="construction-session",
         allowed_scope_ids=binding.scope_ids,
         auxiliary=AuxiliaryRuntimeConfig.from_mapping({"external_embedding": False, "external_consolidation": False}),
-        vector=VectorRuntimeConfig(backend="lancedb", storage_dir=tmp_path / "vectors", table_name="TEST-vectors",
-                                   dimensions=2, test_injection_override=True),
+        vector=VectorRuntimeConfig(
+            backend="lancedb",
+            storage_dir=tmp_path / "vectors",
+            table_name="TEST-vectors",
+            dimensions=2,
+            test_injection_override=True,
+        ),
     )
     instance = build_runtime_instance(config, vector_factory=lambda _: store)
     instance.auxiliary = replace(instance.auxiliary, query_embedding=embedding)
@@ -368,9 +372,16 @@ def _vector_instance(tmp_path, store, embedding):
 
 
 def _search_context(binding, seconds):
-    return SearchContext(query="TEST query", mode="auto", as_of=None, focus_refs=(), limits=SearchLimits(),
-                         deadline=time.monotonic() + seconds, now="2026-09-29T12:00:00Z",
-                         trusted_context=_context(binding, "TEST-vector-session"))
+    return SearchContext(
+        query="TEST query",
+        mode="auto",
+        as_of=None,
+        focus_refs=(),
+        limits=SearchLimits(),
+        deadline=time.monotonic() + seconds,
+        now="2026-09-29T12:00:00Z",
+        trusted_context=_context(binding, "TEST-vector-session"),
+    )
 
 
 class _ScopedStore:
@@ -394,8 +405,8 @@ def test_a_recall_asks_for_its_query_embedding_before_the_sqlite_channels(tmp_pa
     """Asked for after the SQLite channels, the query embedding had three quarters of what they left: on 2026-09-29
     the work computer's server recalled 4 of 9 prompts by words alone that way (AuxiliaryModelError:timeout).  Asked
     for as the recall starts, it runs beside them: here they take 0.8 s of a 1.2 s window, and it takes 0.4 s."""
-    from scope_recall.adapters.models import AuxiliaryModelError
     from scope_recall.core.retrieval_storage import RetrievalStorage
+    from scope_recall.runtime.models import AuxiliaryModelError
 
     class SlowEmbedding:
         def embed_query(self, text, *, remaining_seconds):
@@ -425,7 +436,7 @@ def test_a_recall_asks_for_its_query_embedding_before_the_sqlite_channels(tmp_pa
 def test_a_query_embedding_that_fails_while_the_table_opens_leaves_the_table_open(tmp_path):
     """Raised inside the table's open, the embedding's failure closed the helper too, and the next prompt opened the
     table cold again: the work computer's second prompt after its server restarted (2026-09-29 13:55:34)."""
-    from scope_recall.adapters.models import AuxiliaryModelError
+    from scope_recall.runtime.models import AuxiliaryModelError
 
     class OverlapStore(_ScopedStore):
         def __init__(self):
@@ -463,7 +474,7 @@ def test_a_query_embedding_that_fails_while_the_table_opens_leaves_the_table_ope
 def test_a_vector_search_left_no_time_is_a_gap_not_an_empty_answer(tmp_path, prepared):
     """With the embedding back and no time left for the search, the port answered nothing and said nothing: the
     recall looked as if it had searched by meaning and found nothing."""
-    from scope_recall.adapters.lance import LanceVectorPort
+    from scope_recall.runtime.lance_port import LanceVectorPort
 
     class Embedding:
         def embed_query(self, text, *, remaining_seconds):
@@ -473,12 +484,20 @@ def test_a_vector_search_left_no_time_is_a_gap_not_an_empty_answer(tmp_path, pre
     clock = iter([0.0] + [10.0] * 5)  # the search starts at 0 and finds its 5 s gone
     port = LanceVectorPort(store, Embedding(), clock=lambda: next(clock))
     binding = _binding(tmp_path / "data")
-    context = SearchContext(query="TEST query", mode="auto", as_of=None, focus_refs=(), limits=SearchLimits(),
-                            deadline=5.0, now="2026-09-29T12:00:00Z",
-                            trusted_context=_context(binding, "TEST-vector-session"))
+    context = SearchContext(
+        query="TEST query",
+        mode="auto",
+        as_of=None,
+        focus_refs=(),
+        limits=SearchLimits(),
+        deadline=5.0,
+        now="2026-09-29T12:00:00Z",
+        trusted_context=_context(binding, "TEST-vector-session"),
+    )
     with pytest.raises(TimeoutError, match="deadline exhausted"):
-        port.search(context, limit=1, remaining_seconds=5.0,
-                    _prepared_query=("TEST query", (0.1, 0.2)) if prepared else None)
+        port.search(
+            context, limit=1, remaining_seconds=5.0, _prepared_query=("TEST query", (0.1, 0.2)) if prepared else None
+        )
     assert store.searches == []
 
 
@@ -577,7 +596,7 @@ def test_a_prefetched_embedding_is_waited_for_until_its_own_deadline(tmp_path):
         started = time.monotonic()
         with pytest.raises(TimeoutError, match="embedding stage deadline exhausted"):
             port.search(_search_context(binding, 5.0), limit=1, remaining_seconds=5.0, prefetched=Never())
-        assert time.monotonic() - started < 1.0, "the search's own deadline is not the one the embedding is waited for by"
+        assert time.monotonic() - started < 1.0, "the embedding wait is bounded by its own stage deadline"
         assert store.searches == []
     finally:
         instance.close()
@@ -586,7 +605,7 @@ def test_a_prefetched_embedding_is_waited_for_until_its_own_deadline(tmp_path):
 def test_warming_opens_the_store_and_searches_one_of_its_partitions(tmp_path):
     """A kept handler's first prompt opened the table and read the index inside its recall; warmed when the server
     starts, that prompt finds them ready."""
-    from scope_recall.adapters.lance import physical_partition_scope_id
+    from scope_recall.runtime.lance_port import physical_partition_scope_id
 
     class Embedding:
         def embed_query(self, text, *, remaining_seconds):
@@ -597,9 +616,13 @@ def test_warming_opens_the_store_and_searches_one_of_its_partitions(tmp_path):
     try:
         assert instance.warm_vector_store(5.0) is True
         partition = physical_partition_scope_id(
-            agent_id=binding.agent_id, installation_id=binding.installation_id,
-            embedding_space=instance.config.embedding_space_id(), logical_scope_id="TEST-scope",
-            project_id=None, branch_id=None)
+            agent_id=binding.agent_id,
+            installation_id=binding.installation_id,
+            embedding_space=instance.config.embedding_space_id(),
+            logical_scope_id="TEST-scope",
+            project_id=None,
+            branch_id=None,
+        )
         assert store.opens == 1 and store.searches == [(2, (partition,), 1)]
         instance.core.recall_pipeline.vector_port.search(_search_context(binding, 5.0), limit=1, remaining_seconds=4.0)
         assert store.opens == 1, "the recall found the table open"
@@ -630,17 +653,30 @@ def test_warming_searches_every_partition_a_recall_of_the_runtime_searches(tmp_p
     the first allowed scope's partition only, which holds no rows for any of the five entries a kept handler serves
     on the shared store; once the helper's cached index was paged out it touched 26 MB of the 306 MB the next
     recall paged back in (copy of the store, 2026-10-02)."""
+
     class Embedding:
         def embed_query(self, text, *, remaining_seconds):
             return (0.1, 0.2)
 
-    binding = InstanceBinding("TEST-runtime-agent", "TEST-runtime-installation", tmp_path / "data",
-                              frozenset({"TEST-scope-a", "TEST-scope-b", "TEST-scope-c"}), True)
+    binding = InstanceBinding(
+        "TEST-runtime-agent",
+        "TEST-runtime-installation",
+        tmp_path / "data",
+        frozenset({"TEST-scope-a", "TEST-scope-b", "TEST-scope-c"}),
+        True,
+    )
     config = RuntimeInstanceConfig(
-        binding=binding, session_id="construction-session", allowed_scope_ids=binding.scope_ids,
+        binding=binding,
+        session_id="construction-session",
+        allowed_scope_ids=binding.scope_ids,
         auxiliary=AuxiliaryRuntimeConfig.from_mapping({"external_embedding": False, "external_consolidation": False}),
-        vector=VectorRuntimeConfig(backend="lancedb", storage_dir=tmp_path / "vectors", table_name="TEST-vectors",
-                                   dimensions=2, test_injection_override=True),
+        vector=VectorRuntimeConfig(
+            backend="lancedb",
+            storage_dir=tmp_path / "vectors",
+            table_name="TEST-vectors",
+            dimensions=2,
+            test_injection_override=True,
+        ),
     )
     store = _ScopedStore()
     instance = build_runtime_instance(config, vector_factory=lambda _: store)
@@ -661,9 +697,7 @@ def test_lazy_vector_facade_reopens_poisoned_cached_store_on_next_search(tmp_pat
         binding=binding,
         session_id="construction-session",
         allowed_scope_ids=binding.scope_ids,
-        auxiliary=AuxiliaryRuntimeConfig.from_mapping(
-            {"external_embedding": False, "external_consolidation": False}
-        ),
+        auxiliary=AuxiliaryRuntimeConfig.from_mapping({"external_embedding": False, "external_consolidation": False}),
         vector=VectorRuntimeConfig(
             backend="lancedb",
             storage_dir=tmp_path / "vectors",
@@ -715,7 +749,7 @@ def test_lazy_vector_facade_reopens_poisoned_cached_store_on_next_search(tmp_pat
 
     store = RecoveringStore()
     factory_calls = []
-    instance = build_runtime_instance(config, vector_factory=lambda _: (factory_calls.append(store) or store))
+    instance = build_runtime_instance(config, vector_factory=lambda _: factory_calls.append(store) or store)
     owned_auxiliary = instance.auxiliary
     instance.auxiliary = replace(instance.auxiliary, query_embedding=QueryEmbedding())
     instance.core.initialize()
@@ -820,7 +854,10 @@ def test_worker_processes_durable_work_for_new_session_without_source_fabricatio
     assert source.durability == "persisted"
     with sqlite3.connect(core.storage.path) as conn:
         assert conn.execute("SELECT count(*) FROM work_items WHERE state='pending'").fetchone()[0] == 2
-        assert conn.execute("SELECT count(*) FROM source_events WHERE session_id=?", ("human-session-A",)).fetchone()[0] == 1
+        assert (
+            conn.execute("SELECT count(*) FROM source_events WHERE session_id=?", ("human-session-A",)).fetchone()[0]
+            == 1
+        )
 
     child, result = _run_child(tmp_path, monkeypatch, _config_payload(binding))
     assert child.poll() == 0
@@ -850,12 +887,13 @@ def test_worker_empty_database_is_idle_and_concurrent_owner_is_busy(tmp_path, mo
     core = MemoryCore(CoreConfig(binding))
     core.initialize()
     lock_path = binding.data_directory / "runtime-worker.lock"
-    from scope_recall.core.file_lock import advisory_file_lock
-    from scope_recall.runtime.worker_entry import run_worker
     from concurrent.futures import ThreadPoolExecutor
     from io import StringIO
 
-    config_path = _write_config(tmp_path/'busy.json', _config_payload(binding, drain_seconds=.05))
+    from scope_recall.core.file_lock import advisory_file_lock
+    from scope_recall.runtime.worker_entry import run_worker
+
+    config_path = _write_config(tmp_path / "busy.json", _config_payload(binding, drain_seconds=0.05))
     output = StringIO()
     with ThreadPoolExecutor(max_workers=1) as pool:
         with advisory_file_lock(lock_path, timeout_seconds=None):
@@ -874,6 +912,7 @@ def test_a_handed_deadline_bounds_the_lock_wait_and_the_drain(tmp_path, monkeypa
     its receipt.  The pass now ends its lock wait and drain the finalize margin
     before the deadline it was handed, and its own budget still caps it."""
     from io import StringIO
+
     import scope_recall.core.worker as core_worker
     from scope_recall.runtime import worker_entry
 
@@ -893,7 +932,7 @@ def test_a_handed_deadline_bounds_the_lock_wait_and_the_drain(tmp_path, monkeypa
 
     monkeypatch.setattr(worker_entry, "advisory_file_lock", observed_lock)
     monkeypatch.setattr(core_worker, "drain_worker", drain)
-    clock_reads = .1  # Epoch/monotonic conversions, a few 15.6 ms Windows ticks.
+    clock_reads = 0.1  # Epoch/monotonic conversions, a few 15.6 ms Windows ticks.
     handed = time.time() + 10.0
     output = StringIO()
     config = _write_config(tmp_path / "owned.json", _config_payload(binding))
@@ -914,6 +953,7 @@ def test_a_pass_handed_no_window_reports_the_timeout_without_reserving(tmp_path,
     """With less than the finalize margin left, a pass started now could only be
     killed mid-drain, or fail it; the owner's timeout is the honest receipt."""
     from io import StringIO
+
     import scope_recall.core.worker as core_worker
     from scope_recall.runtime import worker_entry
 
@@ -943,6 +983,7 @@ def test_a_deadline_hit_inside_an_owned_drain_is_the_owner_timeout(tmp_path, mon
     exit 1 it would end a supervisor as failed, where the kill it replaces was a
     timeout the supervisor survives."""
     from io import StringIO
+
     import scope_recall.core.worker as core_worker
     from scope_recall.runtime import worker_entry
 
@@ -974,6 +1015,7 @@ def test_a_pass_its_clock_has_not_ticked_through_asks_for_no_more_than_its_budge
     before about one such pass in ten."""
     from io import StringIO
     from types import SimpleNamespace
+
     import scope_recall.core.worker as core_worker
     from scope_recall.runtime import worker_entry
 
@@ -988,8 +1030,9 @@ def test_a_pass_its_clock_has_not_ticked_through_asks_for_no_more_than_its_budge
         raise ContractError("DEADLINE_EXCEEDED")
 
     monkeypatch.setattr(core_worker, "drain_worker", drain)
-    monkeypatch.setattr(worker_entry, "time", SimpleNamespace(monotonic=lambda: 100.002, time=time.time,
-                                                              sleep=time.sleep))
+    monkeypatch.setattr(
+        worker_entry, "time", SimpleNamespace(monotonic=lambda: 100.002, time=time.time, sleep=time.sleep)
+    )
     output = StringIO()
     assert worker_entry.run_worker(config, output=output) == 1
     assert json.loads(output.getvalue())["capability_gaps"] == ["worker_error:ContractError"], "the drain ran"
@@ -1113,7 +1156,10 @@ def test_worker_session_b_can_apply_evidence_backed_correction(tmp_path):
         assert current.state == "active"
         assert current.payload["value_text"] == "定稿"
         with sqlite3.connect(core_a.storage.path) as conn:
-            assert conn.execute("SELECT session_id FROM source_events ORDER BY recorded_at").fetchone()[0] == "human-session-A"
+            assert (
+                conn.execute("SELECT session_id FROM source_events ORDER BY recorded_at").fetchone()[0]
+                == "human-session-A"
+            )
     finally:
         instance_b.close()
 
@@ -1253,6 +1299,7 @@ def test_worker_session_b_cannot_promote_stale_proposal_past_newer_human_evidenc
 # A failure family is not a fault: say which one it was
 # --------------------------------------------------------------------------
 
+
 def test_a_sqlite_failure_carries_its_symbolic_code():
     """``worker_error:OperationalError`` named a family for days on a live
     instance: "database is locked" and "no such column" arrived as the same
@@ -1299,16 +1346,19 @@ def test_only_a_bounded_code_is_appended(code):
 # The worker and the doctor must agree about which failures are by design
 # --------------------------------------------------------------------------
 
-@pytest.mark.parametrize("code", ["derivation_invalid", "DERIVATION_INVALID",
-                                  "auto_retry:1|derivation_invalid", "input_invalid"])
+
+@pytest.mark.parametrize(
+    "code", ["derivation_invalid", "DERIVATION_INVALID", "auto_retry:1|derivation_invalid", "input_invalid"]
+)
 def test_a_by_design_terminal_outcome_is_not_actionable(code):
     from scope_recall.runtime.worker_entry import _is_actionable
 
     assert _is_actionable(code) is False
 
 
-@pytest.mark.parametrize("code", ["timeout", "http_429", "model_unavailable",
-                                  "candidate_attempt_interrupted", "something_new"])
+@pytest.mark.parametrize(
+    "code", ["timeout", "http_429", "model_unavailable", "candidate_attempt_interrupted", "something_new"]
+)
 def test_anything_an_operator_could_clear_is_actionable(code):
     from scope_recall.runtime.worker_entry import _is_actionable
 
@@ -1396,17 +1446,19 @@ def test_the_worker_status_names_a_refusing_provider_too(tmp_path):
     from scope_recall.runtime import worker_entry
     from scope_recall.runtime.model_budget import provider_refusals
 
-    assert worker_entry.provider_refusals is provider_refusals, \
+    assert worker_entry.provider_refusals is provider_refusals, (
         "the worker must share the doctor's implementation, not restate it"
+    )
 
     ledger = tmp_path / "auxiliary-budget.sqlite3"
     with sqlite3.connect(ledger) as conn:
-        conn.execute("CREATE TABLE requests (id INTEGER PRIMARY KEY, model TEXT,"
-                     " status TEXT, started_ns INTEGER)")
+        conn.execute("CREATE TABLE requests (id INTEGER PRIMARY KEY, model TEXT, status TEXT, started_ns INTEGER)")
         now_ns = int(_time.time() * 1_000_000_000)
         for _ in range(12):
-            conn.execute("INSERT INTO requests(model,status,started_ns) VALUES (?,?,?)",
-                         ("chat-model", "http_429:GoUsageLimitError_usage_unknown", now_ns))
+            conn.execute(
+                "INSERT INTO requests(model,status,started_ns) VALUES (?,?,?)",
+                ("chat-model", "http_429:GoUsageLimitError_usage_unknown", now_ns),
+            )
         conn.commit()
     assert provider_refusals(ledger) == ["model_refused:chat-model:GoUsageLimitError"]
 
@@ -1453,7 +1505,7 @@ def test_a_rate_limited_code_stands_its_work_type_down_for_the_pass():
     from scope_recall.core import worker
 
     source = inspect.getsource(worker)
-    assert "if str(error_code or \"\").lower() in _RATE_LIMITED_ERRORS:" in source
+    assert 'if str(error_code or "").lower() in _RATE_LIMITED_ERRORS:' in source
     assert "allowed = allowed - {item.work_type}" in source
 
 
@@ -1462,14 +1514,15 @@ def test_the_two_stop_loss_layers_stay_distinct():
     down decides how many of that type are tried in one pass. Neither is an
     instance-wide brake, and a backward-looking ledger window must not become
     one."""
-    from scope_recall.core.worker import _RATE_LIMITED_ERRORS
     from scope_recall.core.work_storage import CAPACITY_REFUSALS
+    from scope_recall.core.worker import _RATE_LIMITED_ERRORS
 
     assert _RATE_LIMITED_ERRORS == CAPACITY_REFUSALS
     assert "http_429" in _RATE_LIMITED_ERRORS
 
 
 # --- the watcher and the operator must read the same instance ----------------
+
 
 class _Queue:
     def __init__(self, failed_work, work_error_counts, pending_work=0):
@@ -1557,8 +1610,8 @@ def test_every_degraded_branch_appends_a_gap():
     from scope_recall.runtime import worker_entry
 
     source = inspect.getsource(worker_entry)
-    branch = source[source.index("if actionable_failed or background_gaps"):]
-    branch = branch[:branch.index("elif terminal_failed")]
+    branch = source[source.index("if actionable_failed or background_gaps") :]
+    branch = branch[: branch.index("elif terminal_failed")]
     assert 'gaps.append(f"work_failed:{actionable_failed}")' in branch
     assert "source_only:" in branch
     assert 'payload["capability_gaps"] = sorted(set(gaps))' in branch

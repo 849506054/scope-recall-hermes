@@ -4,18 +4,18 @@ This module deliberately owns no database state and never searches a directory.
 The caller is responsible for deciding that a source is authorized and for
 placing database deletion fences before calling :func:`erase_retained`.
 """
+
 from __future__ import annotations
 
-from dataclasses import dataclass
 import hashlib
 import os
-from pathlib import Path
 import re
 import xml.etree.ElementTree as ET
+from dataclasses import dataclass
+from pathlib import Path
 
 from ..contracts import ContractError, InstanceBinding
 from .secret_patterns import contains_secret_like_text
-
 
 MAX_RETAINED_BYTES = 16 * 1024 * 1024
 ALLOWED_MEDIA_TYPES = frozenset({"image/png", "image/jpeg", "image/webp", "image/svg+xml", "text/plain"})
@@ -186,8 +186,25 @@ def _validate_svg(data: bytes) -> None:
         root = ET.fromstring(text)
     except ET.ParseError as exc:
         raise ContractError("INPUT_INVALID", "svg_content") from exc
-    allowed = {"svg", "g", "path", "rect", "circle", "ellipse", "line", "polyline", "polygon",
-               "defs", "linearGradient", "radialGradient", "stop", "clipPath", "mask", "pattern", "use"}
+    allowed = {
+        "svg",
+        "g",
+        "path",
+        "rect",
+        "circle",
+        "ellipse",
+        "line",
+        "polyline",
+        "polygon",
+        "defs",
+        "linearGradient",
+        "radialGradient",
+        "stop",
+        "clipPath",
+        "mask",
+        "pattern",
+        "use",
+    }
     svg_ns = "http://www.w3.org/2000/svg"
     for element in root.iter():
         if element.tag.startswith("{"):
@@ -238,11 +255,12 @@ def retain(binding: InstanceBinding, grant: ArtifactGrant) -> RetainedBlob:
                 try:
                     io_destination.unlink()
                 except OSError as cleanup:
-                    original.add_note(f'retained artifact cleanup failed: {type(cleanup).__name__}')
-                    original.__cause__=cleanup
+                    original.add_note(f"retained artifact cleanup failed: {type(cleanup).__name__}")
+                    original.__cause__ = cleanup
             raise
-    return RetainedBlob(grant.sha256, len(data), grant.media_type, f"retained/{grant.sha256}",
-                        binding.installation_id, binding.agent_id)
+    return RetainedBlob(
+        grant.sha256, len(data), grant.media_type, f"retained/{grant.sha256}", binding.installation_id, binding.agent_id
+    )
 
 
 def _blob_path(binding: InstanceBinding, blob: RetainedBlob) -> Path:

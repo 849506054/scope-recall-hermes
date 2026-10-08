@@ -36,7 +36,10 @@ Five conditions, and all of them are narrow on purpose:
 Not responsible for: judging either statement (``core/claims.qualify`` does
 that), or writing anything (``core/mutate.apply_claim`` owns the version).
 """
+
 from __future__ import annotations
+
+from .claims import effective_origin, verified_human_ref
 
 #: Independent first-hand statements required before a refusal is overturned.
 #: Two is the ordinary standard for "not just one person's word"; a higher bar
@@ -52,11 +55,13 @@ CORROBORATION_THRESHOLD = 2
 #: standing said it".  Every other refusal in ``qualify`` is about what kind of
 #: statement this is, or about faithfulness to the quote, and repetition cannot
 #: change either.
-CORROBORATION_ELIGIBLE_REASONS = frozenset({
-    "fact_entailment_unproved",
-    "no_independent_authority",
-    "requires_human_source",
-})
+CORROBORATION_ELIGIBLE_REASONS = frozenset(
+    {
+        "fact_entailment_unproved",
+        "no_independent_authority",
+        "requires_human_source",
+    }
+)
 
 #: Reason recorded on the version that corroboration promotes, so a reader can
 #: tell an assertion that was proved by its own text from one that was accepted
@@ -79,13 +84,10 @@ def _first_hand(roots):
     ``capture_state``/``capture_gaps`` are checked because a partially captured
     source is a fragment of a statement, and half a sentence is not a witness.
     """
-    from .claims import effective_origin
-
     return [
-        root for root in roots
-        if effective_origin(root) == "human_direct"
-        and root.capture_state == "complete"
-        and not root.capture_gaps
+        root
+        for root in roots
+        if effective_origin(root) == "human_direct" and root.capture_state == "complete" and not root.capture_gaps
     ]
 
 
@@ -106,9 +108,7 @@ def witness_occasions(roots) -> set[tuple[str | None, str]]:
     speaker in two sessions is too.  The same speaker twice in one session is
     one.
     """
-    from .claims import _principal_ref
-
-    return {(_principal_ref(root), root.session_id) for root in _first_hand(roots)}
+    return {(verified_human_ref(root), root.session_id) for root in _first_hand(roots)}
 
 
 def corroboration_promotes(

@@ -4,9 +4,9 @@ Record identity, dimensions and repair policy are enforced by the runtime.
 SQLite rows remain the source of truth, so a missing vector row is repaired by
 rebuild, never treated as a memory deletion.
 """
+
 from __future__ import annotations
 
-import json
 import math
 import sys
 import time
@@ -19,15 +19,12 @@ from ..core.file_lock import advisory_file_lock
 from . import VectorRecord, VectorStore, VectorStoreCompatibilityError
 from .compaction import measure_footprint
 from .lance_native import native_modules
+from .purge import governed_row_ids, purge_request
 
 _COLUMNS = ("id", "scope_id", "source", "target", "content", "summary", "updated_at", "vector")
-_PURGE_KINDS = frozenset({"event", "claim", "episode", "artifact", "reference"})
-_PURGE_METADATA_KEYS = (
-    "object_kind", "object_ref", "vector_id", "embedding_space", "agent_id", "installation_id", "logical_scope_id",
-)
 #: Lance index types under which ``id = '...'`` is an indexed probe, not a scan.
 _SCALAR_INDEX_TYPES = frozenset({"bitmap", "btree", "label_list", "scalar"})
-#: What a nearest-neighbour search returns: the columns ``adapters.lance`` reads from a hit.  With every column the
+#: What a nearest-neighbour search returns: the columns ``runtime.lance_port`` reads from a hit.  With every column the
 #: 3,072 floats of each of 40 hits crossed the helper's pipe as JSON on every search, and nothing read them.
 _HIT_COLUMNS = ["id", "scope_id", "source", "target", "_distance"]
 #: A search through the index re-ranks this many times its limit by exact distance, and probes every partition
@@ -92,70 +89,6 @@ def _covers_id_only(index: Any) -> bool:
     return columns == ["id"] and (not kind or kind in _SCALAR_INDEX_TYPES)
 
 
-def purge_request(*, members, agent_id, installation_id, partitions):
-    """The validated targets and governed partitions of one purge, for whichever store carries it out."""
-    if not isinstance(agent_id, str) or not agent_id or not isinstance(installation_id, str) or not installation_id:
-        raise ValueError("trusted purge identity required")
-    targets = {(entry["kind"], entry["ref"]) for entry in members}
-    if any(kind not in _PURGE_KINDS or not isinstance(ref, str) or not ref for kind, ref in targets):
-        raise ValueError("invalid purge members")
-    governed = {(entry["scope_id"], entry["embedding_space"]): entry["physical_scope_id"] for entry in partitions}
-    return targets, governed
-
-
-def governed_row_ids(rows: Iterable[dict[str, Any]], *, targets, governed, agent_id, installation_id,
-                     project_id, branch_id, check_budget: Callable[[], None] = lambda: None) -> list[str] | None:
-    """Ids of the governed rows among ``rows``, or ``None`` when any row cannot be classified.
-
-    One rule for every companion store: a row whose writer metadata cannot be
-    read makes the whole inventory unknown, and an unknown inventory is never
-    acknowledged as empty.
-    """
-    scopes = {scope for scope, _ in governed}
-    matched: list[str] = []
-    seen: set[str] = set()
-    for row in rows:
-        check_budget()
-        row_id = row.get("id")
-        if type(row_id) is not str or not row_id or row_id in seen:
-            return None
-        seen.add(row_id)
-        metadata = _purge_metadata(row)
-        if metadata is None:
-            return None
-        if (metadata["agent_id"], metadata["installation_id"]) != (agent_id, installation_id):
-            continue
-        if (metadata["object_kind"], metadata["object_ref"]) not in targets:
-            continue
-        if metadata["logical_scope_id"] not in scopes or (metadata["project_id"], metadata["branch_id"]) != (project_id, branch_id):
-            continue
-        partition = governed.get((metadata["logical_scope_id"], metadata["embedding_space"]))
-        if partition is None or row["scope_id"] != partition:
-            return None
-        matched.append(row_id)
-    return matched
-
-
-def _purge_metadata(row: dict[str, Any]) -> dict[str, Any] | None:
-    """The writer metadata of one row, or ``None`` when the row cannot be classified."""
-    try:
-        metadata = json.loads(row["target"])
-        if any(type(metadata.get(key)) is not str or not metadata[key] for key in _PURGE_METADATA_KEYS):
-            return None
-        if metadata["object_kind"] not in _PURGE_KINDS:
-            return None
-        if type(metadata.get("object_revision")) is not int or metadata["object_revision"] < 1:
-            return None
-        for key in ("project_id", "branch_id"):
-            if key not in metadata or (metadata[key] is not None and (type(metadata[key]) is not str or not metadata[key])):
-                return None
-        if row["id"] != metadata["vector_id"] or row["source"] != metadata["object_ref"]:
-            return None
-        return metadata
-    except (KeyError, TypeError, ValueError, AttributeError):
-        return None
-
-
 class LanceVectorStore(VectorStore):
     """One Lance table.
 
@@ -214,10 +147,12 @@ class LanceVectorStore(VectorStore):
 
     def _schema(self):
         _, pa = self._require_native()
-        return pa.schema([
-            *(pa.field(name, pa.string()) for name in _COLUMNS[:-1]),
-            pa.field("vector", pa.list_(pa.float32(), self.dimensions)),
-        ])
+        return pa.schema(
+            [
+                *(pa.field(name, pa.string()) for name in _COLUMNS[:-1]),
+                pa.field("vector", pa.list_(pa.float32(), self.dimensions)),
+            ]
+        )
 
     def _ensure_schema_compatible(self) -> None:
         schema = self._require_table().schema
@@ -266,8 +201,9 @@ class LanceVectorStore(VectorStore):
     @contextmanager
     def physical_write_lock(self, *, timeout_seconds: float | None = None) -> Iterator[None]:
         """Hold the cross-process Lance mutation lock."""
-        with advisory_file_lock(self.db_path.parent / f".{self.db_path.name}.scope-recall-write.lock",
-                                timeout_seconds=timeout_seconds):
+        with advisory_file_lock(
+            self.db_path.parent / f".{self.db_path.name}.scope-recall-write.lock", timeout_seconds=timeout_seconds
+        ):
             yield
 
     def upsert_records_locked(self, rows: Iterable[dict[str, Any]]) -> None:
@@ -281,7 +217,8 @@ class LanceVectorStore(VectorStore):
         payload = list(rows)
         if payload:
             (
-                self._fresh_table().merge_insert("id")
+                self._fresh_table()
+                .merge_insert("id")
                 .when_matched_update_all()
                 .when_not_matched_insert_all()
                 .execute(payload)
@@ -292,12 +229,16 @@ class LanceVectorStore(VectorStore):
             self.upsert_records_locked(rows)
 
     def fenced_upsert_records(
-        self, rows: Iterable[dict[str, Any]], *, guard: Callable[[], bool], remaining_seconds: float,
+        self,
+        rows: Iterable[dict[str, Any]],
+        *,
+        guard: Callable[[], bool],
+        remaining_seconds: float,
     ) -> bool:
         """Commit ``rows`` in one Lance transaction, only if ``guard`` still approves under the native lock.
 
         The worker publishes every embedding through this fenced form
-        (``adapters.lance.LanceIndexWriter``).  On Windows the store is the
+        (``runtime.lance_port.LanceIndexWriter``).  On Windows the store is the
         helper-process one, and the helper asks the guard with the native lock
         held (``_lance_worker.fenced_upsert``).  Everywhere else
         ``build_vector_store`` selects this in-process store, which did not
@@ -307,7 +248,11 @@ class LanceVectorStore(VectorStore):
         """
         if not callable(guard):
             raise TypeError("guard must be callable")
-        if type(remaining_seconds) not in (int, float) or not math.isfinite(float(remaining_seconds)) or remaining_seconds <= 0:
+        if (
+            type(remaining_seconds) not in (int, float)
+            or not math.isfinite(float(remaining_seconds))
+            or remaining_seconds <= 0
+        ):
             raise RuntimeError("native vector fence deadline exhausted")
         payload = list(rows)
         try:
@@ -329,8 +274,18 @@ class LanceVectorStore(VectorStore):
         with self.physical_write_lock():
             self._delete_ids_locked(ids)
 
-    def purge_governed_members(self, *, members, agent_id, installation_id, partitions, project_id, branch_id,
-                               budget_seconds: float | None = None, remaining_seconds: float | None = None) -> bool:
+    def purge_governed_members(
+        self,
+        *,
+        members,
+        agent_id,
+        installation_id,
+        partitions,
+        project_id,
+        branch_id,
+        budget_seconds: float | None = None,
+        remaining_seconds: float | None = None,
+    ) -> bool:
         """Remove every revision of the governed members and acknowledge only under the publication lock.
 
         Inputs are opaque identities authorized by the host; no truth database
@@ -340,7 +295,7 @@ class LanceVectorStore(VectorStore):
 
         The budget has two names because this method has two callers.  The
         Windows helper process passes ``budget_seconds``, what is left of its
-        parent's deadline.  ``adapters.lance.LancePurgePort`` passes
+        parent's deadline.  ``runtime.lance_port.LancePurgePort`` passes
         ``remaining_seconds`` to whichever store it holds, and off Windows
         that is this one: the keyword was refused with a ``TypeError`` the port
         turns into "not purged", so a forget never finished there (#99).
@@ -351,8 +306,9 @@ class LanceVectorStore(VectorStore):
             raise ValueError("positive finite purge budget required")
         if not members or not partitions:
             return False
-        targets, governed = purge_request(members=members, agent_id=agent_id, installation_id=installation_id,
-                                          partitions=partitions)
+        targets, governed = purge_request(
+            members=members, agent_id=agent_id, installation_id=installation_id, partitions=partitions
+        )
         deadline = time.monotonic() + float(budget_seconds)
 
         def check_budget() -> None:
@@ -362,9 +318,15 @@ class LanceVectorStore(VectorStore):
         def inventory() -> list[str] | None:
             check_budget()
             return governed_row_ids(
-                self._table_rows(["id", "scope_id", "source", "target"]), targets=targets, governed=governed,
-                agent_id=agent_id, installation_id=installation_id, project_id=project_id, branch_id=branch_id,
-                check_budget=check_budget)
+                self._table_rows(["id", "scope_id", "source", "target"]),
+                targets=targets,
+                governed=governed,
+                agent_id=agent_id,
+                installation_id=installation_id,
+                project_id=project_id,
+                branch_id=branch_id,
+                check_budget=check_budget,
+            )
 
         check_budget()
         with self.physical_write_lock():
@@ -406,8 +368,9 @@ class LanceVectorStore(VectorStore):
         after = self._physical_footprint()
         return {f"{key}_before": value for key, value in before.items()} | after
 
-    def ensure_vector_index(self, *, min_rows: int = VECTOR_INDEX_MIN_ROWS,
-                            timeout_seconds: float | None = None, build: bool = True) -> dict[str, Any]:
+    def ensure_vector_index(
+        self, *, min_rows: int = VECTOR_INDEX_MIN_ROWS, timeout_seconds: float | None = None, build: bool = True
+    ) -> dict[str, Any]:
         """Build the nearest-neighbour index once the table is large enough to need one.  Idempotent.
 
         Without it every search reads every vector: 750 ms over 78,000 of them.  A Claude Code or Codex hook starts
@@ -430,13 +393,19 @@ class LanceVectorStore(VectorStore):
             if rows < min_rows and not existing:
                 return {"outcome": "below_threshold", "rows": rows}
             if not build:
-                return {"outcome": "needs_rebuild" if existing else "needs_build", "rows": rows,
-                        **({"segments": segments} if segments is not None else {})}
+                return {
+                    "outcome": "needs_rebuild" if existing else "needs_build",
+                    "rows": rows,
+                    **({"segments": segments} if segments is not None else {}),
+                }
             # A vector index of another kind (an HNSW one built by hand on the pilot) is replaced.
             started = time.monotonic()
             _create_vector_index(table, self.metric, replace=bool(existing))
-            return {"outcome": "rebuilt" if existing else "built", "rows": rows,
-                    "seconds": round(time.monotonic() - started, 3)}
+            return {
+                "outcome": "rebuilt" if existing else "built",
+                "rows": rows,
+                "seconds": round(time.monotonic() - started, 3),
+            }
 
     def _physical_footprint(self) -> dict[str, int]:
         # Read straight off the filesystem: the doctor must report the same
@@ -487,8 +456,15 @@ class LanceVectorStore(VectorStore):
     def search(self, vector: list[float], *, scope_id: str, limit: int) -> list[dict[str, Any]]:
         if not vector:
             return []
-        query = (self._fresh_table().search(vector).metric(self.metric).where(f"scope_id = {_sql_quote(scope_id)}")
-                 .select(_HIT_COLUMNS).nprobes(_ALL_PARTITIONS).refine_factor(_REFINE_FACTOR))
+        query = (
+            self._fresh_table()
+            .search(vector)
+            .metric(self.metric)
+            .where(f"scope_id = {_sql_quote(scope_id)}")
+            .select(_HIT_COLUMNS)
+            .nprobes(_ALL_PARTITIONS)
+            .refine_factor(_REFINE_FACTOR)
+        )
         return query.limit(int(limit)).to_list()
 
     def search_scopes(self, vector: list[float], *, scope_ids: Iterable[str], limit: int) -> list[dict[str, Any]]:
@@ -497,8 +473,15 @@ class LanceVectorStore(VectorStore):
         if not vector or not listed:
             return []
         where = f"scope_id IN ({', '.join(_sql_quote(scope_id) for scope_id in listed)})"
-        query = (self._fresh_table().search(vector).metric(self.metric).where(where, prefilter=True)
-                 .select(_HIT_COLUMNS).nprobes(_ALL_PARTITIONS).refine_factor(_REFINE_FACTOR))
+        query = (
+            self._fresh_table()
+            .search(vector)
+            .metric(self.metric)
+            .where(where, prefilter=True)
+            .select(_HIT_COLUMNS)
+            .nprobes(_ALL_PARTITIONS)
+            .refine_factor(_REFINE_FACTOR)
+        )
         return query.limit(int(limit)).to_list()
 
     def count_rows(self) -> int:
@@ -529,15 +512,25 @@ def build_vector_store(
         config = QdrantConfig.from_mapping(qdrant)
         from .qdrant_store import QdrantVectorStore
 
-        return QdrantVectorStore(Path(storage_dir), table_name=table_name, dimensions=dimensions,
-                                 metric=metric, config=config, binding=binding, embedding_space=embedding_space)
+        return QdrantVectorStore(
+            Path(storage_dir),
+            table_name=table_name,
+            dimensions=dimensions,
+            metric=metric,
+            config=config,
+            binding=binding,
+            embedding_space=embedding_space,
+        )
     if qdrant is not None:
         raise ValueError("qdrant_options")
     if normalized in {"sqlite", "sqlite-bruteforce"}:
         from .sqlite_store import SQLiteBruteForceVectorStore
 
         return SQLiteBruteForceVectorStore(
-            Path(storage_dir) / "vector.sqlite3", table_name=table_name, dimensions=dimensions, metric=metric,
+            Path(storage_dir) / "vector.sqlite3",
+            table_name=table_name,
+            dimensions=dimensions,
+            metric=metric,
         )
     if normalized == "lancedb":
         vector_dir = Path(storage_dir) / "lancedb"
@@ -550,8 +543,7 @@ def build_vector_store(
         return LanceVectorStore(vector_dir, table_name=table_name, dimensions=dimensions, metric=metric)
     if normalized == "pgvector":
         raise ValueError(
-            "pgvector is not supported in this v3 distribution; retain the old "
-            "installation and use the migration guide"
+            "pgvector is not supported in this v3 distribution; retain the old installation and use the migration guide"
         )
     raise ValueError(f"unsupported vector backend: {backend}")
 

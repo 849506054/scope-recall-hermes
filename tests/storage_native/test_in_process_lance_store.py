@@ -7,13 +7,14 @@ behaviour and runs it against the SQLite companion.  It is driven directly here 
 exercised wherever this tier runs.  LanceDB needs a socket and a child process to load, which is why
 these cases live in the native tier and not beside the others.
 """
+
 from __future__ import annotations
 
 import importlib.util
 
 import pytest
-
 from scope_recall.vector.store import LanceVectorStore
+
 from tests.contract import test_every_store_meets_the_runtime as seams
 
 pytestmark = pytest.mark.skipif(

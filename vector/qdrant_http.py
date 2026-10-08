@@ -3,15 +3,16 @@
 Each request owns one process; write failures are uncertain commits, never retried.
 Only stdin carries the API key. Errors expose a closed code and optional HTTP status.
 """
+
 from __future__ import annotations
 
 import base64
 import os
-from pathlib import Path
 import subprocess
 import sys
 import threading
 import time
+from pathlib import Path
 
 from . import _qdrant_http_worker as wire
 from .qdrant_config import QdrantConfig
@@ -44,12 +45,20 @@ def _worker_reply(raw: bytes) -> dict:
         if status is not None and (type(status) is not int or not 100 <= status <= 599):
             raise ValueError
         if frame.get("ok") is False:
-            if (set(frame) != {"ok", "code", "status"} or type(frame["code"]) is not str
-                    or frame["code"] not in wire.ERROR_CODES):
+            if (
+                set(frame) != {"ok", "code", "status"}
+                or type(frame["code"]) is not str
+                or frame["code"] not in wire.ERROR_CODES
+            ):
                 raise ValueError
             raise QdrantHTTPError(frame["code"], status=status)
-        if (frame.get("ok") is not True or set(frame) != {"ok", "status", "body_b64"}
-                or status is None or not 200 <= status < 300 or type(frame["body_b64"]) is not str):
+        if (
+            frame.get("ok") is not True
+            or set(frame) != {"ok", "status", "body_b64"}
+            or status is None
+            or not 200 <= status < 300
+            or type(frame["body_b64"]) is not str
+        ):
             raise ValueError
         body = base64.b64decode(frame["body_b64"], validate=True)
         if len(body) > wire.MAX_RESPONSE_BYTES:
@@ -73,6 +82,7 @@ def _finish_process(process, thread):
                 process.wait()
             except OSError:
                 pass
+
         threading.Thread(target=reap, name="scope-recall-qdrant-reap", daemon=True).start()
     if thread is not None:
         thread.join(timeout=max(0, cleanup_deadline - time.monotonic()))
@@ -91,17 +101,20 @@ def _exchange(request: bytes, *, deadline: float) -> dict:
     try:
         wire._remaining(deadline)
         # The exact interpreter path preserves venv identity; -I ignores ambient Python paths.
-        environment = ({"SystemRoot": os.environ["SystemRoot"]}
-                       if os.name == "nt" and "SystemRoot" in os.environ else {})
+        environment = {"SystemRoot": os.environ["SystemRoot"]} if os.name == "nt" and "SystemRoot" in os.environ else {}
         process = subprocess.Popen(
-            [sys.executable, "-I", "-B", str(_WORKER_PATH)], env=environment,
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            [sys.executable, "-I", "-B", str(_WORKER_PATH)],
+            env=environment,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0,
             close_fds=True,
         )
 
         def exchange():
             try:
+                assert process.stdin is not None and process.stdout is not None  # Popen requested both PIPEs.
                 with process.stdin, process.stdout:
                     process.stdin.write(request)
                     process.stdin.close()
@@ -110,7 +123,7 @@ def _exchange(request: bytes, *, deadline: float) -> dict:
                     outcome[0] = _worker_reply(raw)
             except QdrantHTTPError as error:
                 outcome[0] = error
-            except Exception:
+            except Exception:  # noqa: BLE001 - Return a sanitized failure from the I/O thread to its caller.
                 outcome[0] = QdrantHTTPError("worker_protocol")
             finally:
                 done.set()
@@ -143,8 +156,7 @@ def _exchange(request: bytes, *, deadline: float) -> dict:
             _finish_process(process, thread)
 
 
-def request_json(config: QdrantConfig, method: str, path: str, body: dict | None,
-                 *, deadline: float) -> dict:
+def request_json(config: QdrantConfig, method: str, path: str, body: dict | None, *, deadline: float) -> dict:
     """Return the full Qdrant envelope within the caller's absolute monotonic budget.
 
     The smaller of ``deadline`` and config.timeout_seconds covers child startup,
@@ -162,11 +174,18 @@ def request_json(config: QdrantConfig, method: str, path: str, body: dict | None
         wire._validate_request(method, path, key)
         raw_body = None if body is None else wire._dump_object(body, wire.MAX_BODY_BYTES, deadline=deadline)
         wire._remaining(deadline)
-        request = wire._dump_object({
-            "url": config.url, "method": method, "path": path, "api_key": key,
-            "body_b64": None if raw_body is None else base64.b64encode(raw_body).decode("ascii"),
-            "timeout_seconds": wire._remaining(deadline),
-        }, wire.MAX_REQUEST_FRAME, deadline=deadline)
+        request = wire._dump_object(
+            {
+                "url": config.url,
+                "method": method,
+                "path": path,
+                "api_key": key,
+                "body_b64": None if raw_body is None else base64.b64encode(raw_body).decode("ascii"),
+                "timeout_seconds": wire._remaining(deadline),
+            },
+            wire.MAX_REQUEST_FRAME,
+            deadline=deadline,
+        )
         wire._remaining(deadline)
         return _exchange(request, deadline=deadline)
     except wire._Failure as error:

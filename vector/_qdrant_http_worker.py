@@ -1,4 +1,5 @@
 """Private, one-shot stdlib HTTP worker. Its parent owns the total deadline."""
+
 from __future__ import annotations
 
 import base64
@@ -18,10 +19,20 @@ MAX_RESPONSE_BYTES = 16 * 1024 * 1024
 MAX_REQUEST_FRAME = (MAX_BODY_BYTES * 4) // 3 + 65536
 MAX_RESPONSE_FRAME = (MAX_RESPONSE_BYTES * 4) // 3 + 1024
 MAX_KEY_BYTES = 8192
-ERROR_CODES = frozenset({
-    "request_invalid", "request_limit", "credential_missing", "credential_invalid",
-    "http_status", "http_protocol", "network_error", "timeout", "response_limit", "worker_protocol",
-})
+ERROR_CODES = frozenset(
+    {
+        "request_invalid",
+        "request_limit",
+        "credential_missing",
+        "credential_invalid",
+        "http_status",
+        "http_protocol",
+        "network_error",
+        "timeout",
+        "response_limit",
+        "worker_protocol",
+    }
+)
 
 
 class _Failure(Exception):
@@ -106,20 +117,34 @@ def _remaining(deadline):
 
 
 def _validate_request(method, path, key):
-    if (type(method) is not str or method not in {"GET", "PUT", "POST", "DELETE"}
-            or type(path) is not str or not path.startswith("/") or path.startswith("//")
-            or len(path) > 8192 or not path.isascii()
-            or any(ord(char) <= 32 or ord(char) == 127 for char in path)
-            or "#" in path or "\\" in path):
+    if (
+        type(method) is not str
+        or method not in {"GET", "PUT", "POST", "DELETE"}
+        or type(path) is not str
+        or not path.startswith("/")
+        or path.startswith("//")
+        or len(path) > 8192
+        or not path.isascii()
+        or any(ord(char) <= 32 or ord(char) == 127 for char in path)
+        or "#" in path
+        or "\\" in path
+    ):
         raise _Failure("request_invalid")
-    if (type(key) is not str or not key or len(key) > MAX_KEY_BYTES
-            or not key.isascii() or any(ord(char) <= 32 or ord(char) == 127 for char in key)):
+    if (
+        type(key) is not str
+        or not key
+        or len(key) > MAX_KEY_BYTES
+        or not key.isascii()
+        or any(ord(char) <= 32 or ord(char) == 127 for char in key)
+    ):
         raise _Failure("credential_invalid")
 
 
 _INTERNAL_NETWORKS = (
-    ipaddress.ip_network("10.0.0.0/8"), ipaddress.ip_network("172.16.0.0/12"),
-    ipaddress.ip_network("192.168.0.0/16"), ipaddress.ip_network("fc00::/7"),
+    ipaddress.ip_network("10.0.0.0/8"),
+    ipaddress.ip_network("172.16.0.0/12"),
+    ipaddress.ip_network("192.168.0.0/16"),
+    ipaddress.ip_network("fc00::/7"),
 )
 _DNS_LABEL = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?")
 # Alternative numeric notations (hex, bare decimal, leading zeros) that a C resolver
@@ -144,24 +169,37 @@ def valid_origin(value):
     plaintext is allowed only for an explicitly internal destination, and a host
     written in an alternative numeric notation is refused instead of trusted.
     """
-    if (type(value) is not str or len(value) > 2048 or not value.isascii()
-            or any(ord(char) <= 32 or ord(char) == 127 for char in value)
-            or any(char in value for char in "?#\\%")):
+    if (
+        type(value) is not str
+        or len(value) > 2048
+        or not value.isascii()
+        or any(ord(char) <= 32 or ord(char) == 127 for char in value)
+        or any(char in value for char in "?#\\%")
+    ):
         raise ValueError("origin")
     try:
         parsed = urlsplit(value)
         host, port = parsed.hostname, parsed.port
     except ValueError:
         raise ValueError("origin") from None
-    if (parsed.scheme not in {"http", "https"} or not host or parsed.username is not None
-            or parsed.password is not None or parsed.path not in {"", "/"}
-            or parsed.netloc.endswith(":") or port == 0):
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not host
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path not in {"", "/"}
+        or parsed.netloc.endswith(":")
+        or port == 0
+    ):
         raise ValueError("origin")
     internal = _internal_literal(host)
     if internal is None:
         labels = host.split(".")
-        if (len(host) > 253 or any(not _DNS_LABEL.fullmatch(label) for label in labels)
-                or all(_NUMERIC_LABEL.fullmatch(label) for label in labels)):
+        if (
+            len(host) > 253
+            or any(not _DNS_LABEL.fullmatch(label) for label in labels)
+            or all(_NUMERIC_LABEL.fullmatch(label) for label in labels)
+        ):
             raise ValueError("origin")
         internal = "." not in host
     if port is None:
@@ -191,8 +229,7 @@ def _parse_request(raw):
         raise _Failure("request_invalid")
     _validate_request(request["method"], request["path"], request["api_key"])
     timeout_seconds = request["timeout_seconds"]
-    if (type(timeout_seconds) not in (int, float) or not math.isfinite(timeout_seconds)
-            or timeout_seconds <= 0):
+    if type(timeout_seconds) not in (int, float) or not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
         raise _Failure("timeout")
     # A duration crosses the process boundary portably; this clock starts at once.
     deadline = time.monotonic() + float(timeout_seconds)
@@ -222,9 +259,12 @@ def _arm(connection, deadline):
 def _response_body(response, connection, deadline):
     lengths = response.headers.get_all("Content-Length", [])
     encodings = response.headers.get_all("Transfer-Encoding", [])
-    if (len(lengths) > 1 or (lengths and encodings)
-            or (encodings and encodings != ["chunked"])
-            or response.headers.get("Content-Encoding", "identity").lower() != "identity"):
+    if (
+        len(lengths) > 1
+        or (lengths and encodings)
+        or (encodings and encodings != ["chunked"])
+        or response.headers.get("Content-Encoding", "identity").lower() != "identity"
+    ):
         raise _Failure("http_protocol")
     expected = None
     if lengths:
@@ -268,10 +308,18 @@ def _request(raw):
         if connection.sock is None:
             connection.connect()
         _arm(connection, deadline)
-        connection.request(request["method"], request["path"], body=body, headers={
-            "api-key": request["api_key"], "Content-Type": "application/json",
-            "Accept": "application/json", "Accept-Encoding": "identity", "Connection": "close",
-        })
+        connection.request(
+            request["method"],
+            request["path"],
+            body=body,
+            headers={
+                "api-key": request["api_key"],
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+                "Accept-Encoding": "identity",
+                "Connection": "close",
+            },
+        )
         _arm(connection, deadline)
         with connection.getresponse() as response:
             status = response.status
@@ -281,13 +329,13 @@ def _request(raw):
         return {"ok": True, "status": status, "body_b64": base64.b64encode(raw_body).decode("ascii")}
     except _Failure as error:
         code = error.code
-    except (socket.timeout, TimeoutError):
+    except TimeoutError:
         code = "timeout"
     except OSError:
         code = "network_error"
     except (ValueError, TypeError, UnicodeError, RecursionError, http.client.HTTPException):
         code = "http_protocol"
-    except Exception:
+    except Exception:  # noqa: BLE001 - Sanitize all helper failures before they cross the process boundary.
         code = "worker_protocol"
     finally:
         if connection is not None:
@@ -298,14 +346,15 @@ def _request(raw):
 def main():
     try:
         raw = sys.stdin.buffer.read(MAX_REQUEST_FRAME + 1)
-        result = (_request(raw) if len(raw) <= MAX_REQUEST_FRAME else
-                  {"ok": False, "code": "request_limit", "status": None})
+        result = (
+            _request(raw) if len(raw) <= MAX_REQUEST_FRAME else {"ok": False, "code": "request_limit", "status": None}
+        )
         frame = json.dumps(result, ensure_ascii=True, allow_nan=False, separators=(",", ":")).encode("ascii")
         if len(frame) > MAX_RESPONSE_FRAME:
             frame = b'{"ok":false,"code":"response_limit","status":null}'
         sys.stdout.buffer.write(frame)
         sys.stdout.buffer.flush()
-    except Exception:
+    except Exception:  # noqa: BLE001
         # Tracebacks may contain endpoint, request or credential values. Stderr stays empty.
         return 1
     return 0

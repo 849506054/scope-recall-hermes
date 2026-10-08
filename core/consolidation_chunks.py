@@ -1,8 +1,9 @@
 """Bounded views of existing source records; no new source identity or raw copy."""
+
 from __future__ import annotations
 
-from dataclasses import dataclass
 import re
+from dataclasses import dataclass
 
 from ..contracts import ContractError
 from .storage import StoredSource
@@ -40,8 +41,11 @@ def source_chunk(source, offset, *, formatter, episode_ref=None, resume_seed=())
 
     def view(end):
         chunk = ConsolidationChunk(offset, end, total)
-        return ChunkedSource(**dict(source.__dict__, event=dict(source.event, content=content[offset:end])),
-                             consolidation_window=chunk, consolidation_seed=resume_seed)
+        return ChunkedSource(
+            **dict(source.__dict__, event=dict(source.event, content=content[offset:end])),
+            consolidation_window=chunk,
+            consolidation_seed=resume_seed,
+        )
 
     lower, upper = offset + 1, total
     best = None

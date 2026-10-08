@@ -5,11 +5,11 @@ from the running companion and writes them into another backend, comparing both
 sides afterwards.  These cases use the real SQLite companion as the source and
 the in-memory Qdrant double as the destination.
 """
+
 import json
 import time
 
 import pytest
-
 from scope_recall.contracts import InstanceBinding
 from scope_recall.core.recall_policy import SPACE_ID
 from scope_recall.maintenance import vector_migration
@@ -45,8 +45,9 @@ def _row(number):
 
 
 def _source(tmp_path, count=5):
-    store = build_vector_store("sqlite-bruteforce", storage_dir=tmp_path / "vectors",
-                               table_name="memories", dimensions=2)
+    store = build_vector_store(
+        "sqlite-bruteforce", storage_dir=tmp_path / "vectors", table_name="memories", dimensions=2
+    )
     store.open()
     store.upsert_records([_row(number) for number in range(1, count + 1)])
     return store
@@ -55,11 +56,13 @@ def _source(tmp_path, count=5):
 def _target(tmp_path):
     server = Server(tmp_path / "truth")
     store = QdrantVectorStore(
-        tmp_path / "vectors-qdrant", table_name="memories", dimensions=2,
+        tmp_path / "vectors-qdrant",
+        table_name="memories",
+        dimensions=2,
         config=QdrantConfig("http://qdrant:6333"),
-        binding=InstanceBinding("TEST-agent", "TEST-installation", tmp_path / "truth",
-                                frozenset({"TEST-scope"}), True),
-        embedding_space=SPACE_ID, transport=server,
+        binding=InstanceBinding("TEST-agent", "TEST-installation", tmp_path / "truth", frozenset({"TEST-scope"}), True),
+        embedding_space=SPACE_ID,
+        transport=server,
     )
     return store, server
 
@@ -111,8 +114,7 @@ def test_the_copy_writes_through_the_fenced_entry_with_its_own_budget(tmp_path):
 
     target.fenced_upsert_records = fenced
     target.open()
-    receipt = vector_migration.run(source, target, state_path=tmp_path / "state.json",
-                                   batch_size=3, batch_seconds=20.0)
+    receipt = vector_migration.run(source, target, state_path=tmp_path / "state.json", batch_size=3, batch_seconds=20.0)
     assert receipt["copied"] == 5
     assert calls and all(seconds == 20.0 and permitted for _, seconds, permitted in calls)
     assert sum(size for size, _, _ in calls) == 5
@@ -196,14 +198,19 @@ def test_clear_pending_remote_clears_only_on_a_declared_boundary(tmp_path, monke
     marker = gate.status()
     assert marker is not None
     monkeypatch.setattr(cli, "_migration_stores", lambda args: (None, target, tmp_path))
-    args = argparse.Namespace(qdrant_url="http://qdrant:6333", qdrant_api_key_env="TEST_KEY",
-                              qdrant_collection_prefix="scope-recall", confirm="not-the-collection",
-                              after_recopied=False, seconds=5.0)
-    assert cli._clear_pending_remote(args) == 1          # the collection is not named
+    args = argparse.Namespace(
+        qdrant_url="http://qdrant:6333",
+        qdrant_api_key_env="TEST_KEY",
+        qdrant_collection_prefix="scope-recall",
+        confirm="not-the-collection",
+        after_recopied=False,
+        seconds=5.0,
+    )
+    assert cli._clear_pending_remote(args) == 1  # the collection is not named
     args.confirm = marker["collection"]
-    assert cli._clear_pending_remote(args) == 1          # holds points, work not declared redone
+    assert cli._clear_pending_remote(args) == 1  # holds points, work not declared redone
     assert gate.status() == marker
     args.after_recopied = True
     assert cli._clear_pending_remote(args) == 0
     assert gate.status() is None
-    assert cli._clear_pending_remote(args) == 0          # nothing left to clear
+    assert cli._clear_pending_remote(args) == 0  # nothing left to clear

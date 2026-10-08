@@ -1,15 +1,25 @@
 """Explicit auxiliary runtime composition for approved external routes only."""
+
 from __future__ import annotations
 
-from dataclasses import dataclass
 import hashlib
 import json
 import os
+from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Mapping
 
-from ..adapters.models import (
+from .codex_cli import CodexCliConsolidationAdapter, CodexCliRouteConfig
+from .model_budget import (
+    AuxiliaryBudgetLedger,
+    BudgetPolicy,
+    ModelPricing,
+    default_budget_policy,
+    load_hermes_attempt_authorization,
+    read_auxiliary_budget_status,
+)
+from .models import (
     RESPONSES_KIND,
     ConsolidationRouteConfig,
     EmbeddingRouteConfig,
@@ -19,18 +29,8 @@ from ..adapters.models import (
     ResponsesConsolidationAdapter,
     ResponsesRouteConfig,
 )
-from ..adapters.codex_cli import CodexCliConsolidationAdapter, CodexCliRouteConfig
 from .subscription_budget import SubscriptionBudgetLedger
-from .model_budget import (
-    AuxiliaryBudgetLedger,
-    BudgetPolicy,
-    ModelPricing,
-    default_budget_policy,
-    load_hermes_attempt_authorization,
-    read_auxiliary_budget_status,
-)
 from .validation import absolute_path, mapping, only_keys, positive_int, strict_bool, text
-
 
 DEFAULT_LEDGER_NAME = "auxiliary-budget.sqlite3"
 
@@ -59,7 +59,9 @@ class AuxiliaryRuntimeConfig:
             ledger_path = installation_dir / DEFAULT_LEDGER_NAME
         return AuxiliaryRuntimeConfig(
             external_embedding=strict_bool("external_embedding_bool_required", raw.get("external_embedding")),
-            external_consolidation=strict_bool("external_consolidation_bool_required", raw.get("external_consolidation")),
+            external_consolidation=strict_bool(
+                "external_consolidation_bool_required", raw.get("external_consolidation")
+            ),
             installation_dir=installation_dir,
             ledger_path=ledger_path,
             budget=_budget_policy_from_mapping(raw.get("budget")),
@@ -200,8 +202,14 @@ def _embedding_route_from_mapping(raw: object) -> EmbeddingRouteConfig | None:
 #: has no legacy to stay compatible with and an unknown key is a setting nobody
 #: reads rather than a field to ignore.
 _RESPONSES_ROUTE_KEYS = (
-    "kind", "model", "endpoint", "credential_env", "max_output_tokens",
-    "reasoning_effort", "text_format", "stream",
+    "kind",
+    "model",
+    "endpoint",
+    "credential_env",
+    "max_output_tokens",
+    "reasoning_effort",
+    "text_format",
+    "stream",
 )
 
 
@@ -220,7 +228,9 @@ def _responses_route_from_mapping(raw: Mapping[str, Any]) -> ResponsesRouteConfi
     )
 
 
-def _consolidation_route_from_mapping(raw: object) -> ConsolidationRouteConfig | ResponsesRouteConfig | CodexCliRouteConfig | None:
+def _consolidation_route_from_mapping(
+    raw: object,
+) -> ConsolidationRouteConfig | ResponsesRouteConfig | CodexCliRouteConfig | None:
     if raw is None:
         return None
     raw = mapping("consolidation_mapping_required", raw)
@@ -289,11 +299,17 @@ def build_auxiliary_runtime(
         # Same ledger, transport, deadline, response cap and settlement; only
         # the request dialect and the answer extraction differ.
         consolidation_adapter = ResponsesConsolidationAdapter(
-            config.consolidation, ledger=ledger, reserve_input=reserve_input, transport=transport,
+            config.consolidation,
+            ledger=ledger,
+            reserve_input=reserve_input,
+            transport=transport,
         )
     else:
         consolidation_adapter = OpenAIConsolidationAdapter(
-            config.consolidation, ledger=ledger, reserve_input=reserve_input, transport=transport,
+            config.consolidation,
+            ledger=ledger,
+            reserve_input=reserve_input,
+            transport=transport,
         )
     return AuxiliaryRuntime(
         source_embedding=embed_adapter,
@@ -318,6 +334,7 @@ def auxiliary_runtime_status(config: AuxiliaryRuntimeConfig) -> dict:
         "budget": budget,
         "subscription_budget": (
             runtime.consolidation.ledger.status()
-            if isinstance(runtime.consolidation, CodexCliConsolidationAdapter) else None
+            if isinstance(runtime.consolidation, CodexCliConsolidationAdapter)
+            else None
         ),
     }

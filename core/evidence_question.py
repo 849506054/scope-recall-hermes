@@ -24,13 +24,17 @@ Not responsible for: choosing which evidence the model sees.  The selection
 still sends the newest that fits; this only decides whether that selection is
 a question already answered.
 """
+
 from __future__ import annotations
 
-from dataclasses import dataclass
 import hashlib
 import json
-from typing import Iterable, Mapping
 import unicodedata
+from dataclasses import dataclass
+from typing import Iterable, Mapping
+
+from .claims import AUTHORITY_ORIGINS, HUMAN_ONLY_KINDS, VALUE_FREE_KINDS
+from .source_qualification import bound_literal
 
 #: Origins that count as somebody testifying rather than the system observing
 #: itself.  ``core/corroboration.py`` uses the same notion for promotion; kept
@@ -63,13 +67,8 @@ def question_digest(evidence: object) -> str:
     Equal digests mean "we already asked this and were told the answer"; a
     different digest means something changed that could change the verdict.
     """
-    first_hand = sorted(
-        f"{ref}@{int(revision)}"
-        for ref, revision, origin in (evidence or ())
-        if is_first_hand(origin)
-    )
-    payload = json.dumps({"first_hand": first_hand},
-                         ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    first_hand = sorted(f"{ref}@{int(revision)}" for ref, revision, origin in (evidence or ()) if is_first_hand(origin))
+    payload = json.dumps({"first_hand": first_hand}, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
@@ -87,7 +86,7 @@ def question_digest(evidence: object) -> str:
 # verdict was already decided:
 #
 # * authority -- ``_cite`` keeps complete, gap-free roots and ``_authority``
-#   needs a human, tool or document one (a human one for ``_HUMAN_ONLY_KINDS``);
+#   needs a human, tool or document one (a human one for ``HUMAN_ONLY_KINDS``);
 # * value -- ``_value_preserved`` needs ``value_text`` inside the quotes for every
 #   kind but procedure, intention and alias, and a quote is an exact slice of a
 #   supplied source.  Compared here on letters and digits only, after NFKC and
@@ -120,7 +119,7 @@ def evidence_text(source) -> EvidenceText:
     return EvidenceText(origin, complete, str(source.event.get("content") or ""))
 
 
-def _letters_and_digits(value: object) -> str:
+def nfkc_letters_and_digits(value: object) -> str:
     text = unicodedata.normalize("NFKC", str(value or "")).casefold()
     return "".join(character for character in text if character.isalnum())
 
@@ -128,19 +127,18 @@ def _letters_and_digits(value: object) -> str:
 def unanswerable_reason(payload: Mapping, evidence: Iterable[EvidenceText]) -> str | None:
     """Why no verdict on ``evidence`` could promote this candidate, or ``None``."""
     # The qualification rules own these sets; importing them keeps the two in step.
-    from .claims import _AUTHORITY_ORIGINS, _HUMAN_ONLY_KINDS, _VALUE_FREE_KINDS
 
     kind = payload.get("kind") if isinstance(payload, Mapping) else None
     if kind not in _CLAIM_KINDS:
         return None
     items = tuple(evidence)
-    needed = ("human_direct",) if kind in _HUMAN_ONLY_KINDS else _AUTHORITY_ORIGINS
+    needed = ("human_direct",) if kind in HUMAN_ONLY_KINDS else AUTHORITY_ORIGINS
     if not any(item.complete and item.origin in needed for item in items):
         return "no_authoritative_evidence"
-    value = _letters_and_digits(payload.get("value_text"))
-    if kind in _VALUE_FREE_KINDS or not value:
+    value = nfkc_letters_and_digits(payload.get("value_text"))
+    if kind in VALUE_FREE_KINDS or not value:
         return None
-    if not any(value in _letters_and_digits(item.content) for item in items):
+    if not any(value in nfkc_letters_and_digits(item.content) for item in items):
         return "value_not_in_evidence"
     return None
 
@@ -153,6 +151,7 @@ def unanswerable_reason(payload: Mapping, evidence: Iterable[EvidenceText]) -> s
 # output authority and reads a value from any quote it cites, so a verdict quoting
 # a tool output's value beside any fragment of a person's message was written as
 # that person's report.
+
 
 def rootless(cited_origins: Iterable[str], evidence: Iterable[EvidenceText]) -> str | None:
     """``NO_DERIVATION_ROOT_REASON`` for a candidate nothing a claim may be derived from speaks to.
@@ -176,9 +175,6 @@ def rooted_verdict(proposal: Mapping, quoted: Iterable[tuple[EvidenceText, str]]
     carries nothing.  Kinds proved without a value (intention, alias) need the root quote
     alone; ``qualify`` already asks a person of them.
     """
-    from .claims import _VALUE_FREE_KINDS
-    from .source_qualification import bound_literal
-
     roots = [(text, quote) for text, quote in quoted if text.complete and text.origin in DERIVATION_ROOT_ORIGINS]
     if not roots:
         return False
@@ -187,7 +183,7 @@ def rooted_verdict(proposal: Mapping, quoted: Iterable[tuple[EvidenceText, str]]
         method = (proposal.get("procedure") or {}).get("method") or ()
         return bool(method) and all(any(step in text.content for text, _quote in roots) for step in method)
     value = str(proposal.get("value_text") or "")
-    if kind in _VALUE_FREE_KINDS or not value.strip():
+    if kind in VALUE_FREE_KINDS or not value.strip():
         return True
     return any(bound_literal(quote, value) for _text, quote in roots)
 
@@ -201,7 +197,7 @@ def rooted_verdict(proposal: Mapping, quoted: Iterable[tuple[EvidenceText, str]]
 # verdicts that promoted a fact, 19 came from a candidate's first verdict, 4 from
 # its second, and 4 from the fifth or later.  Two rules follow:
 #
-# * a kind only a person can establish (``claims._HUMAN_ONLY_KINDS``) that was
+# * a kind only a person can establish (``claims.HUMAN_ONLY_KINDS``) that was
 #   proposed from sources where no person spoke is not a candidate at all: 2,034
 #   of those evaluations promoted nothing, and when the person does say it, the
 #   consolidation of their own words proposes it with the authority it needs;
@@ -226,11 +222,9 @@ def needs_absent_person(payload: Mapping, cited_origins: Iterable[str]) -> bool:
     ``cited_origins`` are the effective origins of the sources the proposal
     cites.  An empty or unknown origin set is never judged absent.
     """
-    from .claims import _HUMAN_ONLY_KINDS
-
     kind = payload.get("kind") if isinstance(payload, Mapping) else None
     origins = frozenset(cited_origins)
-    return kind in _HUMAN_ONLY_KINDS and bool(origins) and origins <= IMPERSONAL_ORIGINS
+    return kind in HUMAN_ONLY_KINDS and bool(origins) and origins <= IMPERSONAL_ORIGINS
 
 
 def restatement_needle(payload: Mapping) -> str:
@@ -239,13 +233,11 @@ def restatement_needle(payload: Mapping) -> str:
     The value for kinds whose promotion quotes it; the subject for the kinds
     proved otherwise.  Empty when neither has a letter or digit.
     """
-    from .claims import _VALUE_FREE_KINDS
-
     if not isinstance(payload, Mapping):
         return ""
-    value = _letters_and_digits(payload.get("value_text"))
-    if payload.get("kind") in _VALUE_FREE_KINDS or not value:
-        return _letters_and_digits(payload.get("subject"))
+    value = nfkc_letters_and_digits(payload.get("value_text"))
+    if payload.get("kind") in VALUE_FREE_KINDS or not value:
+        return nfkc_letters_and_digits(payload.get("subject"))
     return value
 
 
@@ -254,10 +246,25 @@ def restates(payload: Mapping, contents: Iterable[str]) -> bool:
     needle = restatement_needle(payload)
     if not needle:
         return True
-    return any(needle in _letters_and_digits(content) for content in contents)
+    return any(needle in nfkc_letters_and_digits(content) for content in contents)
 
 
-__all__ = ["AUTOMATIC_VERDICTS", "DERIVATION_ROOT_ORIGINS", "FIRST_HAND_ORIGINS", "IMPERSONAL_ORIGINS",
-           "NO_DERIVATION_ROOT_REASON", "PERSON_ABSENT_REASON", "rooted_verdict", "rootless",
-           "REPEAT_WITHOUT_RESTATEMENT_REASON", "EvidenceText", "evidence_text", "is_first_hand",
-           "needs_absent_person", "question_digest", "restatement_needle", "restates", "unanswerable_reason"]
+__all__ = [
+    "AUTOMATIC_VERDICTS",
+    "DERIVATION_ROOT_ORIGINS",
+    "FIRST_HAND_ORIGINS",
+    "IMPERSONAL_ORIGINS",
+    "NO_DERIVATION_ROOT_REASON",
+    "PERSON_ABSENT_REASON",
+    "rooted_verdict",
+    "rootless",
+    "REPEAT_WITHOUT_RESTATEMENT_REASON",
+    "EvidenceText",
+    "evidence_text",
+    "is_first_hand",
+    "needs_absent_person",
+    "question_digest",
+    "restatement_needle",
+    "restates",
+    "unanswerable_reason",
+]

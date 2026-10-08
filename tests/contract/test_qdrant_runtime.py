@@ -1,10 +1,10 @@
 """Trusted identity reaches a remote store independently of connection settings."""
-from dataclasses import replace
+
 import sys
+from dataclasses import replace
 from types import ModuleType
 
 import pytest
-
 from scope_recall.contracts import InstanceBinding
 from scope_recall.runtime.auxiliary import AuxiliaryRuntimeConfig
 from scope_recall.runtime.instance import RuntimeInstanceConfig, VectorRuntimeConfig, build_runtime_instance
@@ -13,21 +13,31 @@ from scope_recall.vector.store import build_vector_store
 
 
 def runtime_config(tmp_path):
-    binding = InstanceBinding("TEST-agent", "TEST-install", tmp_path / "truth",
-                              frozenset({"TEST-scope"}), True)
-    vector = VectorRuntimeConfig("qdrant", tmp_path / "vectors", "TEST-vectors", 2,
-                                 test_injection_override=True,
-                                 qdrant=QdrantConfig("http://localhost:6333"))
-    return RuntimeInstanceConfig(binding, "TEST-session", binding.scope_ids, vector=vector,
-                                 auxiliary=AuxiliaryRuntimeConfig.from_mapping(
-                                     {"external_embedding": False, "external_consolidation": False}))
+    binding = InstanceBinding("TEST-agent", "TEST-install", tmp_path / "truth", frozenset({"TEST-scope"}), True)
+    vector = VectorRuntimeConfig(
+        "qdrant",
+        tmp_path / "vectors",
+        "TEST-vectors",
+        2,
+        test_injection_override=True,
+        qdrant=QdrantConfig("http://localhost:6333"),
+    )
+    return RuntimeInstanceConfig(
+        binding,
+        "TEST-session",
+        binding.scope_ids,
+        vector=vector,
+        auxiliary=AuxiliaryRuntimeConfig.from_mapping({"external_embedding": False, "external_consolidation": False}),
+    )
 
 
 def test_runtime_binds_remote_factory_without_constructing_store(tmp_path, monkeypatch):
     config = runtime_config(tmp_path)
     calls = []
-    monkeypatch.setattr("scope_recall.vector.store.build_vector_store",
-                        lambda *args, **kwargs: calls.append((args, kwargs)) or object())
+    monkeypatch.setattr(
+        "scope_recall.runtime.instance.build_vector_store",
+        lambda *args, **kwargs: calls.append((args, kwargs)) or object(),
+    )
     instance = build_runtime_instance(config)
     try:
         assert calls == []
@@ -43,8 +53,10 @@ def test_runtime_binds_remote_factory_without_constructing_store(tmp_path, monke
 def test_custom_factory_preserves_one_argument_seam(tmp_path):
     config = runtime_config(tmp_path)
     calls = []
+
     def custom(value):
         calls.append(value)
+
     instance = build_runtime_instance(config, vector_factory=custom)
     try:
         instance._vector_factory(config.vector)
@@ -59,10 +71,15 @@ def test_store_factory_passes_validated_config_and_identity(tmp_path, monkeypatc
     module = ModuleType("scope_recall.vector.qdrant_store")
     module.QdrantVectorStore = lambda *args, **kwargs: captured.append((args, kwargs)) or object()
     monkeypatch.setitem(sys.modules, module.__name__, module)
-    result = build_vector_store("qdrant", storage_dir=config.vector.storage_dir,
-                               table_name=config.vector.table_name, dimensions=2,
-                               qdrant={"url": "http://localhost:6333"}, binding=config.binding,
-                               embedding_space=config.embedding_space_id())
+    result = build_vector_store(
+        "qdrant",
+        storage_dir=config.vector.storage_dir,
+        table_name=config.vector.table_name,
+        dimensions=2,
+        qdrant={"url": "http://localhost:6333"},
+        binding=config.binding,
+        embedding_space=config.embedding_space_id(),
+    )
     assert result is not None
     args, kwargs = captured[0]
     assert args == (config.vector.storage_dir,)
@@ -83,8 +100,9 @@ def test_legacy_runtime_factory_preserves_original_keywords(tmp_path, monkeypatc
     config = runtime_config(tmp_path)
     config = replace(config, vector=replace(config.vector, backend="sqlite-bruteforce", qdrant=None))
     calls = []
-    monkeypatch.setattr("scope_recall.vector.store.build_vector_store",
-                        lambda *args, **kwargs: calls.append((args, kwargs)))
+    monkeypatch.setattr(
+        "scope_recall.runtime.instance.build_vector_store", lambda *args, **kwargs: calls.append((args, kwargs))
+    )
     instance = build_runtime_instance(config)
     try:
         instance._vector_factory(config.vector)

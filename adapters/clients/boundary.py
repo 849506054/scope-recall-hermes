@@ -1,4 +1,5 @@
 """Convert observed Codex hook payloads into core SourceEvent DTOs."""
+
 from __future__ import annotations
 
 import json
@@ -13,6 +14,11 @@ _MAX_TOOL_CHARS = 65536
 #: of the prompt unless it carries ``additionalContext`` (its ``executeUserPromptSubmitHooks``), so "{}" would stand
 #: before every prompt with nothing recalled; for it an empty answer is nothing at all.
 EMPTY_ANSWER = {"codex": "{}", "claude-code": "{}", "workbuddy": "", "dsh": "{}"}
+#: Where each client's hooks differ.  Claude Code's were the model for Codex's and send the
+#: same fields, except that a turn is named by ``prompt_id``.  Its tool output is not recorded:
+#: a tool result never becomes a memory, and a coding session's tool traffic would be most of
+#: the store for an embedding each.
+TURN_FIELD = {"codex": "turn_id", "claude-code": "prompt_id", "workbuddy": "generation_id", "dsh": "turn_id"}
 
 
 def host_source_key(
@@ -106,16 +112,18 @@ def is_workbuddy_agent_run(payload: dict[str, Any]) -> bool:
     says nothing of the kind: WorkBuddy sets it to whichever agent runs the person's own session, on every turn after
     the first, and ``agent_id`` also names the record of a session loaded from a record named otherwise."""
     agent_id, record = payload.get("agent_id"), payload.get("transcript_path")
-    return ((type(agent_id) is str and agent_id.strip().startswith("agent-"))
-            or (type(record) is str and _WORKBUDDY_SUBAGENT_RECORD.search(record) is not None))
+    return (type(agent_id) is str and agent_id.strip().startswith("agent-")) or (
+        type(record) is str and _WORKBUDDY_SUBAGENT_RECORD.search(record) is not None
+    )
 
 
 #: How Codex opens the prompt it sends through the same hook as a message to ask the model what the owner might do
 #: next.  The owner never wrote it: stored as theirs it put 11,000 to 15,000 characters of Codex's instructions
 #: among their messages, claims were drawn from it as if they had said them, and its recall failed on its length.
 _CODEX_SUGGESTIONS_PROMPT = re.compile(r"\bhyperpersonali[sz]ed\s+suggestions?\b", re.IGNORECASE)
-_CODEX_SUGGESTIONS_HEADINGS = re.compile(r"^#{1,2}[ \t]*(?:overview|rules|examples|bad examples|response format)[ \t]*$",
-                                         re.IGNORECASE | re.MULTILINE)
+_CODEX_SUGGESTIONS_HEADINGS = re.compile(
+    r"^#{1,2}[ \t]*(?:overview|rules|examples|bad examples|response format)[ \t]*$", re.IGNORECASE | re.MULTILINE
+)
 
 
 def is_codex_suggestions_prompt(prompt: str) -> bool:
@@ -259,29 +267,35 @@ def tool_use_source_event(
     origin = "memory_reinjection" if is_scope_recall_tool(tool_name) else "tool_observation"
     input_text, input_truncated = _serialize_tool_value(tool_input)
     response_text, response_truncated = _serialize_tool_value(tool_response)
-    content = json.dumps({"tool_name": tool_name, "tool_input": input_text, "tool_response": response_text}, ensure_ascii=False)
+    content = json.dumps(
+        {"tool_name": tool_name, "tool_input": input_text, "tool_response": response_text}, ensure_ascii=False
+    )
     if not response_text.strip() and not input_text.strip():
         return None, ("outcome_gap:missing_tool_result",), origin
     gaps = ("capture_gap:tool_payload_truncated",) if input_truncated or response_truncated else ()
-    return {
-        "protocol_version": "1.1",
-        "source_event_key": host_source_key(
-            host=host,
-            installation_id=installation_id,
-            session_id=session_id,
-            event_kind="tool",
-            event_id=tool_use_id,
-        ),
-        "source_revision": 1,
-        "origin": origin,
-        "role": "tool",
-        "content": content,
-        "occurred_at": recorded_at,
-        "recorded_at": recorded_at,
-        "time_precision": "instant",
-        "capture_state": "partial" if gaps else "complete",
-        "evidence_refs": [],
-    }, gaps, origin
+    return (
+        {
+            "protocol_version": "1.1",
+            "source_event_key": host_source_key(
+                host=host,
+                installation_id=installation_id,
+                session_id=session_id,
+                event_kind="tool",
+                event_id=tool_use_id,
+            ),
+            "source_revision": 1,
+            "origin": origin,
+            "role": "tool",
+            "content": content,
+            "occurred_at": recorded_at,
+            "recorded_at": recorded_at,
+            "time_precision": "instant",
+            "capture_state": "partial" if gaps else "complete",
+            "evidence_refs": [],
+        },
+        gaps,
+        origin,
+    )
 
 
 def lifecycle_source_event(
@@ -316,7 +330,9 @@ def lifecycle_source_event(
     }
 
 
-def turn_id_from_payload(payload: dict[str, Any], *, required: bool, field: str = "turn_id") -> tuple[str | None, tuple[str, ...]]:
+def turn_id_from_payload(
+    payload: dict[str, Any], *, required: bool, field: str = "turn_id"
+) -> tuple[str | None, tuple[str, ...]]:
     """The host's id of this turn: Codex's ``turn_id``, Claude Code's ``prompt_id``."""
     turn_id = _bounded_turn_id(payload.get(field))
     if turn_id is None and required:
@@ -356,7 +372,7 @@ def without_lone_surrogates(value):
     pending = [(value, top)]
     while pending:
         source, target = pending.pop()
-        for key, item in (source.items() if isinstance(source, dict) else enumerate(source)):
+        for key, item in source.items() if isinstance(source, dict) else enumerate(source):
             if isinstance(item, str):
                 item = _LONE_SURROGATE.sub("\ufffd", item)
             elif isinstance(item, (dict, list)):

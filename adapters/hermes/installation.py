@@ -1,15 +1,16 @@
 """Trusted Hermes installation manifest and explicit install helper."""
+
 from __future__ import annotations
 
-from dataclasses import dataclass, field, replace
 import hashlib
 import json
 import os
-from pathlib import Path
 import re
 import secrets
 import tempfile
 import time
+from dataclasses import dataclass, field, replace
+from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
 from scope_recall.contracts import ENTRY_ID, InstanceBinding, TrustedContext
@@ -17,9 +18,16 @@ from scope_recall.core import CoreConfig, MemoryCore
 from scope_recall.core.storage import SQLiteStorage
 
 from .audiences import (
-    EXACT_FIELDS, LOCAL_USER_ID, HermesIdentityError, _audience_entry, _normalize_audience_entry,
-    is_archive_scope, normalize_local_platforms, normalize_owner_logins, normalize_retained_scope_ids,
+    EXACT_FIELDS,
+    LOCAL_USER_ID,
+    HermesIdentityError,
+    audience_entry,
+    is_archive_scope,
+    normalize_audience_entry,
+    normalize_local_platforms,
+    normalize_owner_logins,
     normalize_owner_principals,
+    normalize_retained_scope_ids,
 )
 
 MANIFEST_FILENAME = "installation.json"
@@ -68,7 +76,7 @@ def build_archive_scope_id(source_scope: str) -> str:
     manifest. Hashes alone are not a claim of mathematical injectivity. This
     scope is strictly disallowed in runtime audiences.
     """
-    if type(source_scope) is not str or source_scope in ('', '*'):
+    if type(source_scope) is not str or source_scope in ("", "*"):
         raise HermesIdentityError("invalid source scope for archive ID")
     raw = source_scope.encode("utf-8")
     hex_id = f"archive|source:{len(raw)}:{raw.hex()}"
@@ -123,7 +131,9 @@ def _archive_values(mapping: Mapping[str, str], *, label: str, reject_star: bool
     """Every value must be a distinct archive-namespace scope; keys are nonempty originals."""
     for key, value in mapping.items():
         if type(key) is not str or not key or (reject_star and key == "*"):
-            raise HermesIdentityError(f"{label} map key must be nonempty string" + (" and not '*'" if reject_star else ""))
+            raise HermesIdentityError(
+                f"{label} map key must be nonempty string" + (" and not '*'" if reject_star else "")
+            )
         if type(value) is not str or not value or not is_archive_scope(value):
             raise HermesIdentityError(f"{label} map value must be nonempty string in archive namespace")
         if value in seen:
@@ -222,7 +232,7 @@ def _build_audience_scope_ids(
 
 def _grant(scope_id: str, *, kind: str, chat_type: str, chat_id: str, route: dict[str, str]) -> dict[str, Any]:
     """One exact audience row whose read, write and capture grants are the same single scope."""
-    return _audience_entry(
+    return audience_entry(
         **route,
         chat_type=chat_type,
         chat_id=chat_id,
@@ -234,41 +244,51 @@ def _grant(scope_id: str, *, kind: str, chat_type: str, chat_id: str, route: dic
     )
 
 
-def _local_grant(owner_private_scope: str, *, platform: str, agent_workspace: str,
-                 user_id: str = LOCAL_USER_ID) -> dict[str, Any]:
+def _local_grant(
+    owner_private_scope: str, *, platform: str, agent_workspace: str, user_id: str = LOCAL_USER_ID
+) -> dict[str, Any]:
     """The owner's private scope on a local surface, routed the way the adapter routes a session there: a
     one-to-one chat with whoever the session names, nobody (``local``) or a dashboard login."""
     route = dict(platform=platform, user_id=user_id, gateway_session_key="", agent_workspace=agent_workspace)
     return _grant(owner_private_scope, kind="owner_private", chat_type="private", chat_id=user_id, route=route)
 
 
-def _unapproved(manifest: InstallationManifest, principals: Sequence[tuple[str, str]], *,
-                agent_workspace: str) -> tuple[tuple[str, str], ...]:
+def _unapproved(
+    manifest: InstallationManifest, principals: Sequence[tuple[str, str]], *, agent_workspace: str
+) -> tuple[tuple[str, str], ...]:
     """Which of these ``(platform, user)`` pairs the manifest lacks the owner principal or the grant for."""
     missing = []
     for platform, user_id in principals:
-        grant = _local_grant(manifest.audience_scopes["owner_private"], platform=platform,
-                             agent_workspace=agent_workspace, user_id=user_id)
+        grant = _local_grant(
+            manifest.audience_scopes["owner_private"],
+            platform=platform,
+            agent_workspace=agent_workspace,
+            user_id=user_id,
+        )
         routed = any(all(row.get(name) == grant[name] for name in EXACT_FIELDS) for row in manifest.audiences)
         if dict(platform=platform, user_id=user_id) not in manifest.owner_principals or not routed:
             missing.append((platform, user_id))
     return tuple(missing)
 
 
-def unapproved_local_platforms(manifest: InstallationManifest, platforms: Sequence[str], *, agent_workspace: str) -> tuple[str, ...]:
+def unapproved_local_platforms(
+    manifest: InstallationManifest, platforms: Sequence[str], *, agent_workspace: str
+) -> tuple[str, ...]:
     """Which of these local surfaces the manifest lacks the owner principal or the grant for."""
     principals = [(platform, LOCAL_USER_ID) for platform in normalize_local_platforms(list(platforms))]
     return tuple(platform for platform, _user in _unapproved(manifest, principals, agent_workspace=agent_workspace))
 
 
-def unapproved_owner_logins(manifest: InstallationManifest, logins: Sequence[str], *,
-                            agent_workspace: str) -> tuple[tuple[str, str], ...]:
+def unapproved_owner_logins(
+    manifest: InstallationManifest, logins: Sequence[str], *, agent_workspace: str
+) -> tuple[tuple[str, str], ...]:
     """Which of these ``<platform>=<login>`` approvals the manifest lacks, as ``(platform, login)``."""
     return _unapproved(manifest, normalize_owner_logins(list(logins)), agent_workspace=agent_workspace)
 
 
-def approve_local_platforms(manifest: InstallationManifest, platforms: Sequence[str], *, agent_workspace: str,
-                            logins: Sequence[str] = ()) -> InstallationManifest:
+def approve_local_platforms(
+    manifest: InstallationManifest, platforms: Sequence[str], *, agent_workspace: str, logins: Sequence[str] = ()
+) -> InstallationManifest:
     """The same manifest with each local surface, and each dashboard login on one, approved as the owner's own.
 
     Approval is two exact entries and nothing else: the owner principal
@@ -280,15 +300,21 @@ def approve_local_platforms(manifest: InstallationManifest, platforms: Sequence[
     """
     principals = list(manifest.owner_principals)
     rows = list(manifest.audiences)
-    wanted = [(platform, LOCAL_USER_ID)
-              for platform in unapproved_local_platforms(manifest, platforms, agent_workspace=agent_workspace)]
+    wanted = [
+        (platform, LOCAL_USER_ID)
+        for platform in unapproved_local_platforms(manifest, platforms, agent_workspace=agent_workspace)
+    ]
     wanted += unapproved_owner_logins(manifest, logins, agent_workspace=agent_workspace)
     for platform, user_id in wanted:
         principal = dict(platform=platform, user_id=user_id)
         if principal not in principals:
             principals.append(principal)
-        grant = _local_grant(manifest.audience_scopes["owner_private"], platform=platform,
-                             agent_workspace=agent_workspace, user_id=user_id)
+        grant = _local_grant(
+            manifest.audience_scopes["owner_private"],
+            platform=platform,
+            agent_workspace=agent_workspace,
+            user_id=user_id,
+        )
         if not any(all(row.get(name) == grant[name] for name in EXACT_FIELDS) for row in rows):
             rows.append(grant)
     return replace(manifest, owner_principals=normalize_owner_principals(principals), audiences=tuple(rows))
@@ -382,17 +408,25 @@ def build_installation_manifest(
     # trusted installer supplies; no non-CLI wildcard is synthesized.
     route = dict(platform=plat, user_id=owner, gateway_session_key=gateway_session_key, agent_workspace=workspace)
     owner_chat = ("cli", "local") if plat == "cli" else ("private", owner)
-    rows = [_grant(scopes["owner_private"], kind="owner_private", chat_type=owner_chat[0], chat_id=owner_chat[1], route=route)]
+    rows = [
+        _grant(
+            scopes["owner_private"], kind="owner_private", chat_type=owner_chat[0], chat_id=owner_chat[1], route=route
+        )
+    ]
     if audiences is not None:
         if project_id:
             raise HermesIdentityError("explicit audiences cannot be mixed with project convenience grants")
-        rows = [_normalize_audience_entry(item) for item in audiences]
+        rows = [normalize_audience_entry(item) for item in audiences]
         if not rows:
             raise HermesIdentityError("explicit audiences must not be empty")
     else:
         # The historical convenience arguments become explicit rows.
         if plat != "cli":
-            rows.append(_grant(scopes["conversation"], kind="conversation", chat_type="group", chat_id=conversation, route=route))
+            rows.append(
+                _grant(
+                    scopes["conversation"], kind="conversation", chat_type="group", chat_id=conversation, route=route
+                )
+            )
         if project_id:
             rows.append(_grant(scopes["project"], kind="project", chat_type="project", chat_id=project, route=route))
     audience_scopes: dict[str, str] = {}
@@ -517,7 +551,7 @@ def _audience_rows(raw: object) -> tuple[dict[str, Any], ...]:
             seen.append(scope_id)
         if type(item.get("capture_scope_id")) is not str:
             raise HermesIdentityError("audience capture_scope_id must be an explicit string")
-    return tuple(_normalize_audience_entry(item) for item in raw)
+    return tuple(normalize_audience_entry(item) for item in raw)
 
 
 def _archive_scope_list(raw: object) -> frozenset[str]:
@@ -558,7 +592,9 @@ _ARCHIVE_FIELDS: tuple[tuple[str, Callable[[object], Any], Callable[[], Any]], .
 )
 
 
-def _archive_field(payload: dict[str, Any], name: str, check: Callable[[object], Any], absent: Callable[[], Any]) -> Any:
+def _archive_field(
+    payload: dict[str, Any], name: str, check: Callable[[object], Any], absent: Callable[[], Any]
+) -> Any:
     if name not in payload:
         return absent()
     if payload[name] is None:
@@ -712,7 +748,9 @@ def _read_json(path: Path, *, limit: int, what: str) -> dict[str, Any]:
 
 def _entry_id(value: object) -> str:
     if type(value) is not str or not ENTRY_ID.fullmatch(value):
-        raise HermesIdentityError("entry_id must be 2 to 32 lowercase letters, digits or hyphens, starting with a letter")
+        raise HermesIdentityError(
+            "entry_id must be 2 to 32 lowercase letters, digits or hyphens, starting with a letter"
+        )
     return value
 
 
@@ -752,15 +790,17 @@ def read_attachment(hermes_home: Path | str) -> Attachment | None:
     root = Path(str(payload.get("root") or ""))
     if not root.is_absolute():
         raise HermesIdentityError("shared store attachment root must be absolute")
-    return Attachment(root.resolve(), _entry_id(payload.get("entry_id")), _display_name(payload.get("display_name")),
-                      payload["host"])
+    return Attachment(
+        root.resolve(), _entry_id(payload.get("entry_id")), _display_name(payload.get("display_name")), payload["host"]
+    )
 
 
 def read_shared_payload(root: Path | str) -> dict[str, Any]:
     """A shared store's manifest, checked as a whole."""
     store = Path(str(root)).expanduser().resolve()
     return _checked_shared_payload(
-        _read_json(store / MANIFEST_FILENAME, limit=_MAX_SHARED_MANIFEST_BYTES, what="shared store manifest"))
+        _read_json(store / MANIFEST_FILENAME, limit=_MAX_SHARED_MANIFEST_BYTES, what="shared store manifest")
+    )
 
 
 def _checked_shared_payload(payload: dict[str, Any]) -> dict[str, Any]:
@@ -781,8 +821,12 @@ def _checked_shared_payload(payload: dict[str, Any]) -> dict[str, Any]:
     for entry in entries:
         carried |= _scope_id_list(entry.get("scope_ids"))
     scope_ids = payload.get("scope_ids")
-    if (not isinstance(scope_ids, list) or any(type(scope_id) is not str for scope_id in scope_ids)
-            or set(scope_ids) != carried or len(set(scope_ids)) != len(scope_ids)):
+    if (
+        not isinstance(scope_ids, list)
+        or any(type(scope_id) is not str for scope_id in scope_ids)
+        or set(scope_ids) != carried
+        or len(set(scope_ids)) != len(scope_ids)
+    ):
         raise HermesIdentityError("shared store scope_ids must be exactly its entries' scopes")
     return payload
 
@@ -867,8 +911,9 @@ def new_shared_payload(root: Path | str, *, agent_id: str = "default", test_mode
 
 def _replace_file(directory: Path, target: Path, text: str) -> None:
     """Write ``target`` in one step: a reader sees the old file or the new one."""
-    handle = tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=directory, prefix=f".{target.stem}-",
-                                         suffix=target.suffix, delete=False)
+    handle = tempfile.NamedTemporaryFile(
+        "w", encoding="utf-8", dir=directory, prefix=f".{target.stem}-", suffix=target.suffix, delete=False
+    )
     with handle:
         handle.write(text)
     staged = Path(handle.name)
@@ -952,10 +997,18 @@ def client_entry_record(
     """
     if host not in CLIENT_HOSTS:
         raise HermesIdentityError(f"a client entry's host is one of {', '.join(CLIENT_HOSTS)}")
-    row = _audience_entry(
-        platform=host, user_id=LOCAL_USER_ID, chat_type="private", chat_id=LOCAL_USER_ID, thread_id="main",
-        gateway_session_key="", agent_workspace="default", allowed_scope_ids=sorted(set(allowed_scope_ids)),
-        writable_scope_ids=sorted(set(writable_scope_ids)), capture_scope_id=capture_scope_id, kind="owner_private",
+    row = audience_entry(
+        platform=host,
+        user_id=LOCAL_USER_ID,
+        chat_type="private",
+        chat_id=LOCAL_USER_ID,
+        thread_id="main",
+        gateway_session_key="",
+        agent_workspace="default",
+        allowed_scope_ids=sorted(set(allowed_scope_ids)),
+        writable_scope_ids=sorted(set(writable_scope_ids)),
+        capture_scope_id=capture_scope_id,
+        kind="owner_private",
     )
     record: dict[str, Any] = {
         "entry_id": _entry_id(entry_id),
@@ -986,8 +1039,9 @@ def attach_shared_entry(
     payload = read_shared_payload(root)
     if (source.agent_id, source.test_mode) != (payload["agent_id"], payload["test_mode"]):
         raise HermesIdentityError("installation agent_id or test_mode differs from the shared store's")
-    record = shared_entry_record(source, entry_id=entry_id, display_name=display_name, attached_at=now,
-                                 python_executable=python_executable)
+    record = shared_entry_record(
+        source, entry_id=entry_id, display_name=display_name, attached_at=now, python_executable=python_executable
+    )
     return attach_shared_record(root, record, now=now)
 
 
@@ -1003,8 +1057,11 @@ def attach_shared_record(root: Path | str, record: dict[str, Any], *, now: str) 
     payload = read_shared_payload(store)
     home = Path(record["home"])
     for entry in payload["entries"]:
-        if (entry["entry_id"] == record["entry_id"] and not _same_path(entry["home"], home)
-                and _points_here(entry["home"], store, entry["entry_id"])):
+        if (
+            entry["entry_id"] == record["entry_id"]
+            and not _same_path(entry["home"], home)
+            and _points_here(entry["home"], store, entry["entry_id"])
+        ):
             # A home that no longer points here gives its id up: the store was
             # copied to another machine and adopted, or the home was detached.
             raise HermesIdentityError("entry_id is already attached from another home")
@@ -1012,16 +1069,19 @@ def attach_shared_record(root: Path | str, record: dict[str, Any], *, now: str) 
             raise HermesIdentityError("home is already attached as another entry")
     before = frozenset(payload["scope_ids"])
     after = before | frozenset(record["scope_ids"])
-    updated = _checked_shared_payload({
-        **payload,
-        "entries": [entry for entry in payload["entries"] if entry["entry_id"] != record["entry_id"]] + [record],
-        "scope_ids": sorted(after),
-    })
+    updated = _checked_shared_payload(
+        {
+            **payload,
+            "entries": [entry for entry in payload["entries"] if entry["entry_id"] != record["entry_id"]] + [record],
+            "scope_ids": sorted(after),
+        }
+    )
     view = _entry_view(store, updated, record)
 
     def binding(scope_ids: frozenset[str]) -> InstanceBinding:
-        return InstanceBinding(payload["agent_id"], payload["installation_id"], store, scope_ids,
-                               payload["test_mode"], "shared")
+        return InstanceBinding(
+            payload["agent_id"], payload["installation_id"], store, scope_ids, payload["test_mode"], "shared"
+        )
 
     if not (store / "memory.sqlite3").exists():
         SQLiteStorage(binding(after)).initialize()
@@ -1032,15 +1092,21 @@ def attach_shared_record(root: Path | str, record: dict[str, Any], *, now: str) 
         tx.register_scopes(after)
         tx.register_entry(view.entry_id, view.entry_name, view.entry_host, now=now)
     write_shared_payload(store, updated)
-    pointer = {"schema": ATTACHMENT_SCHEMA, "root": str(store), "entry_id": view.entry_id,
-               "display_name": view.entry_name, "host": view.entry_host, "attached_at": now}
+    pointer = {
+        "schema": ATTACHMENT_SCHEMA,
+        "root": str(store),
+        "entry_id": view.entry_id,
+        "display_name": view.entry_name,
+        "host": view.entry_host,
+        "attached_at": now,
+    }
     path = attachment_path(home)
     path.parent.mkdir(parents=True, exist_ok=True)
     _replace_file(path.parent, path, json.dumps(pointer, ensure_ascii=False, sort_keys=True, indent=2) + "\n")
     return view
 
 
-def _initialize_core(manifest: InstallationManifest, clock: Any | None) -> tuple[InstanceBinding, MemoryCore]:
+def initialize_core(manifest: InstallationManifest, clock: Any | None) -> tuple[InstanceBinding, MemoryCore]:
     binding = manifest.to_binding()
     core = MemoryCore(CoreConfig(binding), clock=clock)
     core.initialize()
@@ -1089,78 +1155,4 @@ def install_hermes_scope_recall(
         test_mode=test_mode,
     )
     write_installation_manifest(manifest)
-    return _initialize_core(manifest, clock)
-
-
-def _verified_legacy_catalog(source_database: Path | str, source_hash: str, catalog_hash: str) -> dict[str, Any]:
-    from scope_recall.maintenance.migrate_v2 import build_legacy_catalog
-
-    catalog = build_legacy_catalog(source_database)
-    if catalog["source_sha256"] != source_hash:
-        raise HermesIdentityError(
-            f"source snapshot digest mismatch: expected {source_hash}, got {catalog['source_sha256']}"
-        )
-    if catalog["catalog_sha256"] != catalog_hash:
-        raise HermesIdentityError(
-            f"catalog digest mismatch: expected {catalog_hash}, got {catalog['catalog_sha256']}"
-        )
-    if not catalog["is_supported"]:
-        reasons = [item.get("reason", "unknown") for item in catalog.get("unsupported", [])]
-        raise HermesIdentityError(f"legacy catalog reports unsupported semantics: {reasons}")
-    return catalog
-
-
-def install_hermes_archive_migration(
-    hermes_home: Path | str,
-    *,
-    source_database: Path | str,
-    agent_id: str = "p15-archive-agent",
-    platform: str = "cli",
-    user_id: str = "local",
-    agent_workspace: str = "default",
-    test_mode: bool = True,
-    expected_source_hash: str | None = None,
-    expected_catalog_hash: str | None = None,
-    clock: Any | None = None,
-) -> tuple[InstanceBinding, InstallationManifest, dict[str, Any]]:
-    """Explicit opt-in trusted install for isolated archive migrations."""
-    if test_mode is not True:
-        raise HermesIdentityError("archive-only migration requires test_mode=True (literal True)")
-    home = Path(hermes_home)
-    if not home.is_absolute():
-        raise HermesIdentityError("hermes_home must be absolute before resolve")
-    home = home.expanduser().resolve()
-    if not any(part.upper().startswith("TEST") for part in home.parts):
-        raise HermesIdentityError("archive-only installation target must be beneath a TEST-named path component")
-    for label, digest in (("expected_source_hash", expected_source_hash), ("expected_catalog_hash", expected_catalog_hash)):
-        if type(digest) is not str or not _HEX64_RE.fullmatch(digest):
-            raise HermesIdentityError(f"{label} must be exact 64-hex string")
-
-    catalog = _verified_legacy_catalog(source_database, expected_source_hash, expected_catalog_hash)
-    sources = dict.fromkeys(catalog["content_scopes"] + catalog["shared_only_scopes"] + catalog["audit_only_scopes"])
-    manifest = build_installation_manifest(
-        home,
-        agent_id=agent_id,
-        platform=platform,
-        user_id=user_id,
-        agent_workspace=agent_workspace,
-        test_mode=True,
-        archive_source_scopes={source: build_archive_scope_id(source) for source in sources},
-        archive_retention_scopes=AUDIT_RETENTION_SCOPES,
-        archive_snapshot_hash=catalog["source_sha256"],
-        archive_catalog_hash=catalog["catalog_sha256"],
-    )
-
-    target_data = home / "scope-recall"
-    if target_data.exists() and any(target_data.iterdir()):
-        try:
-            existing = load_installation_manifest(home)
-        except HermesIdentityError as exc:
-            raise HermesIdentityError(f"archive target exists but manifest is invalid or unreadable: {exc}") from exc
-        if manifest_payload(existing) != manifest_payload(manifest):
-            raise HermesIdentityError("existing manifest payload does not match intended payload; refusing unrelated target")
-        manifest = existing
-    else:
-        write_installation_manifest(manifest)
-    binding, _core = _initialize_core(manifest, clock)
-    return binding, manifest, catalog
+    return initialize_core(manifest, clock)

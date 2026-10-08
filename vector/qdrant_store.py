@@ -8,22 +8,22 @@ REST reference: https://api.qdrant.tech/api-reference/points/upsert-points
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable, Mapping
 import hashlib
 import json
 import math
-from pathlib import Path
 import time
+from collections.abc import Callable, Iterable, Mapping
+from pathlib import Path
 from typing import Any
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 from ..contracts import ContractError, InstanceBinding
 from ..core.deadline import remaining_seconds as ambient_remaining_seconds
 from . import VectorStore, VectorStoreCompatibilityError
+from .purge import governed_row_ids, purge_request
 from .qdrant_config import QdrantConfig
 from .qdrant_http import QdrantHTTPError, request_json
 from .qdrant_mutation import LeaseFenceRejected, QdrantMutationGate
-from .store import governed_row_ids, purge_request
 
 _INDEX_VERSION = 1
 _COLUMNS = (
@@ -113,9 +113,7 @@ class QdrantVectorStore(VectorStore):
         embedding_space: str,
         transport: Callable[..., dict] = request_json,
     ) -> None:
-        if not isinstance(config, QdrantConfig) or not isinstance(
-            binding, InstanceBinding
-        ):
+        if not isinstance(config, QdrantConfig) or not isinstance(binding, InstanceBinding):
             raise TypeError("QdrantConfig and trusted InstanceBinding required")
         if type(dimensions) is not int or not 1 <= dimensions <= 32768:
             raise ValueError("invalid qdrant dimensions")
@@ -125,9 +123,7 @@ class QdrantVectorStore(VectorStore):
         _text(embedding_space, "embedding_space", maximum=128)
         if not callable(transport):
             raise TypeError("qdrant transport must be callable")
-        super().__init__(
-            storage_dir, table_name=table_name, dimensions=dimensions, metric=metric
-        )
+        super().__init__(storage_dir, table_name=table_name, dimensions=dimensions, metric=metric)
         self.config = config
         self.binding = binding
         self.embedding_space = embedding_space
@@ -141,9 +137,7 @@ class QdrantVectorStore(VectorStore):
             "index_version": _INDEX_VERSION,
         }
         digest = hashlib.sha256(
-            json.dumps(
-                identity, sort_keys=True, ensure_ascii=True, separators=(",", ":")
-            ).encode("ascii")
+            json.dumps(identity, sort_keys=True, ensure_ascii=True, separators=(",", ":")).encode("ascii")
         ).hexdigest()
         self.collection_name = f"{config.collection_prefix}-{digest}"
         self.lock_directory = binding.data_directory / "qdrant"
@@ -164,28 +158,18 @@ class QdrantVectorStore(VectorStore):
             budget = self.config.timeout_seconds if ambient is None else ambient
         else:
             # Worker fencing and maintenance carry independent, explicit budgets.
-            if (
-                type(seconds) not in (int, float)
-                or not math.isfinite(seconds)
-                or seconds <= 0
-            ):
+            if type(seconds) not in (int, float) or not math.isfinite(seconds) or seconds <= 0:
                 raise ValueError("positive finite qdrant budget required")
             budget = min(float(seconds), 45.0)
         deadline = now + budget
         _check_budget(deadline)
         return deadline
 
-    def _request(
-        self, method: str, path: str, body: dict | None, deadline: float
-    ) -> Any:
+    def _request(self, method: str, path: str, body: dict | None, deadline: float) -> Any:
         _check_budget(deadline)
         reply = self._transport(self.config, method, path, body, deadline=deadline)
         _check_budget(deadline)
-        if (
-            type(reply) is not dict
-            or reply.get("status") != "ok"
-            or "result" not in reply
-        ):
+        if type(reply) is not dict or reply.get("status") != "ok" or "result" not in reply:
             raise _invalid()
         return reply["result"]
 
@@ -200,11 +184,7 @@ class QdrantVectorStore(VectorStore):
         names = []
         for entry in result["collections"]:
             _check_budget(deadline)
-            if (
-                type(entry) is not dict
-                or type(entry.get("name")) is not str
-                or not entry["name"]
-            ):
+            if type(entry) is not dict or type(entry.get("name")) is not str or not entry["name"]:
                 raise _invalid()
             names.append(entry["name"])
         if len(names) != len(set(names)):
@@ -227,14 +207,11 @@ class QdrantVectorStore(VectorStore):
             if type(schema) is not dict:
                 raise ValueError
             if "scope_id" in schema and (
-                type(schema["scope_id"]) is not dict
-                or schema["scope_id"].get("data_type") != "keyword"
+                type(schema["scope_id"]) is not dict or schema["scope_id"].get("data_type") != "keyword"
             ):
                 raise ValueError
         except (KeyError, TypeError, ValueError):
-            raise VectorStoreCompatibilityError(
-                "Qdrant collection shape/index mismatch"
-            ) from None
+            raise VectorStoreCompatibilityError("Qdrant collection shape/index mismatch") from None
         return result
 
     def _snapshot_names(self, deadline: float) -> set[str]:
@@ -459,9 +436,7 @@ class QdrantVectorStore(VectorStore):
         gate = self.mutation_gate
         with gate.locked(deadline):
             if self.collection_name not in self._collection_names(deadline):
-                with gate.mutation(
-                    "create_collection", self.collection_name, deadline
-                ) as receipt:
+                with gate.mutation("create_collection", self.collection_name, deadline) as receipt:
                     # Collection creation is synchronous and returns boolean, unlike
                     # point/index operations. Confirm its documented result and read back.
                     created = self._request(
@@ -475,10 +450,7 @@ class QdrantVectorStore(VectorStore):
                         },
                         deadline,
                     )
-                    if (
-                        created is not True
-                        or self.collection_name not in self._collection_names(deadline)
-                    ):
+                    if created is not True or self.collection_name not in self._collection_names(deadline):
                         raise _invalid()
                     self._collection_info(deadline)
                     receipt.complete()
@@ -489,18 +461,14 @@ class QdrantVectorStore(VectorStore):
             for field in ("scope_id", "source"):
                 if field in info["payload_schema"]:
                     continue
-                with gate.mutation(
-                    "create_index", self.collection_name, deadline
-                ) as receipt:
+                with gate.mutation("create_index", self.collection_name, deadline) as receipt:
                     self._completed(
                         "PUT",
                         self._path + "/index?wait=true",
                         {"field_name": field, "field_schema": "keyword"},
                         deadline,
                     )
-                    if (
-                        field not in self._collection_info(deadline)["payload_schema"]
-                    ):
+                    if field not in self._collection_info(deadline)["payload_schema"]:
                         raise _invalid()
                     receipt.complete()
         self._opened = True
@@ -516,9 +484,7 @@ class QdrantVectorStore(VectorStore):
         if type(vector) not in (list, tuple) or len(vector) != self.dimensions:
             raise ValueError("invalid qdrant vector dimensions")
         if any(
-            type(value) not in (int, float)
-            or not math.isfinite(value)
-            or abs(value) > 3.4028234663852886e38
+            type(value) not in (int, float) or not math.isfinite(value) or abs(value) > 3.4028234663852886e38
             for value in vector
         ):
             raise ValueError("invalid qdrant vector number")
@@ -535,9 +501,7 @@ class QdrantVectorStore(VectorStore):
         _text(row["scope_id"], "scope_id")
         return dict(row) | {"vector": self._vector(row["vector"])}
 
-    def _prepare(
-        self, rows: Iterable[dict[str, Any]], deadline: float
-    ) -> list[list[dict]]:
+    def _prepare(self, rows: Iterable[dict[str, Any]], deadline: float) -> list[list[dict]]:
         batches: list[list[dict]] = []
         batch: list[dict] = []
         size = 32
@@ -553,19 +517,10 @@ class QdrantVectorStore(VectorStore):
                 "vector": _direction(row["vector"]),
                 "payload": row,
             }
-            encoded_size = (
-                len(
-                    json.dumps(
-                        point, ensure_ascii=True, allow_nan=False, separators=(",", ":")
-                    )
-                )
-                + 1
-            )
+            encoded_size = len(json.dumps(point, ensure_ascii=True, allow_nan=False, separators=(",", ":"))) + 1
             if encoded_size > _MAX_POINT_BYTES:
                 raise ValueError("qdrant record exceeds size limit")
-            if batch and (
-                len(batch) >= _BATCH_SIZE or size + encoded_size > _BATCH_BYTES
-            ):
+            if batch and (len(batch) >= _BATCH_SIZE or size + encoded_size > _BATCH_BYTES):
                 batches.append(batch)
                 batch, size = [], 32
             batch.append(point)
@@ -594,7 +549,7 @@ class QdrantVectorStore(VectorStore):
             expected = _direction(row["vector"])
             if any(
                 not math.isclose(left, right, rel_tol=2e-5, abs_tol=2e-6)
-                for left, right in zip(actual, expected)
+                for left, right in zip(actual, expected, strict=True)
             ):
                 raise ValueError
             return row
@@ -659,15 +614,11 @@ class QdrantVectorStore(VectorStore):
     ) -> None:
         ids = [point["payload"]["id"] for batch in batches for point in batch]
         try:
-            with self.mutation_gate.mutation(
-                "upsert", self.collection_name, deadline, guard=guard, ids=ids
-            ) as receipt:
+            with self.mutation_gate.mutation("upsert", self.collection_name, deadline, guard=guard, ids=ids) as receipt:
                 # ponytail: bounded batches share one fence; a partial remote commit
                 # leaves the whole mutation pending, requiring controlled recovery.
                 for batch in batches:
-                    self._completed(
-                        "PUT", self._path + "/points?wait=true", {"points": batch}, deadline
-                    )
+                    self._completed("PUT", self._path + "/points?wait=true", {"points": batch}, deadline)
                     expected = {point["payload"]["id"]: point["payload"] for point in batch}
                     if self._retrieve(list(expected), deadline) != expected:
                         raise _invalid()
@@ -733,9 +684,7 @@ class QdrantVectorStore(VectorStore):
         deadline = self._deadline()
         listed = self._ids(ids, deadline)
         if listed:
-            with self.mutation_gate.mutation(
-                "delete", self.collection_name, deadline
-            ) as receipt:
+            with self.mutation_gate.mutation("delete", self.collection_name, deadline) as receipt:
                 self._delete_batches(listed, deadline)
                 receipt.complete()
 
@@ -768,9 +717,7 @@ class QdrantVectorStore(VectorStore):
             body = {"limit": _PAGE_SIZE, "with_payload": True, "with_vector": True}
             if cursor is not None:
                 body["offset"] = cursor
-            result = self._request(
-                "POST", self._path + "/points/scroll", body, deadline
-            )
+            result = self._request("POST", self._path + "/points/scroll", body, deadline)
             if (
                 type(result) is not dict
                 or type(result.get("points")) is not list
@@ -797,9 +744,7 @@ class QdrantVectorStore(VectorStore):
                 _check_budget(deadline)
                 return output
             try:
-                valid_cursor = (
-                    type(next_cursor) is str and str(UUID(next_cursor)) == next_cursor
-                )
+                valid_cursor = type(next_cursor) is str and str(UUID(next_cursor)) == next_cursor
             except ValueError:
                 valid_cursor = False
             if (
@@ -828,14 +773,8 @@ class QdrantVectorStore(VectorStore):
         return self._retrieve(wanted, self._deadline())
 
     def _count(self, deadline: float) -> int:
-        result = self._request(
-            "POST", self._path + "/points/count", {"exact": True}, deadline
-        )
-        if (
-            type(result) is not dict
-            or type(result.get("count")) is not int
-            or result["count"] < 0
-        ):
+        result = self._request("POST", self._path + "/points/count", {"exact": True}, deadline)
+        if type(result) is not dict or type(result.get("count")) is not int or result["count"] < 0:
             raise _invalid()
         return result["count"]
 
@@ -860,14 +799,10 @@ class QdrantVectorStore(VectorStore):
                 "duplicate_ids": 0,
             }
 
-    def search(
-        self, vector: list[float], *, scope_id: str, limit: int
-    ) -> list[dict[str, Any]]:
+    def search(self, vector: list[float], *, scope_id: str, limit: int) -> list[dict[str, Any]]:
         return self.search_scopes(vector, scope_ids=[scope_id], limit=limit)
 
-    def search_scopes(
-        self, vector: list[float], *, scope_ids: Iterable[str], limit: int
-    ) -> list[dict[str, Any]]:
+    def search_scopes(self, vector: list[float], *, scope_ids: Iterable[str], limit: int) -> list[dict[str, Any]]:
         self._require_open()
         deadline = self._deadline()
         if type(limit) is not int or limit < 0:
@@ -888,11 +823,7 @@ class QdrantVectorStore(VectorStore):
             },
             deadline,
         )
-        if (
-            type(result) is not dict
-            or type(result.get("points")) is not list
-            or len(result["points"]) > limit
-        ):
+        if type(result) is not dict or type(result.get("points")) is not list or len(result["points"]) > limit:
             raise _invalid()
         output = []
         seen = set()

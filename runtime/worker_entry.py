@@ -4,6 +4,7 @@ The entry point deliberately accepts only a trusted configuration file.  It
 does not initialize a database, infer identity from a request, or keep a
 daemon alive after the bounded drain finishes.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -11,18 +12,20 @@ import hashlib
 import json
 import math
 import os
+import re
 import sqlite3
 import stat
+import sys
 import tempfile
 import time
 from pathlib import Path
-import sys
 from typing import Any, TextIO
 
+from ..contracts import ContractError, TrustedContext
+from ..core.failure_retry import retry_class
 from ..core.file_lock import advisory_file_lock
 from ..core.writer_lease import TruthWriterBusyError
-from ..vector.process_store import NativeVectorPathError
-from ..contracts import ContractError, TrustedContext
+from ..vector.process_store import NativeVectorPathError, ProcessLanceVectorStore
 from .instance import RuntimeInstanceConfig, build_runtime_instance
 from .model_budget import pre_request_refusals, provider_refusals
 from .validation import strict_float, utc_now
@@ -55,6 +58,53 @@ def load_config(path: str | Path) -> RuntimeInstanceConfig:
     return RuntimeInstanceConfig.from_mapping(raw)
 
 
+def credential_environment(config, env_file):
+    """Read only the configured credential keys; never execute/interpolate dotenv."""
+    names = {
+        route.credential_env
+        for route in (getattr(config.auxiliary, "embedding", None), getattr(config.auxiliary, "consolidation", None))
+        if route is not None
+    }
+    qdrant = getattr(getattr(config, "vector", None), "qdrant", None)
+    if qdrant is not None:
+        names.add(qdrant.api_key_env)
+    if not env_file or not names:
+        return {}
+    path = Path(env_file)
+    if not path.is_absolute() or path.is_symlink() or path.stat().st_size > 1048576:
+        raise ValueError("autostart_environment_invalid")
+    result = {}
+    for line in path.read_text(encoding="utf-8-sig").splitlines():
+        match = re.fullmatch(r"\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*?)\s*", line)
+        if match is None or match[1] not in names:
+            continue
+        value = match[2]
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+            value = value[1:-1]
+        else:
+            value = re.split(r"\s+#", value, maxsplit=1)[0]
+        if value and "\x00" not in value and len(value) <= 8192:
+            result[match[1]] = value
+    return result
+
+
+def host_process_credential_environment(runtime_config_path, env_file):
+    """Credential variables for a process the host launches with its own environment.
+
+    The worker receives them through its autostart control file (``resume_once``);
+    a Codex-launched MCP server or hook starts with Codex's environment, which carries
+    none of the configured credential names, so it is given the same two paths and
+    reads them under the same contract: only the names the trusted runtime config
+    declares, never an interpolated dotenv.  Raises ``ValueError`` for an unusable
+    env file and ``OSError``/``ValueError`` for an unreadable config; the caller
+    decides whether a process may run without credentials.
+    """
+    config_path = Path(runtime_config_path)
+    if not config_path.is_absolute():
+        raise ValueError("runtime_config_path_not_absolute")
+    return credential_environment(load_config(config_path), str(env_file))
+
+
 def _is_actionable(error_code: object) -> bool:
     """Whether an operator could still clear this failure.
 
@@ -63,20 +113,27 @@ def _is_actionable(error_code: object) -> bool:
     """
     if not error_code:
         return False
-    from ..core.failure_retry import retry_class
 
     return retry_class(error_code) != "terminal"
 
 
 def _ingress_report(ingress) -> tuple[dict[str, int], list[str]]:
-    """What a pass says of the capture inbox rows it replayed.  A row put off (``capture_inbox._DEFERRED``) is not
-    stored yet, and one given up (``capture_inbox._GAVE_UP``) waits for ``retry-failures --apply``: each is a gap."""
-    counts = {"ingress_deferred": sum(r.error_code == "DEFERRED" for r in ingress),
-              "ingress_given_up": sum(r.error_code == "GAVE_UP" for r in ingress),
-              "ingress_replayed": sum(r.durability == "persisted" for r in ingress),
-              "ingress_cancelled": sum(r.disposition == "cancelled" for r in ingress)}
-    gaps = [gap for gap, key in (("capture_gap:durable_ingress_deferred", "ingress_deferred"),
-                                 ("capture_gap:durable_ingress_given_up", "ingress_given_up")) if counts[key]]
+    """What a pass says of the capture inbox rows it replayed.  A row put off (``inbox_rules.DEFERRED``) is not
+    stored yet, and one given up (``inbox_rules.GAVE_UP``) waits for ``retry-failures --apply``: each is a gap."""
+    counts = {
+        "ingress_deferred": sum(r.error_code == "DEFERRED" for r in ingress),
+        "ingress_given_up": sum(r.error_code == "GAVE_UP" for r in ingress),
+        "ingress_replayed": sum(r.durability == "persisted" for r in ingress),
+        "ingress_cancelled": sum(r.disposition == "cancelled" for r in ingress),
+    }
+    gaps = [
+        gap
+        for gap, key in (
+            ("capture_gap:durable_ingress_deferred", "ingress_deferred"),
+            ("capture_gap:durable_ingress_given_up", "ingress_given_up"),
+        )
+        if counts[key]
+    ]
     return counts, gaps
 
 
@@ -96,9 +153,11 @@ def _receipt_payload(config: RuntimeInstanceConfig, receipt: Any, capability_gap
     # A run that met only by-design terminal outcomes did its job; counting
     # them as degraded made the worker disagree with the doctor, which uses
     # the same classification.
-    degraded = (bool(capability_gaps)
-                or int(getattr(receipt, "retried", 0)) > 0
-                or any(_is_actionable(item.get("error_code")) for item in items))
+    degraded = (
+        bool(capability_gaps)
+        or int(getattr(receipt, "retried", 0)) > 0
+        or any(_is_actionable(item.get("error_code")) for item in items)
+    )
     # An empty queue is a successful idle outcome even when optional external
     # routes are unavailable; the gaps remain explicit for the supervisor.
     unavailable = tuple(getattr(receipt, "unavailable_work_types", ()))
@@ -127,12 +186,10 @@ def _receipt_payload(config: RuntimeInstanceConfig, receipt: Any, capability_gap
 def _is_reparse_point(path: Path) -> bool:
     if path.is_symlink():
         return True
-    return path.exists() and bool(
-        getattr(path.stat(), "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT
-    )
+    return path.exists() and bool(getattr(path.stat(), "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT)
 
 
-def _metadata_path(config: RuntimeInstanceConfig, name: str) -> Path:
+def worker_metadata_path(config: RuntimeInstanceConfig, name: str) -> Path:
     root = config.binding.data_directory
     if any(_is_reparse_point(path) for path in (root, *root.parents)):
         raise ValueError("worker_metadata_reparse_path")
@@ -163,7 +220,7 @@ def _beside_another_process(action):
             time.sleep(_SHARING_PAUSE_SECONDS)
 
 
-def _read_metadata(path: Path) -> dict[str, Any]:
+def read_worker_metadata(path: Path) -> dict[str, Any]:
     if not path.exists():
         return {}
 
@@ -178,7 +235,7 @@ def _read_metadata(path: Path) -> dict[str, Any]:
     return value
 
 
-def _atomic_metadata(path: Path, value: dict[str, Any]) -> None:
+def write_worker_metadata(path: Path, value: dict[str, Any]) -> None:
     payload = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     if len(payload.encode("utf-8")) > METADATA_LIMIT_BYTES:
         raise ValueError("worker_metadata_oversized")
@@ -196,28 +253,58 @@ def _atomic_metadata(path: Path, value: dict[str, Any]) -> None:
         temporary.unlink(missing_ok=True)
 
 
-def persist_worker_status(config: RuntimeInstanceConfig, payload: dict[str, Any], *,
-                          started_at: str, exit_code: int, worker_pid: int | None = None) -> None:
-    lock = _metadata_path(config, "runtime-worker-status.lock")
-    with advisory_file_lock(lock, timeout_seconds=.2):
-        _persist_worker_status_unlocked(config, payload, started_at=started_at,
-                                       exit_code=exit_code, worker_pid=worker_pid)
+def persist_worker_status(
+    config: RuntimeInstanceConfig,
+    payload: dict[str, Any],
+    *,
+    started_at: str,
+    exit_code: int,
+    worker_pid: int | None = None,
+) -> None:
+    lock = worker_metadata_path(config, "runtime-worker-status.lock")
+    with advisory_file_lock(lock, timeout_seconds=0.2):
+        _persist_worker_status_unlocked(
+            config, payload, started_at=started_at, exit_code=exit_code, worker_pid=worker_pid
+        )
 
 
-def _persist_worker_status_unlocked(config: RuntimeInstanceConfig, payload: dict[str, Any], *,
-                                   started_at: str, exit_code: int, worker_pid: int | None = None) -> None:
+def _persist_worker_status_unlocked(
+    config: RuntimeInstanceConfig,
+    payload: dict[str, Any],
+    *,
+    started_at: str,
+    exit_code: int,
+    worker_pid: int | None = None,
+) -> None:
     """Bounded metadata only. Never retain model text, stderr, or credentials."""
-    path = _metadata_path(config, "runtime-worker-status.json")
-    previous = _read_metadata(path)
+    path = worker_metadata_path(config, "runtime-worker-status.json")
+    previous = read_worker_metadata(path)
     if previous.get("installation_id") not in (None, config.binding.installation_id):
         raise ValueError("worker_status_binding_mismatch")
     if str(previous.get("started_at", "")) > started_at:
         return
     # Accept only the closed worker protocol, excluding arbitrary stderr/text.
-    safe = {key: payload[key] for key in ("status", "processed", "completed", "failed", "retried",
-            "skipped", "stale", "obsolete", "deferred", "recovered", "daily_queue_used",
-            "pending_work", "failed_work", "terminal_failed_work",
-            "oldest_pending_at") if key in payload}
+    safe = {
+        key: payload[key]
+        for key in (
+            "status",
+            "processed",
+            "completed",
+            "failed",
+            "retried",
+            "skipped",
+            "stale",
+            "obsolete",
+            "deferred",
+            "recovered",
+            "daily_queue_used",
+            "pending_work",
+            "failed_work",
+            "terminal_failed_work",
+            "oldest_pending_at",
+        )
+        if key in payload
+    }
     safe["capability_gaps"] = [str(value)[:120] for value in payload.get("capability_gaps", ())][:16]
     # One bounded line naming why a child died, chosen by the watchdog from the
     # tail of a traceback; never the stream itself.
@@ -227,13 +314,24 @@ def _persist_worker_status_unlocked(config: RuntimeInstanceConfig, payload: dict
     for key in ("ingress_replayed", "ingress_cancelled", "ingress_deferred", "ingress_given_up", "source_only"):
         if type(payload.get(key)) is int:
             safe[key] = payload[key]
-    safe["items"] = [{key: item[key] for key in ("work_id", "work_type", "disposition", "state", "error_code", "error_detail") if key in item}
-                     for item in payload.get("items", ())[:32]]
+    safe["items"] = [
+        {
+            key: item[key]
+            for key in ("work_id", "work_type", "disposition", "state", "error_code", "error_detail")
+            if key in item
+        }
+        for item in payload.get("items", ())[:32]
+    ]
     finished = utc_now()
-    safe.update(installation_id=config.binding.installation_id, started_at=started_at, finished_at=finished,
-                exit_code=exit_code, worker_pid=worker_pid if worker_pid is not None else os.getpid(),
-                last_success_at=finished if int(payload.get("completed", 0)) > 0 else previous.get("last_success_at"))
-    _atomic_metadata(path, safe)
+    safe.update(
+        installation_id=config.binding.installation_id,
+        started_at=started_at,
+        finished_at=finished,
+        exit_code=exit_code,
+        worker_pid=worker_pid if worker_pid is not None else os.getpid(),
+        last_success_at=finished if int(payload.get("completed", 0)) > 0 else previous.get("last_success_at"),
+    )
+    write_worker_metadata(path, safe)
 
 
 def _reserve_daily_work(config: RuntimeInstanceConfig) -> tuple[Path, dict[str, Any], int]:
@@ -242,8 +340,8 @@ def _reserve_daily_work(config: RuntimeInstanceConfig) -> tuple[Path, dict[str, 
     This cap complements, and never resets or expands, the auxiliary ledger's
     call/token/currency budget.
     """
-    path = _metadata_path(config, "runtime-worker-day.json")
-    prior = _read_metadata(path)
+    path = worker_metadata_path(config, "runtime-worker-day.json")
+    prior = read_worker_metadata(path)
     if prior.get("installation_id") not in (None, config.binding.installation_id):
         raise ValueError("worker_budget_binding_mismatch")
     day = utc_now()[:10]
@@ -253,10 +351,13 @@ def _reserve_daily_work(config: RuntimeInstanceConfig) -> tuple[Path, dict[str, 
     # 0 means uncapped: take a full page every pass and let the auxiliary ledger,
     # the only layer that knows what a request costs, be the limit.  The counter
     # still accumulates, so the day's volume stays observable.
-    count = config.max_items if config.daily_work_limit == 0 else \
-        min(config.max_items, max(0, config.daily_work_limit - used))
+    count = (
+        config.max_items
+        if config.daily_work_limit == 0
+        else min(config.max_items, max(0, config.daily_work_limit - used))
+    )
     state = dict(installation_id=config.binding.installation_id, day=day, used=used + count)
-    _atomic_metadata(path, state)
+    write_worker_metadata(path, state)
     return path, state, count
 
 
@@ -306,8 +407,15 @@ def _minimal_payload(config: RuntimeInstanceConfig | None, status: str, gap: str
     }
 
 
-def _report(sink: TextIO, config: RuntimeInstanceConfig | None, payload: dict[str, Any], *,
-            started_at: str, exit_code: int, best_effort: bool = False) -> int:
+def _report(
+    sink: TextIO,
+    config: RuntimeInstanceConfig | None,
+    payload: dict[str, Any],
+    *,
+    started_at: str,
+    exit_code: int,
+    best_effort: bool = False,
+) -> int:
     """Persist the status file, then write the one-line receipt.
 
     ``best_effort`` is for the failure path: a status file that cannot be
@@ -327,11 +435,11 @@ def _vector_preflight_gap(config: RuntimeInstanceConfig) -> str | None:
     """A native path Lance cannot open is reported by name, whatever fails later."""
     if config.vector is None or config.vector.backend != "lancedb":
         return None
-    from ..vector.process_store import ProcessLanceVectorStore
 
     vector = config.vector
-    check = ProcessLanceVectorStore(vector.storage_dir, table_name=vector.table_name,
-                                    dimensions=vector.dimensions, metric=vector.metric)
+    check = ProcessLanceVectorStore(
+        vector.storage_dir, table_name=vector.table_name, dimensions=vector.dimensions, metric=vector.metric
+    )
     return NativeVectorPathError.code if check.native_path_error() else None
 
 
@@ -346,17 +454,21 @@ def _drain_once(config: RuntimeInstanceConfig, instance: Any, deadline: float) -
     # No more than the pass's own budget: with no tick of the clock since the
     # deadline was set (every 15.6 ms on Windows before Python 3.13), ``now +
     # budget - now`` can round to a hair over it, which the drain refuses.
-    receipt = instance.drain(max_items=reserved or config.max_items,
-                             purge_only=reserved == 0,
-                             remaining_seconds=min(config.drain_seconds, max(.001, deadline - time.monotonic())))
+    receipt = instance.drain(
+        max_items=reserved or config.max_items,
+        purge_only=reserved == 0,
+        remaining_seconds=min(config.drain_seconds, max(0.001, deadline - time.monotonic())),
+    )
     # Purge never spends the optional enrichment budget.
     used = sum(item.work_type != "purge" for item in receipt.items)
     budget_state["used"] -= max(0, reserved - used)
-    _atomic_metadata(budget_path, budget_state)
+    write_worker_metadata(budget_path, budget_state)
     background_gaps = tuple(instance.background_gaps)
     # A held provider is the one refusal that does steer the pass: its work
     # types were not claimed at all (runtime/model_budget.py provider_holds).
-    holds = sorted({f"provider_hold:{model[:64]}" for model, _until in (getattr(instance, "provider_holds", None) or {}).values()})
+    holds = sorted(
+        {f"provider_hold:{model[:64]}" for model, _until in (getattr(instance, "provider_holds", None) or {}).values()}
+    )
     gaps = [*(getattr(instance.auxiliary, "capability_gaps", ()) or ()), *refusals, *holds, *background_gaps]
     if reserved == 0:
         gaps.append("daily_queue_budget")
@@ -374,22 +486,26 @@ def _drain_once(config: RuntimeInstanceConfig, instance: Any, deadline: float) -
     # The admission counts scan every source's JSON and the queue age walks every
     # queued row; a pass reports ``source_only`` from its own items and its depth
     # from a count, and the doctor is where the age is read.
-    _apply_queue_status(payload, gaps, instance.status(include_admission=False, include_queue_age=False),
-                        receipt, background_gaps)
+    _apply_queue_status(
+        payload, gaps, instance.status(include_admission=False, include_queue_age=False), receipt, background_gaps
+    )
     return payload
 
 
-def _apply_queue_status(payload: dict[str, Any], gaps: list[str], queue: Any, receipt: Any,
-                        background_gaps: tuple[str, ...]) -> None:
+def _apply_queue_status(
+    payload: dict[str, Any], gaps: list[str], queue: Any, receipt: Any, background_gaps: tuple[str, ...]
+) -> None:
     """Fold the queue's standing into the pass status, with the same
     classification the doctor uses.  Never degraded without saying why: an
     empty gap list is what sent a watcher hunting through two-day-old logs."""
-    terminal_failed = sum(count for code, count in queue.work_error_counts
-                          if not _is_actionable(code))
+    terminal_failed = sum(count for code, count in queue.work_error_counts if not _is_actionable(code))
     actionable_failed = max(0, queue.failed_work - terminal_failed)
-    payload.update(pending_work=queue.pending_work, failed_work=queue.failed_work,
-                   terminal_failed_work=terminal_failed,
-                   oldest_pending_at=queue.oldest_pending_at)
+    payload.update(
+        pending_work=queue.pending_work,
+        failed_work=queue.failed_work,
+        terminal_failed_work=terminal_failed,
+        oldest_pending_at=queue.oldest_pending_at,
+    )
     if actionable_failed or background_gaps or payload["source_only"]:
         payload["status"] = "degraded"
         if actionable_failed:
@@ -427,8 +543,7 @@ def _owner_timeout(sink: TextIO, config: RuntimeInstanceConfig | None, *, starte
     return _report(sink, config, payload, started_at=started_at, exit_code=124, best_effort=True)
 
 
-def run_worker(config_path: str | Path, *, output: TextIO | None = None,
-               deadline_epoch: float | None = None) -> int:
+def run_worker(config_path: str | Path, *, output: TextIO | None = None, deadline_epoch: float | None = None) -> int:
     sink: TextIO = sys.stdout if output is None else output
     config: RuntimeInstanceConfig | None = None
     instance = None
@@ -440,7 +555,7 @@ def run_worker(config_path: str | Path, *, output: TextIO | None = None,
         preflight_gap = _vector_preflight_gap(config)
         instance = build_runtime_instance(config)
         instance.memory_epoch()  # Validate the bound database before writing metadata.
-        lock_path = _metadata_path(config, "runtime-worker.lock")
+        lock_path = worker_metadata_path(config, "runtime-worker.lock")
         try:
             with advisory_file_lock(lock_path, timeout_seconds=max(0, deadline - time.monotonic())):
                 if deadline_epoch is not None and time.monotonic() >= deadline:
@@ -452,8 +567,12 @@ def run_worker(config_path: str | Path, *, output: TextIO | None = None,
             payload = _minimal_payload(config, "busy", "worker_wait_timeout")
             return _report(sink, config, payload, started_at=started_at, exit_code=75)
     except Exception as exc:
-        if (deadline_epoch is not None and preflight_gap is None
-                and isinstance(exc, ContractError) and exc.code == "DEADLINE_EXCEEDED"):
+        if (
+            deadline_epoch is not None
+            and preflight_gap is None
+            and isinstance(exc, ContractError)
+            and exc.code == "DEADLINE_EXCEEDED"
+        ):
             # The window ran out inside the drain, as it does for a pass that
             # starts with milliseconds left.  Like a kill, it keeps its page.
             return _owner_timeout(sink, config, started_at=started_at)
@@ -481,7 +600,9 @@ def _default_retry_operation(config: RuntimeInstanceConfig, work_ids: tuple[int,
     return "operator-retry-" + hashlib.sha256(material).hexdigest()[:32]
 
 
-def _retry_payload(config: RuntimeInstanceConfig, retry_results: tuple[Any, ...], receipt: Any, gaps: list[str]) -> dict[str, Any]:
+def _retry_payload(
+    config: RuntimeInstanceConfig, retry_results: tuple[Any, ...], receipt: Any, gaps: list[str]
+) -> dict[str, Any]:
     payload = _receipt_payload(config, receipt, gaps)
     payload["operator_retry"] = [
         {
@@ -511,8 +632,12 @@ def run_retry_failed(
     instance = None
     try:
         config = load_config(config_path)
-        if (not work_ids or len(work_ids) > 8 or len(set(work_ids)) != len(work_ids)
-                or any(type(work_id) is not int or work_id < 1 for work_id in work_ids)):
+        if (
+            not work_ids
+            or len(work_ids) > 8
+            or len(set(work_ids)) != len(work_ids)
+            or any(type(work_id) is not int or work_id < 1 for work_id in work_ids)
+        ):
             raise ValueError("retry_work_ids")
         operation_id = operation_id or _default_retry_operation(config, work_ids, expected_memory_epoch)
         instance = build_runtime_instance(config)
@@ -543,7 +668,16 @@ def run_retry_failed(
         _write(sink, _retry_payload(config, retry_results, receipt, gaps))
         return 0
     except TimeoutError:
-        _write(sink, {"status": "busy", "processed": 0, "items": [], "operator_retry": [], "capability_gaps": ["worker_already_running"]})
+        _write(
+            sink,
+            {
+                "status": "busy",
+                "processed": 0,
+                "items": [],
+                "operator_retry": [],
+                "capability_gaps": ["worker_already_running"],
+            },
+        )
         return 0
     except Exception as exc:
         payload = _minimal_payload(config, "degraded", _exception_gap(exc))
@@ -568,8 +702,6 @@ def load_credential_environment(config_path: str | Path, env_file: str | Path) -
     overwriting a variable this process was already given, so the wake's own
     environment always wins.  Returns how many names were set, never their values.
     """
-    from .resume_entry import credential_environment
-
     added = 0
     for name, value in credential_environment(load_config(config_path), str(env_file)).items():
         if name not in os.environ:
@@ -581,9 +713,12 @@ def load_credential_environment(config_path: str | Path, env_file: str | Path) -
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="scope_recall.runtime.worker_entry")
     parser.add_argument("--config", required=True)
-    parser.add_argument("--env-file", help="Absolute file holding the credential names this "
-                                           "instance's runtime config declares; a scheduled wake "
-                                           "carries them in its environment instead.")
+    parser.add_argument(
+        "--env-file",
+        help="Absolute file holding the credential names this "
+        "instance's runtime config declares; a scheduled wake "
+        "carries them in its environment instead.",
+    )
     parser.add_argument("--retry-failed", nargs="+", type=int, metavar="WORK_ID")
     parser.add_argument("--retry-operation-id")
     parser.add_argument("--memory-epoch", type=int)

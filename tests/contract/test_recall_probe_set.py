@@ -5,12 +5,12 @@ gate has.  What a gate *can* check is that the set stays honest: every question
 distinct, every predicate a valid regex that is narrower than "mentions a
 word", and the abstention questions genuinely absent from the answerable set.
 """
+
 from __future__ import annotations
 
 import re
 
 import pytest
-
 from recall_probes import (
     ANSWERABLE,
     GOLD,

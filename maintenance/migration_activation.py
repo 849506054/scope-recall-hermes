@@ -3,32 +3,49 @@
 Loads installer identity, validates injective audience maps and seals completed
 TEST archive handoffs. Never stops a service or changes a scheduled principal.
 """
+
 from __future__ import annotations
-from collections import defaultdict
+
 import hashlib
 import json
 import re
 import sqlite3
+from collections import defaultdict
 from pathlib import Path
 from typing import Any, Mapping
-from .backup import _safe_path
+
+from scope_recall.adapters.clients.config import load_codex_config
+from scope_recall.adapters.hermes.installation import (
+    AUDIT_RETENTION_SCOPES,
+    HermesIdentityError,
+    InstallationManifest,
+    build_archive_scope_id,
+    build_installation_manifest,
+    initialize_core,
+    load_installation_manifest,
+    manifest_payload,
+    write_installation_manifest,
+)
+from scope_recall.contracts import InstanceBinding
+
+from .backup import safe_path
+from .legacy_catalog import build_legacy_catalog
 from .migration_records import MigrationError
 
 _ARCHIVE_REPORT_NAME = "p15-archive-migration-report.json"
 _HEX64 = re.compile(r"[0-9a-fA-F]{64}")
 _STORAGE_DB_NAMES = ("memory.sqlite3",)
 
-def _load_installation_handoff(
+
+def load_installation_handoff(
     manifest_path: str | Path, host: str | None
 ) -> tuple[Any, Path, Path, dict[str, str], str]:
     """Load the host-owned identity and target directory without inventing one."""
-    supplied = _safe_path(manifest_path, error_type=MigrationError)
+    supplied = safe_path(manifest_path, error_type=MigrationError)
     choice = (host or "").strip().lower()
     if choice not in {"", "hermes", "codex"}:
         raise MigrationError("installation host must be hermes or codex")
     if choice in {"", "hermes"}:
-        from scope_recall.adapters.hermes.installation import load_installation_manifest
-
         home = supplied
         if home.is_file() and home.name == "installation.json":
             home = home.parent.parent
@@ -45,8 +62,6 @@ def _load_installation_handoff(
             )
         if choice == "hermes":
             raise MigrationError("Hermes installation manifest is required")
-    from scope_recall.adapters.codex.config import load_codex_config
-
     config_path = supplied
     if config_path.is_dir():
         config_path = config_path / "codex-installation.json"
@@ -60,7 +75,7 @@ def _load_installation_handoff(
     )
 
 
-def _resolve_scope_mapping(
+def resolve_scope_mapping(
     source_scopes: frozenset[str],
     target_scopes: frozenset[str],
     audience_scopes: Mapping[str, str],
@@ -116,41 +131,37 @@ def _resolve_scope_mapping(
     return resolved, issues
 
 
-def _existing_target_scopes(path: Path) -> frozenset[str] | None:
+def existing_target_scopes(path: Path) -> frozenset[str] | None:
     db = path / "memory.sqlite3"
     if not db.exists():
         return None
     conn = sqlite3.connect(f"file:{db.resolve().as_posix()}?mode=ro", uri=True)
     try:
-        return frozenset(
-            str(row[0]) for row in conn.execute("SELECT scope_id FROM instance_scopes")
-        )
+        return frozenset(str(row[0]) for row in conn.execute("SELECT scope_id FROM instance_scopes"))
     finally:
         conn.close()
 
 
-def _require_hex64(value: object, field: str) -> str:
+def require_hex64(value: object, field: str) -> str:
     if type(value) is not str or not _HEX64.fullmatch(value):
         raise MigrationError(f"{field} must be an exact 64-hex digest")
     return value
 
 
-def _require_test_absolute_target(raw: str) -> Path:
+def require_test_absolute_target(raw: str) -> Path:
     target = Path(raw)
     if not target.is_absolute():
         raise MigrationError("archive-install-test target must be an absolute TEST path")
-    resolved = _safe_path(target, error_type=MigrationError)
+    resolved = safe_path(target, error_type=MigrationError)
     if not any(part.upper().startswith("TEST") for part in resolved.parts):
-        raise MigrationError(
-            "archive-install-test target must be beneath a TEST-named path component"
-        )
+        raise MigrationError("archive-install-test target must be beneath a TEST-named path component")
     return resolved
 
 
-def _archive_report_path(target_path: Path, report_arg: str | None) -> Path:
+def archive_report_path(target_path: Path, report_arg: str | None) -> Path:
     if report_arg:
-        return _safe_path(report_arg, error_type=MigrationError)
-    return _safe_path(target_path / "scope-recall" / _ARCHIVE_REPORT_NAME, error_type=MigrationError)
+        return safe_path(report_arg, error_type=MigrationError)
+    return safe_path(target_path / "scope-recall" / _ARCHIVE_REPORT_NAME, error_type=MigrationError)
 
 
 def _file_sha256(path: Path) -> str:
@@ -239,7 +250,7 @@ def _write_exclusive_text(path: Path, text: str) -> None:
     path.write_text(text, encoding="utf-8")
 
 
-def _accept_identical_archive_run(
+def accept_identical_archive_run(
     *,
     target_path: Path,
     report_path: Path,
@@ -247,11 +258,6 @@ def _accept_identical_archive_run(
     catalog: dict[str, Any],
     batch_key: str,
 ) -> None:
-    from scope_recall.adapters.hermes.installation import (
-        HermesIdentityError,
-        load_installation_manifest,
-    )
-
     data_dir = target_path / "scope-recall"
     manifest_path = data_dir / "installation.json"
     db_path = data_dir / "memory.sqlite3"
@@ -261,9 +267,7 @@ def _accept_identical_archive_run(
     try:
         manifest = load_installation_manifest(target_path)
     except HermesIdentityError as exc:
-        raise MigrationError(
-            f"installed manifest is invalid or does not bind this run: {exc}"
-        ) from exc
+        raise MigrationError(f"installed manifest is invalid or does not bind this run: {exc}") from exc
     if manifest.test_mode is not True:
         raise MigrationError("installed manifest is not a TEST archive installation")
     if (
@@ -291,7 +295,7 @@ def _accept_identical_archive_run(
         raise MigrationError("preexisting receipt does not bind this identical run")
 
 
-def _write_complete_archive_receipt(
+def write_complete_archive_receipt(
     *,
     target_path: Path,
     report_path: Path,
@@ -316,3 +320,76 @@ def _write_complete_archive_receipt(
     )
 
 
+def _verified_legacy_catalog(source_database: Path | str, source_hash: str, catalog_hash: str) -> dict[str, Any]:
+    catalog = build_legacy_catalog(source_database)
+    if catalog["source_sha256"] != source_hash:
+        raise HermesIdentityError(
+            f"source snapshot digest mismatch: expected {source_hash}, got {catalog['source_sha256']}"
+        )
+    if catalog["catalog_sha256"] != catalog_hash:
+        raise HermesIdentityError(f"catalog digest mismatch: expected {catalog_hash}, got {catalog['catalog_sha256']}")
+    if not catalog["is_supported"]:
+        reasons = [item.get("reason", "unknown") for item in catalog.get("unsupported", [])]
+        raise HermesIdentityError(f"legacy catalog reports unsupported semantics: {reasons}")
+    return catalog
+
+
+def install_hermes_archive_migration(
+    hermes_home: Path | str,
+    *,
+    source_database: Path | str,
+    agent_id: str = "p15-archive-agent",
+    platform: str = "cli",
+    user_id: str = "local",
+    agent_workspace: str = "default",
+    test_mode: bool = True,
+    expected_source_hash: str | None = None,
+    expected_catalog_hash: str | None = None,
+    clock: Any | None = None,
+) -> tuple[InstanceBinding, InstallationManifest, dict[str, Any]]:
+    """Explicit opt-in trusted install for isolated archive migrations."""
+    if test_mode is not True:
+        raise HermesIdentityError("archive-only migration requires test_mode=True (literal True)")
+    home = Path(hermes_home)
+    if not home.is_absolute():
+        raise HermesIdentityError("hermes_home must be absolute before resolve")
+    home = home.expanduser().resolve()
+    if not any(part.upper().startswith("TEST") for part in home.parts):
+        raise HermesIdentityError("archive-only installation target must be beneath a TEST-named path component")
+    for label, digest in (
+        ("expected_source_hash", expected_source_hash),
+        ("expected_catalog_hash", expected_catalog_hash),
+    ):
+        if type(digest) is not str or not _HEX64.fullmatch(digest):
+            raise HermesIdentityError(f"{label} must be exact 64-hex string")
+
+    catalog = _verified_legacy_catalog(source_database, expected_source_hash, expected_catalog_hash)
+    sources = dict.fromkeys(catalog["content_scopes"] + catalog["shared_only_scopes"] + catalog["audit_only_scopes"])
+    manifest = build_installation_manifest(
+        home,
+        agent_id=agent_id,
+        platform=platform,
+        user_id=user_id,
+        agent_workspace=agent_workspace,
+        test_mode=True,
+        archive_source_scopes={source: build_archive_scope_id(source) for source in sources},
+        archive_retention_scopes=AUDIT_RETENTION_SCOPES,
+        archive_snapshot_hash=catalog["source_sha256"],
+        archive_catalog_hash=catalog["catalog_sha256"],
+    )
+
+    target_data = home / "scope-recall"
+    if target_data.exists() and any(target_data.iterdir()):
+        try:
+            existing = load_installation_manifest(home)
+        except HermesIdentityError as exc:
+            raise HermesIdentityError(f"archive target exists but manifest is invalid or unreadable: {exc}") from exc
+        if manifest_payload(existing) != manifest_payload(manifest):
+            raise HermesIdentityError(
+                "existing manifest payload does not match intended payload; refusing unrelated target"
+            )
+        manifest = existing
+    else:
+        write_installation_manifest(manifest)
+    binding, _core = initialize_core(manifest, clock)
+    return binding, manifest, catalog

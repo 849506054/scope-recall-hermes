@@ -8,16 +8,15 @@ one request each, one after another, about two seconds a claim.  And members lef
 for themselves were still asked after the lease they were claimed with had run out, their
 vectors paid for and dropped as stale.
 """
+
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
 import sqlite3
+from datetime import datetime, timedelta, timezone
 
 import pytest
-
-from scope_recall.adapters.lance import LanceEmbedPort
 from scope_recall.core.recall_policy import claim_embedding_text, encode_embedding_text
-
+from scope_recall.runtime.lance_port import LanceEmbedPort
 from test_v11_claims import accept, app, capture, draft, revise_request  # noqa: F401  (fixtures)
 
 
@@ -160,7 +159,9 @@ def test_a_vector_written_before_its_claim_was_superseded_is_still_on_the_ledger
         core.drain_worker(ctx, max_items=32, remaining_seconds=30, owner_id="TEST-supersede", embed=port)
     assert port.supersede is None and (target.ref, target.revision) in port.written
     with sqlite3.connect(core.storage.path) as conn:
-        done = set(conn.execute("SELECT subject_ref,subject_revision FROM work_items WHERE work_type='embed' AND state='done'"))
+        done = set(
+            conn.execute("SELECT subject_ref,subject_revision FROM work_items WHERE work_type='embed' AND state='done'")
+        )
     assert set(port.written) <= done, f"points no ledger expects: {sorted(set(port.written) - done)}"
     assert (target.ref, target.revision + 1) in done, "the new revision is embedded as well"
 
@@ -194,14 +195,18 @@ def test_a_vector_written_before_its_embed_was_sent_back_to_wait_is_still_on_the
     core.clock.now = "2026-09-06T12:00:00Z"
     core.drain_worker(ctx, max_items=32, remaining_seconds=30, owner_id="TEST-stall", embed=port)
     with sqlite3.connect(core.storage.path) as conn:
-        state, token = conn.execute("SELECT state,lease_token FROM work_items WHERE work_type='embed' AND subject_ref=?"
-                                    " AND subject_revision=?", (target.ref, target.revision)).fetchone()
+        state, token = conn.execute(
+            "SELECT state,lease_token FROM work_items WHERE work_type='embed' AND subject_ref=? AND subject_revision=?",
+            (target.ref, target.revision),
+        ).fetchone()
     assert (state, token > 0) == ("pending", True) and (target.ref, target.revision) in port.written
     core.revise(ctx, revise_request(target, correction, "新值0"), remaining_seconds=10)
     core.clock.now = "2026-09-06T13:00:00Z"
     core.drain_worker(ctx, max_items=32, remaining_seconds=30, owner_id="TEST-stall", embed=port)
     with sqlite3.connect(core.storage.path) as conn:
-        done = set(conn.execute("SELECT subject_ref,subject_revision FROM work_items WHERE work_type='embed' AND state='done'"))
+        done = set(
+            conn.execute("SELECT subject_ref,subject_revision FROM work_items WHERE work_type='embed' AND state='done'")
+        )
     assert set(port.written) <= done, f"points no ledger expects: {sorted(set(port.written) - done)}"
 
 
@@ -277,8 +282,13 @@ def test_a_claim_group_is_encoded_exactly_as_one_claim_is():
         def __init__(self, index):
             self.ref, self.revision = f"claim-TEST-{index}", 1
             self.scope_id, self.project_id, self.branch_id = "TEST-scope", None, None
-            self.payload = dict(kind="decision", subject="TEST-project", predicate=f"属性{index}",
-                                value_text=f"值{index}", conditions=[])
+            self.payload = dict(
+                kind="decision",
+                subject="TEST-project",
+                predicate=f"属性{index}",
+                value_text=f"值{index}",
+                conditions=[],
+            )
 
     class Embedding:
         def __init__(self):
@@ -318,5 +328,6 @@ def test_the_runtime_boundary_offers_the_claim_group_it_bounds():
 
     bounded = _BoundedEmbed(Port(), 45.0)
     assert bounded.prepare_claims((), remaining_seconds=120.0) == ("prepared", 45.0)
-    assert bounded.publish_claims((), claims=(), lease_tokens=(), lease_owner="TEST-owner",
-                                  lease_guard=lambda: True, remaining_seconds=120.0) == ("published", 45.0)
+    assert bounded.publish_claims(
+        (), claims=(), lease_tokens=(), lease_owner="TEST-owner", lease_guard=lambda: True, remaining_seconds=120.0
+    ) == ("published", 45.0)

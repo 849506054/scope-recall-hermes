@@ -1,26 +1,27 @@
 """Trusted local runtime wiring for Codex host adapters."""
+
 from __future__ import annotations
 
 import json
-from pathlib import Path
 import time
+import uuid
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
-import uuid
 
 import pytest
-
-from scope_recall.adapters.codex import CodexHookHandler, install_codex_scope_recall
-from scope_recall.adapters.codex.mcp_server import build_server
-from scope_recall.adapters.codex.runtime_wiring import GAP_UNCONFIGURED, attach_trusted_host_runtime
+from scope_recall.adapters.clients import CodexHookHandler, install_codex_scope_recall
+from scope_recall.adapters.clients.mcp_server import build_server
+from scope_recall.adapters.clients.runtime_wiring import GAP_UNCONFIGURED, attach_trusted_host_runtime
 from scope_recall.contracts import ContractError
 
 
 def test_runtime_wiring_uses_this_source_checkout(record_property):
-    from scope_recall.adapters.codex import runtime_wiring
+    from scope_recall.adapters.clients import runtime_wiring
+
     actual = Path(runtime_wiring.__file__).resolve()
-    expected = Path(__file__).resolve().parents[3] / 'adapters' / 'codex' / 'runtime_wiring.py'
-    record_property('runtime_wiring_file', str(actual))
+    expected = Path(__file__).resolve().parents[3] / "adapters" / "clients" / "runtime_wiring.py"
+    record_property("runtime_wiring_file", str(actual))
     assert actual == expected
 
 
@@ -116,18 +117,21 @@ def test_session_end_launches_owned_worker_without_foreground_model(codex_instal
         str(config.config_path),
         trusted_runtime_config_path=str(runtime_path),
     )
-    with patch("scope_recall.adapters.codex.runtime_wiring.launch_worker") as launch_worker:
+    with patch("scope_recall.adapters.clients.runtime_wiring.launch_worker") as launch_worker:
         worker = Mock()
         worker.poll.return_value = None
         launch_worker.return_value = worker
-        assert handler.handle_payload(
-            {
-                "hook_event_name": "SessionEnd",
-                "session_id": "TEST-session",
-                "cwd": str(project),
-                "reason": "logout",
-            }
-        ) == {}
+        assert (
+            handler.handle_payload(
+                {
+                    "hook_event_name": "SessionEnd",
+                    "session_id": "TEST-session",
+                    "cwd": str(project),
+                    "reason": "logout",
+                }
+            )
+            == {}
+        )
         launch_worker.assert_called_once()
     handler.close()
 
@@ -135,7 +139,7 @@ def test_session_end_launches_owned_worker_without_foreground_model(codex_instal
 def test_session_end_without_runtime_config_does_not_launch_worker(codex_install):
     config, core, project, _runtime_path = codex_install
     handler = CodexHookHandler(config, core=core)
-    with patch("scope_recall.adapters.codex.runtime_wiring.launch_worker") as launch_worker:
+    with patch("scope_recall.adapters.clients.runtime_wiring.launch_worker") as launch_worker:
         handler.handle_payload(
             {
                 "hook_event_name": "SessionEnd",
@@ -182,7 +186,7 @@ def test_real_owned_watchdog_outlives_short_hook_and_cleans_config(codex_install
     assert worker.wait(timeout=30.0) == 0
     stdout, _stderr = worker.communicate(timeout=5.0)
     assert stdout == ""
-    receipt = json.loads((config.data_directory / 'runtime-worker-status.json').read_text())
+    receipt = json.loads((config.data_directory / "runtime-worker-status.json").read_text())
     assert receipt["status"] == "waiting"
     assert receipt["processed"] == 0 and receipt["failed_work"] == 0
     assert all(not path.exists() for path in ephemeral)
@@ -194,7 +198,7 @@ def test_generated_hook_and_mcp_attach_binding_directory_default(codex_install):
     default_path.write_text(runtime_path.read_text(encoding="utf-8"), encoding="utf-8")
     handler = CodexHookHandler.from_config_path(str(config.config_path))
     assert handler._host_runtime is None
-    handler._ensure_host_runtime()
+    handler.ensure_runtime()
     server = build_server(config, workspace=project)
     assert handler._host_runtime is not None and handler._host_runtime.configured
     assert server._host_runtime is not None and server._host_runtime.configured

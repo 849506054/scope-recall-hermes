@@ -5,10 +5,11 @@ evidence backs it; otherwise the row stays a proposal and the report says why.
 Slot conflicts are never resolved by arrival order: the whole batch is planned
 first and conflicting rows stay archived with an explicit conversion gap.
 """
+
 from __future__ import annotations
 
-from collections import defaultdict
 import sqlite3
+from collections import defaultdict
 from typing import Any, NamedTuple, cast
 
 from scope_recall.contracts import ClaimProposal
@@ -16,9 +17,24 @@ from scope_recall.core.claims import claim_slot
 
 from .legacy_plan import Conversion, Row
 from .legacy_sources import (
-    _anchor_ref, _evidence_items, _json, _resolve, _safe, _safe_list, _safe_text, _scope, _text_or_none,
+    anchor_ref,
+    evidence_items,
+    resolve_evidence_ref,
+    sanitized_list,
+    scope_descriptor,
+    text_or_none,
 )
-from .migration_records import MigrationError, _canon, _digest, _recorded, _stable, _time
+from .migration_records import (
+    MigrationError,
+    canonical_digest,
+    canonical_json,
+    json_value,
+    parse_instant,
+    recorded_time,
+    sanitized_text,
+    sanitized_value,
+    stable_legacy_id,
+)
 
 Evidence = list[tuple[str, str, str | None]]
 
@@ -34,7 +50,7 @@ _HISTORY_LINK_TABLES = ("experience_runs", "reflection_events", "skill_anchors",
 
 def _procedure_claim_id(old_id: str) -> str:
     """Use the Core claim namespace for imported procedures."""
-    return _stable("claim", f"procedure:{old_id}")
+    return stable_legacy_id("claim", f"procedure:{old_id}")
 
 
 def _claim_basis(assertion: object, origin: str) -> str:
@@ -122,23 +138,49 @@ def _insert_version(
     if head is None:
         conn.execute(
             "INSERT INTO claims(claim_id,scope_id,project_id,branch_id,subject,predicate,kind,slot_key,current_revision) VALUES (?,?,?,?,?,?,?,?,1)",
-            (claim_id, scope_id, project_id, branch_id, payload["subject"], payload["predicate"], payload["kind"], slot),
+            (
+                claim_id,
+                scope_id,
+                project_id,
+                branch_id,
+                payload["subject"],
+                payload["predicate"],
+                payload["kind"],
+                slot,
+            ),
         )
         revision = 1
     else:
         if str(head[0]) != claim_id:
             raise MigrationError(f"claim slot collision: {slot}")
         revision = int(
-            conn.execute("SELECT COALESCE(max(revision),0)+1 FROM claim_versions WHERE claim_id=?", (claim_id,)).fetchone()[0]
+            conn.execute(
+                "SELECT COALESCE(max(revision),0)+1 FROM claim_versions WHERE claim_id=?", (claim_id,)
+            ).fetchone()[0]
         )
-        conn.execute("UPDATE claim_versions SET recorded_to=? WHERE claim_id=? AND revision=?", (recorded, claim_id, revision - 1))
+        conn.execute(
+            "UPDATE claim_versions SET recorded_to=? WHERE claim_id=? AND revision=?",
+            (recorded, claim_id, revision - 1),
+        )
         conn.execute("UPDATE claims SET current_revision=? WHERE claim_id=?", (revision, claim_id))
-    serialized = _canon(payload)
+    serialized = canonical_json(payload)
     if len(serialized.encode()) > _CLAIM_PAYLOAD_LIMIT:
         raise MigrationError(f"claim payload exceeds Core limit: {claim_id}")
     conn.execute(
         "INSERT INTO claim_versions(claim_id,revision,payload_json,state,basis,qualification_reason,valid_from,valid_to,recorded_from,replaces_revision,conflict_revisions_json) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-        (claim_id, revision, serialized, state, basis, reason, valid_from, valid_to, recorded, revision - 1 if revision > 1 else None, "[]"),
+        (
+            claim_id,
+            revision,
+            serialized,
+            state,
+            basis,
+            reason,
+            valid_from,
+            valid_to,
+            recorded,
+            revision - 1 if revision > 1 else None,
+            "[]",
+        ),
     )
     for ref, quote, location in evidence:
         conn.execute(
@@ -150,7 +192,9 @@ def _insert_version(
     return revision
 
 
-def _link_archive(cv: Conversion, conn: sqlite3.Connection, claim_id: str, revision: int, archive_ref: str | None) -> None:
+def _link_archive(
+    cv: Conversion, conn: sqlite3.Connection, claim_id: str, revision: int, archive_ref: str | None
+) -> None:
     """Tie a claim revision back to the archived legacy row it came from."""
     if not archive_ref:
         return
@@ -163,10 +207,11 @@ def _link_archive(cv: Conversion, conn: sqlite3.Connection, claim_id: str, revis
 
 # --- facts -----------------------------------------------------------------
 
+
 class _FactSlots(NamedTuple):
     """Legacy fact rows that cannot map to one Core slot without an operator."""
 
-    collisions: set[tuple[Any, ...]]        # several current single-valued rows on one raw key
+    collisions: set[tuple[Any, ...]]  # several current single-valued rows on one raw key
     natural_conflicts: set[tuple[Any, ...]]  # different legacy fact_keys on one natural slot
     unordered_current: set[tuple[Any, ...]]  # the current row is not the latest recorded
 
@@ -186,7 +231,9 @@ def _fact_slots(rows: list[Row]) -> _FactSlots:
             current_counts[(*context, row.get("subject_key"), row.get("predicate_key"), row.get("fact_key"))] += 1
         if not single:
             continue
-        subject, predicate, fact_key = (_safe_text(row.get(key))[0] for key in ("subject_key", "predicate_key", "fact_key"))
+        subject, predicate, fact_key = (
+            sanitized_text(row.get(key))[0] for key in ("subject_key", "predicate_key", "fact_key")
+        )
         natural_keys[(*context, subject, predicate)].add(fact_key)
         history[(*context, subject, predicate, fact_key)].append(row)
     unordered: set[tuple[Any, ...]] = set()
@@ -194,8 +241,11 @@ def _fact_slots(rows: list[Row]) -> _FactSlots:
         current = [c for c in candidates if str(c.get("status") or "").lower() == "current" and not c.get("retired_at")]
         if len(current) != 1:
             continue
-        recorded = _recorded(current[0].get("recorded_at"))
-        if any(str(c.get("status") or "").lower() != "current" and _recorded(c.get("recorded_at")) > recorded for c in candidates):
+        recorded = recorded_time(current[0].get("recorded_at"))
+        if any(
+            str(c.get("status") or "").lower() != "current" and recorded_time(c.get("recorded_at")) > recorded
+            for c in candidates
+        ):
             unordered.add(key)
     return _FactSlots(
         {key for key, count in current_counts.items() if count > 1},
@@ -211,16 +261,22 @@ def _fact_evidence(
     evidence: Evidence = []
     origin = ""
     for row in rows:
-        ref = _resolve(row.get("source_ref"), row.get("source_type"), cv.journal_refs, cv.memory_refs, cv.archives)
-        quote, _ = _safe_text(row.get("excerpt"))
+        ref = resolve_evidence_ref(
+            row.get("source_ref"), row.get("source_type"), cv.journal_refs, cv.memory_refs, cv.archives
+        )
+        quote, _ = sanitized_text(row.get("excerpt"))
         if ref and _exact_evidence(by_event.get(ref), quote, scope_id, project, branch):
             origin = by_event[ref].get("source_original_origin") or ""
-            evidence.append((ref, quote, _text_or_none(row.get("location"))))
+            evidence.append((ref, quote, text_or_none(row.get("location"))))
     return evidence, origin
 
 
 def _fact_sort_key(row: Row) -> tuple[str, int, str]:
-    return (_recorded(row.get("recorded_at")), int(str(row.get("status") or "").lower() == "current"), str(row.get("claim_id")))
+    return (
+        recorded_time(row.get("recorded_at")),
+        int(str(row.get("status") or "").lower() == "current"),
+        str(row.get("claim_id")),
+    )
 
 
 def write_fact_claims(cv: Conversion, conn: sqlite3.Connection) -> None:
@@ -244,28 +300,55 @@ def write_fact_claims(cv: Conversion, conn: sqlite3.Connection) -> None:
         status = str(row.get("status") or "unknown")
         archive_ref = cv.archives.get(("fact_claims", old_id))
         context = (row.get("scope_id"), row.get("project_id"), row.get("branch_id"))
-        (subject, sr), (predicate, pr), (fact_key, fr) = (_safe_text(row.get(key)) for key in ("subject_key", "predicate_key", "fact_key"))
-        value, vr = _safe_text(row.get("value") or row.get("normalized_value"))
+        (subject, sr), (predicate, pr), (fact_key, fr) = (
+            sanitized_text(row.get(key)) for key in ("subject_key", "predicate_key", "fact_key")
+        )
+        value, vr = sanitized_text(row.get("value") or row.get("normalized_value"))
         if (*context, subject, predicate, fact_key) in slots.unordered_current:
-            cv.unmapped("fact_claims", old_id, "fact_current_not_latest_recorded_blocks_cutover", status=status, archive_source_ref=archive_ref)
+            cv.unmapped(
+                "fact_claims",
+                old_id,
+                "fact_current_not_latest_recorded_blocks_cutover",
+                status=status,
+                archive_source_ref=archive_ref,
+            )
             continue
         if (*context, subject, predicate) in slots.natural_conflicts:
-            cv.unmapped("fact_claims", old_id, "fact_slot_conflict_different_legacy_fact_key", status=status, legacy_fact_key=fact_key, archive_source_ref=archive_ref)
+            cv.unmapped(
+                "fact_claims",
+                old_id,
+                "fact_slot_conflict_different_legacy_fact_key",
+                status=status,
+                legacy_fact_key=fact_key,
+                archive_source_ref=archive_ref,
+            )
             continue
         scope_id = str(row.get("scope_id") or "legacy-scope")
-        project, branch = _text_or_none(row.get("project_id")), _text_or_none(row.get("branch_id"))
+        project, branch = text_or_none(row.get("project_id")), text_or_none(row.get("branch_id"))
         conditions: list[str] = []
-        claim_id = _stable("claim", f"{scope_id}:{project}:{branch}:fact:{subject}:{predicate}:{conditions}")
+        claim_id = stable_legacy_id("claim", f"{scope_id}:{project}:{branch}:fact:{subject}:{predicate}:{conditions}")
         if claim_id in preexisting:
             cv.mapped_facts.add(old_id)
             cv.fact_claim_refs[old_id] = claim_id
             continue
         cardinality = str(row.get("cardinality") or "single").lower()
         if cardinality == "multi":
-            cv.unmapped("fact_claims", old_id, "multi_value_fact_not_losslessly_mapped_to_core_slot", status=status, archive_source_ref=archive_ref)
+            cv.unmapped(
+                "fact_claims",
+                old_id,
+                "multi_value_fact_not_losslessly_mapped_to_core_slot",
+                status=status,
+                archive_source_ref=archive_ref,
+            )
             continue
         if (*context, row.get("subject_key"), row.get("predicate_key"), row.get("fact_key")) in slots.collisions:
-            cv.unmapped("fact_claims", old_id, "single_slot_collision_not_losslessly_mapped", status=status, archive_source_ref=archive_ref)
+            cv.unmapped(
+                "fact_claims",
+                old_id,
+                "single_slot_collision_not_losslessly_mapped",
+                status=status,
+                archive_source_ref=archive_ref,
+            )
             continue
         evidence_rows = evidence_by_claim.get(old_id, [])
         evidence, origin = _fact_evidence(cv, by_event, evidence_rows, scope_id, project, branch)
@@ -275,31 +358,48 @@ def write_fact_claims(cv: Conversion, conn: sqlite3.Connection) -> None:
             state, reason = "superseded", "legacy_retired_at_not_active"
         if state == "active" and not evidence:
             state, reason = "proposed", "legacy_current_without_live_exact_evidence"
-        payload = _claim_payload("fact", subject, predicate, value, conditions, {
-            "claim_id": old_id,
-            "memory_id": row.get("memory_id"),
-            "fact_key": fact_key,
-            "normalized_value": row.get("normalized_value"),
-            "value_fingerprint": str(row.get("value_fingerprint") or _digest(value)),
-            "cardinality": cardinality,
-            "assertion_kind": row.get("assertion_kind"),
-            "status": old_status,
-            "retired_at": row.get("retired_at"),
-            "confidence": row.get("confidence"),
-            "superseded_by_claim_id": row.get("superseded_by_claim_id"),
-            "source_type": row.get("source_type"),
-            "source_ref": row.get("source_ref"),
-            "evidence_hash": row.get("evidence_hash"),
-            "evidence": _safe(evidence_rows),
-            "scope_authorization": _scope(row),
-            "valid_from": _time(row.get("valid_from"))[0],
-            "valid_to": _time(row.get("valid_to"))[0],
-        })
+        payload = _claim_payload(
+            "fact",
+            subject,
+            predicate,
+            value,
+            conditions,
+            {
+                "claim_id": old_id,
+                "memory_id": row.get("memory_id"),
+                "fact_key": fact_key,
+                "normalized_value": row.get("normalized_value"),
+                "value_fingerprint": str(row.get("value_fingerprint") or canonical_digest(value)),
+                "cardinality": cardinality,
+                "assertion_kind": row.get("assertion_kind"),
+                "status": old_status,
+                "retired_at": row.get("retired_at"),
+                "confidence": row.get("confidence"),
+                "superseded_by_claim_id": row.get("superseded_by_claim_id"),
+                "source_type": row.get("source_type"),
+                "source_ref": row.get("source_ref"),
+                "evidence_hash": row.get("evidence_hash"),
+                "evidence": sanitized_value(evidence_rows),
+                "scope_authorization": scope_descriptor(row),
+                "valid_from": parse_instant(row.get("valid_from"))[0],
+                "valid_to": parse_instant(row.get("valid_to"))[0],
+            },
+        )
         revision = _insert_version(
-            conn, claim_id=claim_id, scope_id=scope_id, project_id=project, branch_id=branch,
-            payload=payload, state=state, basis=_claim_basis(row.get("assertion_kind"), origin), reason=reason,
-            recorded=_recorded(row.get("recorded_at")), valid_from=payload["valid_from"], valid_to=payload["valid_to"],
-            evidence=evidence, counts=cv.inserted,
+            conn,
+            claim_id=claim_id,
+            scope_id=scope_id,
+            project_id=project,
+            branch_id=branch,
+            payload=payload,
+            state=state,
+            basis=_claim_basis(row.get("assertion_kind"), origin),
+            reason=reason,
+            recorded=recorded_time(row.get("recorded_at")),
+            valid_from=payload["valid_from"],
+            valid_to=payload["valid_to"],
+            evidence=evidence,
+            counts=cv.inserted,
         )
         _link_archive(cv, conn, claim_id, revision, archive_ref)
         cv.mapped_facts.add(old_id)
@@ -317,6 +417,7 @@ def write_fact_claims(cv: Conversion, conn: sqlite3.Connection) -> None:
 
 
 # --- procedures ------------------------------------------------------------
+
 
 class _Version(NamedTuple):
     """One playbook snapshot, read into the fields a procedure claim needs."""
@@ -340,13 +441,11 @@ def versions_by_playbook(rows: list[Row]) -> dict[str, list[Row]]:
 
 
 def _snapshot_data(snapshot: Row, playbook: Row) -> dict[str, Any]:
-    data = _json(snapshot.get("snapshot"), playbook)
+    data = json_value(snapshot.get("snapshot"), playbook)
     return data if isinstance(data, dict) else playbook
 
 
-def _procedure_slot_collisions(
-    playbooks: list[Row], versions: dict[str, list[Row]]
-) -> dict[str, tuple[str, ...]]:
+def _procedure_slot_collisions(playbooks: list[Row], versions: dict[str, list[Row]]) -> dict[str, tuple[str, ...]]:
     """Find different legacy identities competing for one Core procedure slot.
 
     Plan the complete batch before inserting any authority: arrival order must
@@ -360,26 +459,29 @@ def _procedure_slot_collisions(
         if not old_id:
             continue
         slots: set[str] = set()
-        for snapshot in versions.get(old_id) or [{"snapshot": _canon(playbook)}]:
+        for snapshot in versions.get(old_id) or [{"snapshot": canonical_json(playbook)}]:
             data = _snapshot_data(snapshot, playbook)
-            title, _ = _safe_text(data.get("title") or playbook.get("title") or old_id)
-            proposal = cast(ClaimProposal, {
-                "kind": "procedure", "subject": str(playbook.get("task_class") or old_id),
-                "predicate": title or "procedure", "conditions": _safe_list(data.get("preconditions")),
-            })
-            slots.add(claim_slot(
-                _scope(playbook)["row_scope_id"],
-                _text_or_none(playbook.get("project_id")),
-                _text_or_none(playbook.get("branch_id")),
-                proposal,
-            ))
+            title, _ = sanitized_text(data.get("title") or playbook.get("title") or old_id)
+            proposal = cast(
+                ClaimProposal,
+                {
+                    "kind": "procedure",
+                    "subject": str(playbook.get("task_class") or old_id),
+                    "predicate": title or "procedure",
+                    "conditions": sanitized_list(data.get("preconditions")),
+                },
+            )
+            slots.add(
+                claim_slot(
+                    scope_descriptor(playbook)["row_scope_id"],
+                    text_or_none(playbook.get("project_id")),
+                    text_or_none(playbook.get("branch_id")),
+                    proposal,
+                )
+            )
         if len(slots) == 1:
             owners[next(iter(slots))].add(old_id)
-    return {
-        old_id: tuple(sorted(ids))
-        for ids in owners.values() if len(ids) > 1
-        for old_id in ids
-    }
+    return {old_id: tuple(sorted(ids)) for ids in owners.values() if len(ids) > 1 for old_id in ids}
 
 
 def _versions(playbook: Row, snapshots: list[Row]) -> list[_Version]:
@@ -387,37 +489,54 @@ def _versions(playbook: Row, snapshots: list[Row]) -> list[_Version]:
     prepared: list[_Version] = []
     for snapshot in sorted(snapshots, key=lambda x: (int(x.get("version") or 0), str(x.get("created_at") or ""))):
         data = _snapshot_data(snapshot, playbook)
-        title, _ = _safe_text(data.get("title") or playbook.get("title") or old_id)
-        goal, _ = _safe_text(data.get("goal") or playbook.get("goal"))
-        prepared.append(_Version(
-            snapshot,
-            data,
-            title or "procedure",
-            goal,
-            str(data.get("status") or playbook.get("status") or "candidate").lower(),
-            str(playbook.get("task_class") or old_id),
-            _safe_list(data.get("preconditions")),
-            _safe_list(data.get("steps")),
-            _safe_list(data.get("pitfalls")),
-        ))
+        title, _ = sanitized_text(data.get("title") or playbook.get("title") or old_id)
+        goal, _ = sanitized_text(data.get("goal") or playbook.get("goal"))
+        prepared.append(
+            _Version(
+                snapshot,
+                data,
+                title or "procedure",
+                goal,
+                str(data.get("status") or playbook.get("status") or "candidate").lower(),
+                str(playbook.get("task_class") or old_id),
+                sanitized_list(data.get("preconditions")),
+                sanitized_list(data.get("steps")),
+                sanitized_list(data.get("pitfalls")),
+            )
+        )
     return prepared
 
 
-def _procedure_evidence(cv: Conversion, by_event: dict[str, Row], version: _Version, playbook: Row, scope_id: str, project: str | None, branch: str | None) -> Evidence:
+def _procedure_evidence(
+    cv: Conversion,
+    by_event: dict[str, Row],
+    version: _Version,
+    playbook: Row,
+    scope_id: str,
+    project: str | None,
+    branch: str | None,
+) -> Evidence:
     evidence: Evidence = []
-    for anchor in _evidence_items(version.data.get("evidence_anchors") or playbook.get("evidence_anchors")):
-        ref = _resolve(_anchor_ref(anchor), "", cv.journal_refs, cv.memory_refs, cv.archives)
-        quote, _ = _safe_text(anchor.get("quote") or anchor.get("excerpt"))
+    for anchor in evidence_items(version.data.get("evidence_anchors") or playbook.get("evidence_anchors")):
+        ref = resolve_evidence_ref(anchor_ref(anchor), "", cv.journal_refs, cv.memory_refs, cv.archives)
+        quote, _ = sanitized_text(anchor.get("quote") or anchor.get("excerpt"))
         if ref and _exact_evidence(by_event.get(ref), quote, scope_id, project, branch):
             evidence.append((ref, quote, None))
     return evidence
 
 
-def _write_procedure_versions(cv: Conversion, conn: sqlite3.Connection, by_event: dict[str, Row], playbook: Row, claim_id: str, prepared: list[_Version]) -> None:
+def _write_procedure_versions(
+    cv: Conversion,
+    conn: sqlite3.Connection,
+    by_event: dict[str, Row],
+    playbook: Row,
+    claim_id: str,
+    prepared: list[_Version],
+) -> None:
     old_id = str(playbook.get("id") or "")
-    scope = _scope(playbook)
+    scope = scope_descriptor(playbook)
     scope_id = scope["row_scope_id"]
-    project, branch = _text_or_none(playbook.get("project_id")), _text_or_none(playbook.get("branch_id"))
+    project, branch = text_or_none(playbook.get("project_id")), text_or_none(playbook.get("branch_id"))
     for version in prepared:
         evidence = _procedure_evidence(cv, by_event, version, playbook, scope_id, project, branch)
         promoted = version.status == "promoted"
@@ -429,27 +548,46 @@ def _write_procedure_versions(cv: Conversion, conn: sqlite3.Connection, by_event
             "verification_basis": "user_accepted" if promoted else "inferred_suggestion",
             "counterexample_refs": [],
         }
-        payload = _claim_payload("procedure", version.subject, version.title, version.goal, version.conditions, {
-            "playbook_id": old_id,
-            "version": version.snapshot.get("version"),
-            "status": version.status,
-            "snapshot": _safe(version.data),
-            "scope_authorization": scope,
-        }, procedure)
+        payload = _claim_payload(
+            "procedure",
+            version.subject,
+            version.title,
+            version.goal,
+            version.conditions,
+            {
+                "playbook_id": old_id,
+                "version": version.snapshot.get("version"),
+                "status": version.status,
+                "snapshot": sanitized_value(version.data),
+                "scope_authorization": scope,
+            },
+            procedure,
+        )
         revision = _insert_version(
-            conn, claim_id=claim_id, scope_id=scope_id, project_id=project, branch_id=branch,
+            conn,
+            claim_id=claim_id,
+            scope_id=scope_id,
+            project_id=project,
+            branch_id=branch,
             payload=payload,
             state="active" if active else "proposed",
             basis="observed" if active else "inferred_suggestion",
             reason=(
-                "legacy_promoted_with_exact_evidence" if active
-                else "legacy_promoted_without_same_scope_exact_evidence" if promoted
+                "legacy_promoted_with_exact_evidence"
+                if active
+                else "legacy_promoted_without_same_scope_exact_evidence"
+                if promoted
                 else "legacy_candidate_or_missing_exact_evidence"
             ),
-            recorded=_recorded(version.snapshot.get("created_at") or playbook.get("updated_at")),
-            valid_from=None, valid_to=None, evidence=evidence, counts=cv.inserted,
+            recorded=recorded_time(version.snapshot.get("created_at") or playbook.get("updated_at")),
+            valid_from=None,
+            valid_to=None,
+            evidence=evidence,
+            counts=cv.inserted,
         )
-        archive_ref = cv.archives.get(("playbook_versions", str(version.snapshot.get("id")))) or cv.archives.get(("procedural_playbooks", old_id))
+        archive_ref = cv.archives.get(("playbook_versions", str(version.snapshot.get("id")))) or cv.archives.get(
+            ("procedural_playbooks", old_id)
+        )
         _link_archive(cv, conn, claim_id, revision, archive_ref)
         if promoted and not active:
             cv.unmapped("procedural_playbooks", old_id, "promoted_procedure_without_live_exact_evidence")
@@ -470,7 +608,9 @@ def write_procedures(cv: Conversion, conn: sqlite3.Connection) -> None:
             # legacy_history source_events.  Do not silently turn unrelated
             # playbooks into revisions of each other.
             cv.unmapped(
-                "procedural_playbooks", old_id, "procedure_slot_conflict_different_legacy_playbook",
+                "procedural_playbooks",
+                old_id,
+                "procedure_slot_conflict_different_legacy_playbook",
                 archive_source_ref=cv.archives.get(("procedural_playbooks", old_id)),
                 version_source_refs=[
                     cv.archives[("playbook_versions", str(snap.get("id")))]
@@ -482,19 +622,29 @@ def write_procedures(cv: Conversion, conn: sqlite3.Connection) -> None:
                 automatic_procedure_eligible=False,
             )
             continue
-        snapshots = versions.get(old_id) or [{"version": 1, "snapshot": _canon(playbook), "created_at": playbook.get("created_at")}]
+        snapshots = versions.get(old_id) or [
+            {"version": 1, "snapshot": canonical_json(playbook), "created_at": playbook.get("created_at")}
+        ]
         prepared = _versions(playbook, snapshots)
-        scope = _scope(playbook)
+        scope = scope_descriptor(playbook)
         slots = {
-            (scope["row_scope_id"], _text_or_none(playbook.get("project_id")), _text_or_none(playbook.get("branch_id")),
-             version.subject, version.title, tuple(sorted(set(version.conditions))))
+            (
+                scope["row_scope_id"],
+                text_or_none(playbook.get("project_id")),
+                text_or_none(playbook.get("branch_id")),
+                version.subject,
+                version.title,
+                tuple(sorted(set(version.conditions))),
+            )
             for version in prepared
         }
         if len(slots) > 1:
             table = "playbook_versions" if versions.get(old_id) else "procedural_playbooks"
             for version in prepared:
                 cv.unmapped(
-                    table, str(version.snapshot.get("id") or old_id), "procedure_version_slot_changed_blocks_cutover",
+                    table,
+                    str(version.snapshot.get("id") or old_id),
+                    "procedure_version_slot_changed_blocks_cutover",
                     archive_source_ref=cv.archives.get(("playbook_versions", str(version.snapshot.get("id")))),
                 )
             continue
@@ -506,7 +656,10 @@ def write_procedures(cv: Conversion, conn: sqlite3.Connection) -> None:
 
 # --- history links ---------------------------------------------------------
 
-def _link_history(cv: Conversion, conn: sqlite3.Connection, kind: str, ref: str, revision: int, source_ref: str) -> None:
+
+def _link_history(
+    cv: Conversion, conn: sqlite3.Connection, kind: str, ref: str, revision: int, source_ref: str
+) -> None:
     conn.execute(
         "INSERT INTO evidence_links(object_kind,object_ref,object_revision,source_ref,source_revision,relation,quote) VALUES (?,?,?,?,?,'derived_from','') ON CONFLICT DO NOTHING",
         (kind, ref, revision, source_ref, 1),

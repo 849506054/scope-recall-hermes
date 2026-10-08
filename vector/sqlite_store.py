@@ -4,6 +4,7 @@ Vectors are stored as JSON arrays and searched with a bounded brute-force
 scan: dependency-free and portable for small or medium local memory sets and
 non-AVX CPUs.  It is still only a rebuildable cache, never the truth store.
 """
+
 from __future__ import annotations
 
 import json
@@ -16,6 +17,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable
 
 from . import VectorStore, VectorStoreCompatibilityError
+from .purge import governed_row_ids, purge_request
 
 _ROW_COLUMNS = "id, scope_id, source, target, content, summary, updated_at, vector_json"
 #: Ids per statement: SQLite's parameter limit is far higher, and a page this
@@ -83,7 +85,9 @@ class SQLiteBruteForceVectorStore(VectorStore):
             try:
                 descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
             except OSError as exc:
-                raise VectorStoreCompatibilityError("sqlite-bruteforce mutable sidecar is unsafe or inaccessible") from exc
+                raise VectorStoreCompatibilityError(
+                    "sqlite-bruteforce mutable sidecar is unsafe or inaccessible"
+                ) from exc
             try:
                 self._harden_regular_file(descriptor, "sidecar")
             finally:
@@ -114,7 +118,9 @@ class SQLiteBruteForceVectorStore(VectorStore):
                 self._ensure_schema()
                 stored_dimensions = self._get_meta_int("dimensions")
                 stored_table = self._get_meta_text("table_name")
-                if (stored_dimensions and stored_dimensions != self.dimensions) or (stored_table and stored_table != self.table_name):
+                if (stored_dimensions and stored_dimensions != self.dimensions) or (
+                    stored_table and stored_table != self.table_name
+                ):
                     self._conn.rollback()
                     raise VectorStoreCompatibilityError(
                         "existing sqlite-bruteforce generation is incompatible: "
@@ -282,19 +288,27 @@ class SQLiteBruteForceVectorStore(VectorStore):
             conn.commit()
 
     def fenced_upsert_records(
-        self, rows: Iterable[dict[str, Any]], *, guard: Callable[[], bool], remaining_seconds: float,
+        self,
+        rows: Iterable[dict[str, Any]],
+        *,
+        guard: Callable[[], bool],
+        remaining_seconds: float,
     ) -> bool:
         """Write ``rows`` as one group, only if ``guard`` still approves under this store's lock.
 
         The worker publishes every embedding through this fenced form (see
-        ``adapters.lance.LanceIndexWriter``), so a companion without it cannot
+        ``runtime.lance_port.LanceIndexWriter``), so a companion without it cannot
         be written to at all.  The store's own lock is the fence boundary: the
         guard is evaluated with the write already serialized, a refusing guard
         writes nothing, and ``upsert_records`` commits the group once.
         """
         if not callable(guard):
             raise TypeError("guard must be callable")
-        if type(remaining_seconds) not in (int, float) or not math.isfinite(float(remaining_seconds)) or remaining_seconds <= 0:
+        if (
+            type(remaining_seconds) not in (int, float)
+            or not math.isfinite(float(remaining_seconds))
+            or remaining_seconds <= 0
+        ):
             raise RuntimeError("vector fence deadline exhausted")
         payload = list(rows)
         if not payload:
@@ -305,8 +319,9 @@ class SQLiteBruteForceVectorStore(VectorStore):
             self.upsert_records(payload)
         return True
 
-    def purge_governed_members(self, *, members, agent_id, installation_id,
-                               partitions, project_id, branch_id, remaining_seconds: float) -> bool:
+    def purge_governed_members(
+        self, *, members, agent_id, installation_id, partitions, project_id, branch_id, remaining_seconds: float
+    ) -> bool:
         """Remove every revision of the governed members; acknowledge only an inventory verified empty.
 
         This companion could not be purged at all.  That did not matter while
@@ -316,20 +331,32 @@ class SQLiteBruteForceVectorStore(VectorStore):
         row that cannot be classified makes the inventory unknown, and an
         unknown inventory is never acknowledged.
         """
-        from .store import governed_row_ids, purge_request
-
-        if type(remaining_seconds) not in (int, float) or not math.isfinite(float(remaining_seconds)) or remaining_seconds <= 0:
+        if (
+            type(remaining_seconds) not in (int, float)
+            or not math.isfinite(float(remaining_seconds))
+            or remaining_seconds <= 0
+        ):
             raise RuntimeError("vector purge deadline exhausted")
         if not members or not partitions:
             return False
-        targets, governed = purge_request(members=members, agent_id=agent_id, installation_id=installation_id,
-                                          partitions=partitions)
-        select = dict(targets=targets, governed=governed, agent_id=agent_id, installation_id=installation_id,
-                      project_id=project_id, branch_id=branch_id)
+        targets, governed = purge_request(
+            members=members, agent_id=agent_id, installation_id=installation_id, partitions=partitions
+        )
+        select = dict(
+            targets=targets,
+            governed=governed,
+            agent_id=agent_id,
+            installation_id=installation_id,
+            project_id=project_id,
+            branch_id=branch_id,
+        )
 
         def rows() -> list[dict[str, Any]]:
             found = self._require_conn().execute("SELECT id, scope_id, source, target FROM vector_records").fetchall()
-            return [dict(id=row["id"], scope_id=row["scope_id"], source=row["source"], target=row["target"]) for row in found]
+            return [
+                dict(id=row["id"], scope_id=row["scope_id"], source=row["source"], target=row["target"])
+                for row in found
+            ]
 
         with self._lock:
             ids = governed_row_ids(rows(), **select)
@@ -355,9 +382,11 @@ class SQLiteBruteForceVectorStore(VectorStore):
         if not resolved:
             return False
         with self._lock:
-            row = self._require_conn().execute(
-                "SELECT 1 FROM vector_records WHERE id = ? LIMIT 1", (resolved,)
-            ).fetchone()
+            row = (
+                self._require_conn()
+                .execute("SELECT 1 FROM vector_records WHERE id = ? LIMIT 1", (resolved,))
+                .fetchone()
+            )
         return row is not None
 
     def list_ids(self) -> list[str]:
@@ -370,7 +399,7 @@ class SQLiteBruteForceVectorStore(VectorStore):
         wanted = [str(item) for item in ids]
         output: dict[str, dict[str, Any]] = {}
         for offset in range(0, len(wanted), _ID_BATCH):
-            batch = wanted[offset:offset + _ID_BATCH]
+            batch = wanted[offset : offset + _ID_BATCH]
             placeholders = ",".join("?" for _ in batch)
             for row in self._rows(f"id IN ({placeholders})", tuple(batch)):
                 record = self._row_to_record(row)

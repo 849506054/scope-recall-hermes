@@ -9,16 +9,17 @@ included; ``claude plugin disable <name>@skills-dir`` stops it.  Claude Code
 runs hook commands through a shell (Git Bash, or PowerShell without it), so the
 command is kept to words neither shell reinterprets.
 """
+
 from __future__ import annotations
 
-from pathlib import Path
 import re
+from pathlib import Path
 from typing import Any
 
-from scope_recall.adapters.codex.config import CodexConfigError, load_shared_client
+from scope_recall.adapters.clients.config import CodexConfigError, load_shared_client
 from scope_recall.adapters.hermes.installation import attachment_path
 
-from .install_common import SKILLS, InstallError, InstallPlan, _json_dump, _manifest_version, _require_file
+from .install_common import SKILLS, InstallError, InstallPlan, json_dump, manifest_version, require_file
 
 HOST = "claude-code"
 #: The events recorded, and how long Claude Code waits for each.  A prompt waits for its
@@ -27,7 +28,7 @@ HOOK_TIMEOUTS = {"UserPromptSubmit": 15, "Stop": 10, "SessionEnd": 10}
 #: The skills a Claude Code session gets.  ``scope-recall-setup`` stays out: installing and
 #: upgrading the fleet is an operator's procedure, not something a coding session is asked.
 CLAUDE_CODE_SKILLS = ("scope-recall-memory",)
-_SHELL_WORD = re.compile(r"[A-Za-z0-9_@%+=:,./-]+")
+SHELL_WORD = re.compile(r"[A-Za-z0-9_@%+=:,./-]+")
 
 
 def data_dir(instance_root: Path) -> Path:
@@ -58,7 +59,7 @@ def validate_options(agent_workspace: str | None, env_file: Path | str | None) -
         raise InstallError("agent_workspace is not used for Claude Code installation")
     if env_file is None or str(env_file).strip() == "":
         return "", None
-    return "", _require_file(Path(env_file), "env_file")
+    return "", require_file(Path(env_file), "env_file")
 
 
 def validate_local_platforms(values: object) -> tuple[str, ...]:
@@ -86,8 +87,17 @@ def approve_local_platforms(plan: InstallPlan) -> None:
 
 
 def _argv(plan: InstallPlan, module: str) -> list[str]:
-    argv = [plan.python_executable.as_posix(), "-I", "-B", "-m", f"scope_recall.adapters.codex.{module}",
-            "--home", plan.instance_root.as_posix(), "--host", HOST]
+    argv = [
+        plan.python_executable.as_posix(),
+        "-I",
+        "-B",
+        "-m",
+        f"scope_recall.adapters.codex.{module}",
+        "--home",
+        plan.instance_root.as_posix(),
+        "--host",
+        HOST,
+    ]
     if plan.env_file is not None:
         argv += ["--env-file", plan.env_file.as_posix()]
     return argv
@@ -95,17 +105,23 @@ def _argv(plan: InstallPlan, module: str) -> list[str]:
 
 def _hook_command(plan: InstallPlan) -> str:
     argv = _argv(plan, "hook_entry")
-    unsafe = [part for part in argv if not _SHELL_WORD.fullmatch(part)]
+    unsafe = [part for part in argv if not SHELL_WORD.fullmatch(part)]
     if unsafe:
-        raise InstallError("Claude Code runs a hook through a shell: keep the interpreter, home and env file on paths "
-                           f"of ASCII letters, digits and ._-/: only (not {unsafe[0]!r})")
+        raise InstallError(
+            "Claude Code runs a hook through a shell: keep the interpreter, home and env file on paths "
+            f"of ASCII letters, digits and ._-/: only (not {unsafe[0]!r})"
+        )
     return " ".join(argv)
 
 
 def _hooks_json(plan: InstallPlan) -> dict[str, Any]:
     command = _hook_command(plan)
-    return {"hooks": {event: [{"hooks": [{"type": "command", "command": command, "timeout": timeout}]}]
-                      for event, timeout in sorted(HOOK_TIMEOUTS.items())}}
+    return {
+        "hooks": {
+            event: [{"hooks": [{"type": "command", "command": command, "timeout": timeout}]}]
+            for event, timeout in sorted(HOOK_TIMEOUTS.items())
+        }
+    }
 
 
 def _mcp_json(plan: InstallPlan) -> dict[str, Any]:
@@ -116,7 +132,7 @@ def _mcp_json(plan: InstallPlan) -> dict[str, Any]:
 def _plugin_json(plugin_name: str) -> dict[str, Any]:
     return {
         "name": plugin_name,
-        "version": _manifest_version(),
+        "version": manifest_version(),
         "description": "Scope Recall: this machine's shared memory store, in Claude Code",
         "author": {"name": "Local developer"},
         "hooks": "./hooks/hooks.json",
@@ -126,11 +142,13 @@ def _plugin_json(plugin_name: str) -> dict[str, Any]:
 
 def planned_files(plan: InstallPlan) -> dict[Path, str | bytes]:
     return {
-        plan.target_plugin_dir / ".claude-plugin" / "plugin.json": _json_dump(_plugin_json(plan.target_plugin_dir.name)),
-        plan.target_plugin_dir / "hooks" / "hooks.json": _json_dump(_hooks_json(plan)),
-        plan.target_plugin_dir / ".mcp.json": _json_dump(_mcp_json(plan)),
-        **{plan.target_plugin_dir / "skills" / name / "SKILL.md": SKILLS[name].read_text(encoding="utf-8")
-           for name in CLAUDE_CODE_SKILLS},
+        plan.target_plugin_dir / ".claude-plugin" / "plugin.json": json_dump(_plugin_json(plan.target_plugin_dir.name)),
+        plan.target_plugin_dir / "hooks" / "hooks.json": json_dump(_hooks_json(plan)),
+        plan.target_plugin_dir / ".mcp.json": json_dump(_mcp_json(plan)),
+        **{
+            plan.target_plugin_dir / "skills" / name / "SKILL.md": SKILLS[name].read_text(encoding="utf-8")
+            for name in CLAUDE_CODE_SKILLS
+        },
     }
 
 
@@ -140,7 +158,9 @@ def foreign_instance_entries(instance_root: Path) -> list[str]:
 
 
 def initialize_instance(plan: InstallPlan) -> str:
-    raise InstallError("Claude Code joins a shared store: attach its home first (scope-recall attach --host claude-code)")
+    raise InstallError(
+        "Claude Code joins a shared store: attach its home first (scope-recall attach --host claude-code)"
+    )
 
 
 def _bound(instance_root: Path):
@@ -160,8 +180,7 @@ def validate_reuse(plan: InstallPlan) -> None:
         raise InstallError("existing Claude Code entry agent_id mismatch: the store's is " + config.agent_id)
     if config.test_mode != plan.test_mode:
         raise InstallError(
-            "existing Claude Code entry test_mode mismatch: "
-            f"stored={config.test_mode}, requested={plan.test_mode}"
+            f"existing Claude Code entry test_mode mismatch: stored={config.test_mode}, requested={plan.test_mode}"
         )
 
 

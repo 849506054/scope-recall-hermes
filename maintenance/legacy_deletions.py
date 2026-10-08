@@ -5,15 +5,27 @@ consider derived from them: episodes, memories, fact records, and whole
 procedure archive groups. The closure is planned from the archived sources,
 then applied inside the single write transaction.
 """
+
 from __future__ import annotations
 
 from typing import Any
 
 from .legacy_plan import Conversion, Row
 from .legacy_sources import (
-    _anchor_ref, _evidence_items, _json_list, _resolve, _safe, journal_links,
+    anchor_ref,
+    evidence_items,
+    journal_links,
+    json_list,
+    resolve_evidence_ref,
 )
-from .migration_records import _canon, _digest, _json, _recorded, _stable
+from .migration_records import (
+    canonical_digest,
+    canonical_json,
+    json_value,
+    recorded_time,
+    sanitized_value,
+    stable_legacy_id,
+)
 
 _OBJECT_TABLES = {
     "event": ("source_events", "event_id"),
@@ -47,13 +59,15 @@ def _procedure_archive_groups(cv: Conversion) -> list[tuple[set[str], set[str]]]
             ref = cv.archives.get(("playbook_versions", str(snapshot.get("id"))))
             if ref:
                 group.add(ref)
-            data = _json(snapshot.get("snapshot"), {})
+            data = json_value(snapshot.get("snapshot"), {})
             if isinstance(data, dict):
                 records.append(data)
         dependencies: set[str] = set()
         for record in records:
-            for anchor in _evidence_items(record.get("evidence_anchors")):
-                ref = _resolve(_anchor_ref(anchor), anchor.get("source_type"), cv.journal_refs, cv.memory_refs, cv.archives)
+            for anchor in evidence_items(record.get("evidence_anchors")):
+                ref = resolve_evidence_ref(
+                    anchor_ref(anchor), anchor.get("source_type"), cv.journal_refs, cv.memory_refs, cv.archives
+                )
                 if ref:
                     dependencies.add(ref)
         groups.append((group, dependencies))
@@ -69,7 +83,7 @@ def _closure(
     """Every archived object Core would treat as derived from the purged journals."""
     refs = {cv.journal_refs[x] for x in journal_ids if x in cv.journal_refs}
     for episode in cv.rows["task_episodes"]:
-        members = [str(x) for x in _json_list(episode.get("journal_entry_ids"))]
+        members = [str(x) for x in json_list(episode.get("journal_entry_ids"))]
         if any(x in journal_ids for x in members):
             refs.add(cv.episode_refs[str(episode.get("id"))])
     for memory in cv.rows["memories"]:
@@ -80,7 +94,9 @@ def _closure(
     while len(refs) != previous:
         previous = len(refs)
         for evidence in cv.rows["fact_claim_evidence"]:
-            resolved = _resolve(evidence.get("source_ref"), evidence.get("source_type"), cv.journal_refs, cv.memory_refs, cv.archives)
+            resolved = resolve_evidence_ref(
+                evidence.get("source_ref"), evidence.get("source_type"), cv.journal_refs, cv.memory_refs, cv.archives
+            )
             if resolved not in refs:
                 continue
             for table, column in (("fact_claims", "claim_id"), ("fact_claim_evidence", "evidence_id")):
@@ -103,7 +119,12 @@ def plan_deletions(cv: Conversion) -> None:
     for row in cv.rows["privacy_purge_operations"]:
         op = str(row.get("operation_id") or "")
         if str(row.get("status") or "") != "completed":
-            cv.unmapped("privacy_purge_operations", op, "non_completed_tombstone_not_replayed_blocks_cutover", redacted_row=_safe(row))
+            cv.unmapped(
+                "privacy_purge_operations",
+                op,
+                "non_completed_tombstone_not_replayed_blocks_cutover",
+                redacted_row=sanitized_value(row),
+            )
             continue
         journal_ids = [
             str(item.get("journal_entry_id"))
@@ -112,16 +133,23 @@ def plan_deletions(cv: Conversion) -> None:
         ]
         default_scope = sorted(cv.requested)[0]
         scopes = sorted({str(scope_by_journal.get(x, default_scope)) for x in journal_ids})
-        cv.deletion_specs.append({
-            "operation_id": _stable("deletion", op),
-            "legacy_operation_id": op,
-            "refs": sorted(_closure(cv, journal_ids, links, groups)),
-            "scopes": scopes or [default_scope],
-            "created_at": _recorded(row.get("created_at")),
-        })
+        cv.deletion_specs.append(
+            {
+                "operation_id": stable_legacy_id("deletion", op),
+                "legacy_operation_id": op,
+                "refs": sorted(_closure(cv, journal_ids, links, groups)),
+                "scopes": scopes or [default_scope],
+                "created_at": recorded_time(row.get("created_at")),
+            }
+        )
     for row in cv.rows["privacy_purge_source_tombstones"]:
         if str(row.get("journal_entry_id")) not in cv.journal_refs:
-            cv.unmapped("privacy_purge_source_tombstones", str(row.get("journal_entry_id")), "source_missing_unknown_blocks_cutover", redacted_row=_safe(row))
+            cv.unmapped(
+                "privacy_purge_source_tombstones",
+                str(row.get("journal_entry_id")),
+                "source_missing_unknown_blocks_cutover",
+                redacted_row=sanitized_value(row),
+            )
 
 
 def _insert_operation(conn: Any, spec: Row, batch_key: str) -> None:
@@ -131,16 +159,16 @@ def _insert_operation(conn: Any, spec: Row, batch_key: str) -> None:
         "INSERT INTO deletion_operations(operation_id,request_sha256,mode,scope_ids_json,project_id,branch_id,requested_refs_json,expected_revisions_json,created_at,memory_epoch,layers_json,active_content_removed) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
         (
             spec["operation_id"],
-            _digest(request),
+            canonical_digest(request),
             "delete",
-            _canon(spec["scopes"]),
+            canonical_json(spec["scopes"]),
             None,
             None,
-            _canon(spec["refs"]),
-            _canon({x: 1 for x in spec["refs"]}),
+            canonical_json(spec["refs"]),
+            canonical_json({x: 1 for x in spec["refs"]}),
             spec["created_at"],
             epoch,
-            _canon(_PENDING_LAYERS),
+            canonical_json(_PENDING_LAYERS),
             0,
         ),
     )
@@ -165,11 +193,18 @@ def write_deletions(cv: Conversion, tx: Any) -> None:
     conn = tx._check(write=True)
     for spec in cv.deletion_specs:
         op_id = spec["operation_id"]
-        if conn.execute("SELECT memory_epoch FROM deletion_operations WHERE operation_id=?", (op_id,)).fetchone() is None:
+        if (
+            conn.execute("SELECT memory_epoch FROM deletion_operations WHERE operation_id=?", (op_id,)).fetchone()
+            is None
+        ):
             _insert_operation(conn, spec, cv.batch_key)
         for ref in spec["refs"]:
-            event = conn.execute("SELECT scope_id,project_id,branch_id FROM source_events WHERE event_id=?", (ref,)).fetchone()
-            episode = conn.execute("SELECT scope_id,project_id,branch_id FROM episodes WHERE episode_id=?", (ref,)).fetchone()
+            event = conn.execute(
+                "SELECT scope_id,project_id,branch_id FROM source_events WHERE event_id=?", (ref,)
+            ).fetchone()
+            episode = conn.execute(
+                "SELECT scope_id,project_id,branch_id FROM episodes WHERE episode_id=?", (ref,)
+            ).fetchone()
             owner = event or episode
             if owner is not None:
                 _block(conn, op_id, "episode" if episode else "event", ref, tuple(owner))
@@ -179,7 +214,9 @@ def write_deletions(cv: Conversion, tx: Any) -> None:
             (op_id,),
         ).fetchall()
         for (claim_id,) in derived:
-            owner = conn.execute("SELECT scope_id,project_id,branch_id FROM claims WHERE claim_id=?", (claim_id,)).fetchone()
+            owner = conn.execute(
+                "SELECT scope_id,project_id,branch_id FROM claims WHERE claim_id=?", (claim_id,)
+            ).fetchone()
             if owner:
                 _block(conn, op_id, "claim", claim_id, tuple(owner))
         tx.deletions.purge_sqlite(op_id)

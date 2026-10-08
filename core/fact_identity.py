@@ -7,13 +7,12 @@ or supersede one value without losing the stable slot identity.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import hashlib
 import json
 import re
 import unicodedata
+from dataclasses import dataclass
 from typing import Any
-
 
 FACT_IDENTITY_VERSION = 1
 MAX_FACT_SUBJECT_CHARS = 200
@@ -40,9 +39,7 @@ def normalize_fact_component(
     if not normalized and not allow_empty:
         raise FactIdentityError(f"{field_name} is required")
     if len(normalized) > max_chars:
-        raise FactIdentityError(
-            f"{field_name} exceeds {max_chars} characters"
-        )
+        raise FactIdentityError(f"{field_name} exceeds {max_chars} characters")
     return normalized
 
 

@@ -45,13 +45,51 @@ Not responsible for: deciding whether the upstream fix actually works -- the
 next attempt decides that, and a row that fails again is failed again with its
 marker intact.
 """
+
 from __future__ import annotations
 
 import re
 
 from ..contracts import ContractError
 from .secret_patterns import contains_secret_like_text
-from .work_storage import ACCOUNT_REFUSALS, AUTO_RECOVERABLE_ERRORS, DERIVATION_RETRY_MARKER
+
+DERIVATION_RETRY_MARKER = "derivation_retry:1"
+# Only infrastructure failures may be recovered without a new source revision.
+# Invalid derivations and rejected authority remain terminal and inspectable.
+# ``http_protocol`` is the transport failing mid-reply (a connection closed or a malformed answer), and is treated as
+# ``network_error`` is: it says nothing about the payload.  Missing here, consolidation and embedding work failing
+# with it was never recovered, and no work failing with it was clearable by ``retry-failures``: candidate evaluations
+# against a model served over plain HTTP left failed rows only a hand edit could clear (#201).
+AUTO_RECOVERABLE_ERRORS = frozenset(
+    {
+        "model_unavailable",
+        "model_timeout",
+        "timeout",
+        "network_error",
+        "http_protocol",
+        "http_429",
+        "http_500",
+        "http_502",
+        "http_503",
+        "http_504",
+        "http_529",
+        "rate_limited",
+        "storage_unavailable",
+        "STORAGE_UNAVAILABLE",
+        "DEADLINE_EXCEEDED",
+        "memory_epoch_changed",
+        "lease_exhausted",
+        "embedding_unavailable",
+    }
+)
+
+#: The provider declining the account rather than this request: payment
+#: required, key rejected, access forbidden.  No payload changes that answer, so
+#: the worker parks the item without an attempt (``BUDGET_PAUSE_ERRORS``) until
+#: someone fixes the account.  On one instance a DeepSeek balance that ran out
+#: answered 402 for fifteen minutes and failed 100 candidate evaluations
+#: outright, none of which an operator command could reopen afterwards.
+ACCOUNT_REFUSALS = frozenset({"http_401", "http_402", "http_403"})
 
 #: Faults an operator may clear even though the worker's automatic budget is
 #: spent.  None is auto-recoverable, and each is here for a stated reason:
@@ -60,31 +98,39 @@ from .work_storage import ACCOUNT_REFUSALS, AUTO_RECOVERABLE_ERRORS, DERIVATION_
 #: crash, which the three-table reopen undoes; and an account refusal failed
 #: its item outright before the worker learned to park it, so the rows it left
 #: can only come back once someone has fixed the account.
-_OPERATOR_ONLY_FAILURES = frozenset({
-    "http_400",
-    "candidate_attempt_interrupted",
-    # The model client's own refusals of a route or a size (``runtime/_http_worker.py``, ``adapters/models.py``): a
-    # wrong or redirecting base URL, a request or an answer past its bound.  An operator fixes the route or the bound,
-    # then re-opens.
-    "endpoint_invalid", "http_redirect", "request_limit", "response_limit",
-}) | ACCOUNT_REFUSALS
+_OPERATOR_ONLY_FAILURES = (
+    frozenset(
+        {
+            "http_400",
+            "candidate_attempt_interrupted",
+            # The model client's own refusals of a route or a size (``runtime/_http_worker.py``, ``runtime/models.py``): a
+            # wrong or redirecting base URL, a request or an answer past its bound.  An operator fixes the route or the bound,
+            # then re-opens.
+            "endpoint_invalid",
+            "http_redirect",
+            "request_limit",
+            "response_limit",
+        }
+    )
+    | ACCOUNT_REFUSALS
+)
 
 #: Faults.  Clearing these is what moves an instance from degraded to healthy.
 #: Derived from the worker's transient set so the two cannot drift apart again,
 #: and lower-cased to match what ``failure_kind`` produces -- the worker's set
 #: is matched against raw codes by SQL and carries a few in upper case.
-ACTIONABLE_FAILURES = frozenset(
-    code.lower() for code in AUTO_RECOVERABLE_ERRORS
-) | _OPERATOR_ONLY_FAILURES
+ACTIONABLE_FAILURES = frozenset(code.lower() for code in AUTO_RECOVERABLE_ERRORS) | _OPERATOR_ONLY_FAILURES
 
 #: By-design outcomes.  Re-running them asserts that something upstream changed.
 #: ``sensitive_request`` is the request guard refusing to send secret-like text
 #: to a model; the payload is what it is, so a retry can only refuse again.
-TERMINAL_FAILURES = frozenset({
-    "derivation_invalid",
-    "input_invalid",
-    "sensitive_request",
-})
+TERMINAL_FAILURES = frozenset(
+    {
+        "derivation_invalid",
+        "input_invalid",
+        "sensitive_request",
+    }
+)
 
 #: Stamped on every row this grants a re-look, so the grant is visible and
 #: cannot be repeated within one schema generation.
@@ -108,9 +154,15 @@ def validation_feedback(code: object, field: object) -> dict[str, str]:
     safe_code = code.upper() if isinstance(code, str) else ""
     if safe_code not in {"INPUT_INVALID", "DERIVATION_INVALID"}:
         safe_code = "DERIVATION_INVALID"
-    safe_field = field if (isinstance(field, str)
-                           and re.fullmatch(r"[A-Za-z0-9_./\[\]-]{1,240}", field)
-                           and not contains_secret_like_text(field)) else "payload"
+    safe_field = (
+        field
+        if (
+            isinstance(field, str)
+            and re.fullmatch(r"[A-Za-z0-9_./\[\]-]{1,240}", field)
+            and not contains_secret_like_text(field)
+        )
+        else "payload"
+    )
     return {"code": safe_code, "field": safe_field}
 
 

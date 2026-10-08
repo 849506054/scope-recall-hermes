@@ -11,16 +11,18 @@ direction.  Qdrant keeps the search vector normalised while the payload keeps
 the original, so a direction comparison inside a tolerance is the honest test;
 a byte comparison of floats is not.
 """
+
 from __future__ import annotations
 
-from collections import Counter
 import json
 import math
-from pathlib import Path
 import time
-from typing import Any, Callable, Iterable, cast
+from collections import Counter
+from collections.abc import Callable, Iterable
+from pathlib import Path
+from typing import Any, cast
 
-from .backup import _atomic_json
+from .backup import atomic_json
 
 #: Ids per page: one bounded read and one bounded write, either side of the copy.
 BATCH = 256
@@ -32,7 +34,7 @@ SAMPLE = 10
 
 def _pages(values: list[str], size: int) -> Iterable[list[str]]:
     for offset in range(0, len(values), size):
-        yield values[offset:offset + size]
+        yield values[offset : offset + size]
 
 
 def _backend(store: Any) -> str:
@@ -72,7 +74,7 @@ def _same_direction(left: Any, right: Any, *, tolerance: float) -> bool:
     norm_left, norm_right = math.hypot(*left), math.hypot(*right)
     if norm_left == 0 or norm_right == 0:
         return norm_left == norm_right
-    return all(abs(a / norm_left - b / norm_right) <= tolerance for a, b in zip(left, right))
+    return all(abs(a / norm_left - b / norm_right) <= tolerance for a, b in zip(left, right, strict=True))
 
 
 def _same_row(left: dict[str, Any], right: dict[str, Any], *, tolerance: float) -> bool:
@@ -90,7 +92,8 @@ def plan(source: Any, target: Any) -> dict[str, Any]:
     A count difference is an estimate, not a list: a full pass is what the run
     does, and it reports what it actually copied.
     """
-    _reader(source), _reader(target)
+    _reader(source)
+    _reader(target)
     source_ids = sorted(source.list_ids())
     target_rows = target.count_rows()
     return {
@@ -146,7 +149,7 @@ def run(
                 copied += len(rows)
         scanned += len(page)
         batches += 1
-        _atomic_json(state_path, {"scanned": scanned, "copied": copied, "last_id": page[-1]})
+        atomic_json(state_path, {"scanned": scanned, "copied": copied, "last_id": page[-1]})
     return {
         "source": _backend(source),
         "target": _backend(target),
@@ -159,8 +162,7 @@ def run(
     }
 
 
-def verify(source: Any, target: Any, *, batch_size: int = BATCH,
-           tolerance: float = TOLERANCE) -> dict[str, Any]:
+def verify(source: Any, target: Any, *, batch_size: int = BATCH, tolerance: float = TOLERANCE) -> dict[str, Any]:
     """Read both sides back: coverage, per-scope counts, payloads and directions.
 
     Every source id is read from both sides and compared, so coverage is proved

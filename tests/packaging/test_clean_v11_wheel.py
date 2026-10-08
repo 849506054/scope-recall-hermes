@@ -1,4 +1,5 @@
 """Packaging tests for the bounded v11 clean wheel."""
+
 from __future__ import annotations
 
 import json
@@ -31,10 +32,7 @@ def _expected_wheel_members(allowlist: dict) -> set[str]:
 
 def _build_wheel(dist_dir: Path) -> Path:
     dist_dir.mkdir(parents=True, exist_ok=True)
-    uv = (
-        os.environ.get("SCOPE_RECALL_UV")
-        or shutil.which("uv")
-        )
+    uv = os.environ.get("SCOPE_RECALL_UV") or shutil.which("uv")
     completed = subprocess.run(
         [uv, "build", "--wheel", "--out-dir", str(dist_dir)],
         cwd=REPO_ROOT,
@@ -45,11 +43,7 @@ def _build_wheel(dist_dir: Path) -> Path:
         creationflags=_CREATE_FLAGS,
     )
     if completed.returncode != 0:
-        pytest.fail(
-            "wheel build failed\n"
-            f"stdout:\n{completed.stdout}\n"
-            f"stderr:\n{completed.stderr}"
-        )
+        pytest.fail(f"wheel build failed\nstdout:\n{completed.stdout}\nstderr:\n{completed.stderr}")
     wheels = sorted(dist_dir.glob("*.whl"))
     assert len(wheels) == 1, wheels
     return wheels[0]
@@ -193,6 +187,26 @@ def test_clean_v11_wheel_entrypoint_and_register_delegate(installed_venv: dict[s
     assert receipt["loaded_is_wrapper_register"] is True
     assert receipt["scope_recall_all"] == ["register"]
     assert receipt["register_module"] == "scope_recall"
+
+
+def test_clean_v11_wheel_runtime_loads_no_host_adapter(installed_venv: dict[str, Path]) -> None:
+    """The runtime's two lazy imports of a host's authorization check (``LAZY_UPWARD`` in scripts/quality.py) run when
+    a worker builds its instance, never while the runtime loads: loading it loads no adapter module."""
+    probe = _run_clean_child(
+        installed_venv["python"],
+        cwd=installed_venv["outside_cwd"],
+        args=[
+            "-c",
+            (
+                "import json, sys; "
+                "import scope_recall.runtime.instance, scope_recall.runtime.worker_entry, "
+                "scope_recall.runtime.resume_entry; "
+                "print(json.dumps(sorted(name for name in sys.modules if name.startswith('scope_recall.adapters'))))"
+            ),
+        ],
+    )
+    assert probe.returncode == 0, probe.stderr.decode("utf-8", errors="replace")
+    assert json.loads(probe.stdout.decode("utf-8")) == []
 
 
 def test_clean_v11_wheel_installed_runtime_recall(installed_venv: dict[str, Path], tmp_path: Path) -> None:

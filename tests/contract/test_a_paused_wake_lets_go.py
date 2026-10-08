@@ -8,12 +8,12 @@ folder the upgrade was about to replace.  The package step refused, correctly, a
 ``{"state": "blocked", "error_type": "PackageUpgradeError"}``: no reason, for a refusal whose remedy is
 to wait a moment and run it again.
 """
+
 from __future__ import annotations
 
 import json
 
 import pytest
-
 from scope_recall.maintenance import package_upgrade
 from scope_recall.runtime import scheduling
 from scope_recall.runtime.scheduling import PAUSE_POLL_SECONDS, WakePlan, supervise
@@ -26,8 +26,6 @@ class _Owner:
 
 def _run(tmp_path, monkeypatch, *, delay_seconds, enabled_at):
     """Supervise with a start delay; ``enabled_at(slept)`` is what the operator's switch says."""
-    import scope_recall.runtime.resume_entry as resume_entry
-
     writes: list[dict] = []
     slept: list[float] = []
     drains: list[float] = []
@@ -62,15 +60,20 @@ def _run(tmp_path, monkeypatch, *, delay_seconds, enabled_at):
     monkeypatch.setattr(scheduling, "load_config", lambda path: config)
     monkeypatch.setattr(scheduling, "SupervisorControl", Recorder)
     monkeypatch.setattr(scheduling, "_acquire_ownership", lambda control: _Owner())
-    monkeypatch.setattr(resume_entry, "read_control", lambda cfg: {"enabled": enabled_at(sum(slept))})
+    monkeypatch.setattr(scheduling, "read_control", lambda cfg: {"enabled": enabled_at(sum(slept))})
 
     def drain_once(remaining):
         drains.append(sum(slept))
         return 0, {"completed": 0}
 
-    code = supervise(tmp_path / "config.json", drain_once, delay_seconds=delay_seconds,
-                     clock=lambda: sum(slept), sleep=slept.append,
-                     planner=lambda cfg, *, now, unavailable_until: WakePlan(None, "idle", 0, 0, 0))
+    code = supervise(
+        tmp_path / "config.json",
+        drain_once,
+        delay_seconds=delay_seconds,
+        clock=lambda: sum(slept),
+        sleep=slept.append,
+        planner=lambda cfg, *, now, unavailable_until: WakePlan(None, "idle", 0, 0, 0),
+    )
     return code, writes, slept, drains
 
 
@@ -103,6 +106,7 @@ def test_no_delay_means_no_sleep_before_the_first_pass(tmp_path, monkeypatch):
 
 # -- the package step says why it refused -------------------------------------
 
+
 def _blocked(monkeypatch, capsys, error) -> dict:
     def refuse(*args, **kwargs):
         raise error
@@ -121,20 +125,32 @@ def test_a_held_package_folder_is_named_and_so_is_what_to_do(monkeypatch, capsys
 
 
 def test_every_reason_the_step_raises_is_a_code_it_will_print():
+    import ast
     import inspect
-    import re
 
-    source = inspect.getsource(package_upgrade)
-    codes = set(re.findall(r"PackageUpgradeError\('([^']+)'\)", source)) | {package_upgrade._LOCKED}
+    raised = {
+        node.args[0].value
+        for node in ast.walk(ast.parse(inspect.getsource(package_upgrade)))
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "PackageUpgradeError"
+        and len(node.args) == 1
+        and isinstance(node.args[0], ast.Constant)
+        and isinstance(node.args[0].value, str)
+    }
+    codes = raised | {package_upgrade._LOCKED}
     assert len(codes) >= 12, codes
     for code in codes:
         assert package_upgrade._REASON_CODE.fullmatch(code), code
 
 
-@pytest.mark.parametrize("error", [
-    package_upgrade.PackageUpgradeError("C:\\somewhere\\python.exe must reference an existing file"),
-    FileExistsError(17, "File exists", "C:\\somewhere\\backup"),
-])
+@pytest.mark.parametrize(
+    "error",
+    [
+        package_upgrade.PackageUpgradeError("C:\\somewhere\\python.exe must reference an existing file"),
+        FileExistsError(17, "File exists", "C:\\somewhere\\backup"),
+    ],
+)
 def test_a_message_that_may_carry_a_path_is_not_printed(monkeypatch, capsys, error):
     out = _blocked(monkeypatch, capsys, error)
     assert out == {"state": "blocked", "error_type": type(error).__name__, "host_restart_allowed": False}

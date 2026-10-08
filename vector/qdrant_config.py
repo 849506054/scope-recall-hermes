@@ -1,11 +1,13 @@
 """Validated remote-companion settings; secrets remain in the process environment."""
+
 from __future__ import annotations
 
-from dataclasses import dataclass, fields
+import math
 import re
-from typing import Any, Mapping
+from collections.abc import Mapping
+from dataclasses import dataclass, fields
+from typing import Any
 
-from ..runtime.validation import mapping, only_keys, strict_float
 from ._qdrant_http_worker import valid_origin
 
 
@@ -22,12 +24,18 @@ class QdrantConfig:
             raise ValueError("qdrant_api_key_env")
         if type(self.collection_prefix) is not str or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", self.collection_prefix):
             raise ValueError("qdrant_collection_prefix")
-        strict_float("qdrant_timeout_seconds", self.timeout_seconds, minimum=0.001, maximum=45.0)
+        if type(self.timeout_seconds) not in (int, float):
+            raise ValueError("qdrant_timeout_seconds")
+        timeout = float(self.timeout_seconds)
+        if not math.isfinite(timeout) or not 0.001 <= timeout <= 45.0:
+            raise ValueError("qdrant_timeout_seconds")
 
     @classmethod
     def from_mapping(cls, raw: Mapping[str, Any]) -> QdrantConfig:
-        raw = mapping("qdrant", raw)
-        only_keys("qdrant_fields", raw, {field.name for field in fields(cls)})
+        if not isinstance(raw, Mapping):
+            raise ValueError("qdrant")
+        if set(raw) - {field.name for field in fields(cls)}:
+            raise ValueError("qdrant_fields")
         if "url" not in raw:
             raise ValueError("qdrant_url")
         return cls(**raw)

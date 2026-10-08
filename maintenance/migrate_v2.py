@@ -3,28 +3,31 @@
 Legacy conversion, catalog reads, host activation and indexing have separate
 owners; this module is the public facade and the command line.
 """
+
 from __future__ import annotations
+
 import argparse
 import json
 from pathlib import Path
 from typing import Any, Callable
 
-from .migration_records import (
-    LEGACY_BASELINE as LEGACY_BASELINE,
-    MigrationError as MigrationError,
-    _stable as _stable,
-)
 from .legacy_catalog import build_legacy_catalog as build_legacy_catalog
+from .legacy_conversion import migrate_legacy as migrate_legacy
 from .migration_activation import (
-    _load_installation_handoff as _load_installation_handoff,
-    _accept_identical_archive_run,
-    _archive_report_path,
-    _require_hex64,
-    _require_test_absolute_target,
-    _write_complete_archive_receipt,
+    accept_identical_archive_run,
+    archive_report_path,
+    install_hermes_archive_migration,
+    require_hex64,
+    require_test_absolute_target,
+    write_complete_archive_receipt,
 )
 from .migration_index import queue_index_page as queue_index_page
-from .legacy_conversion import migrate_legacy as migrate_legacy
+from .migration_records import (
+    LEGACY_BASELINE as LEGACY_BASELINE,
+)
+from .migration_records import (
+    MigrationError as MigrationError,
+)
 
 _ARGUMENTS: tuple[tuple[str, dict[str, Any]], ...] = (
     ("--source", {"required": True, "help": "旧版离线 memory.sqlite3"}),
@@ -35,9 +38,23 @@ _ARGUMENTS: tuple[tuple[str, dict[str, Any]], ...] = (
     ("--scope-id", {"action": "append", "dest": "scope_ids", "help": "重复指定以限制迁移 scope"}),
     ("--installation-manifest", {"help": "已正常安装的 Hermes home/installation.json 或 Codex installation.json"}),
     ("--host", {"choices": ("hermes", "codex"), "help": "manifest 所属宿主；省略时按清单路径识别"}),
-    ("--scope-map", {"help": 'JSON 文件，例如 {"scope-a":"owner_private"}；值可为 manifest audience 名或已绑定 scope ID'}),
-    ("--map-scope", {"action": "append", "default": [], "metavar": "SOURCE=AUDIENCE", "help": "重复指定 source scope 到 manifest audience 的映射"}),
-    ("--single-scope-to", {"metavar": "AUDIENCE", "help": "仅当旧库只有一个 scope 时，将它明确映射到该 audience 名或已绑定 scope ID"}),
+    (
+        "--scope-map",
+        {"help": 'JSON 文件，例如 {"scope-a":"owner_private"}；值可为 manifest audience 名或已绑定 scope ID'},
+    ),
+    (
+        "--map-scope",
+        {
+            "action": "append",
+            "default": [],
+            "metavar": "SOURCE=AUDIENCE",
+            "help": "重复指定 source scope 到 manifest audience 的映射",
+        },
+    ),
+    (
+        "--single-scope-to",
+        {"metavar": "AUDIENCE", "help": "仅当旧库只有一个 scope 时，将它明确映射到该 audience 名或已绑定 scope ID"},
+    ),
     ("--batch-key", {"default": "p15-fixed-batch-001"}),
     ("--catalog-only", {"action": "store_true", "help": "只输出 read-only 字典/计划"}),
     ("--archive-install-test", {"action": "store_true", "help": "安装 TEST 归档并执行转换"}),
@@ -48,28 +65,42 @@ _ARGUMENTS: tuple[tuple[str, dict[str, Any]], ...] = (
 _Rule = tuple[Callable[[argparse.Namespace], object], str]
 # Option combinations the parser rejects, checked in this order.
 _OPTION_RULES: tuple[_Rule, ...] = (
-    (lambda a: a.archive_install_test and a.catalog_only,
-     "--catalog-only and --archive-install-test cannot be combined"),
-    (lambda a: (a.archive_install_test or a.catalog_only)
-     and (a.installation_manifest or a.host or a.scope_map or a.map_scope or a.single_scope_to or a.scope_ids),
-     "archive/catalog modes cannot be combined with alternate manifest/map/single-scope/host/scope-selection options"),
-    (lambda a: a.archive_install_test and not a.target,
-     "--archive-install-test requires --target as hermes_home"),
-    (lambda a: a.archive_install_test and not (a.source_hash and a.catalog_hash),
-     "--archive-install-test requires --source-hash and --catalog-hash"),
-    (lambda a: a.scope_map and a.map_scope,
-     "--scope-map 与 --map-scope 不能同时使用"),
-    (lambda a: a.single_scope_to and (a.scope_map or a.map_scope),
-     "--single-scope-to 与 --scope-map/--map-scope 不能同时使用"),
+    (
+        lambda a: a.archive_install_test and a.catalog_only,
+        "--catalog-only and --archive-install-test cannot be combined",
+    ),
+    (
+        lambda a: (
+            (a.archive_install_test or a.catalog_only)
+            and (a.installation_manifest or a.host or a.scope_map or a.map_scope or a.single_scope_to or a.scope_ids)
+        ),
+        "archive/catalog modes cannot be combined with alternate manifest/map/single-scope/host/scope-selection options",
+    ),
+    (lambda a: a.archive_install_test and not a.target, "--archive-install-test requires --target as hermes_home"),
+    (
+        lambda a: a.archive_install_test and not (a.source_hash and a.catalog_hash),
+        "--archive-install-test requires --source-hash and --catalog-hash",
+    ),
+    (lambda a: a.scope_map and a.map_scope, "--scope-map 与 --map-scope 不能同时使用"),
+    (
+        lambda a: a.single_scope_to and (a.scope_map or a.map_scope),
+        "--single-scope-to 与 --scope-map/--map-scope 不能同时使用",
+    ),
 )
 # Checked after the scope map is parsed; ``mapping`` is None when none was given.
 _MAPPING_RULES: tuple[tuple[Callable[[argparse.Namespace, dict | None], object], str], ...] = (
-    (lambda a, mapping: mapping is not None and not a.installation_manifest,
-     "--scope-map/--map-scope 需要 --installation-manifest"),
-    (lambda a, mapping: a.installation_manifest and mapping is None and not a.single_scope_to,
-     "manifest 模式必须显式提供 --scope-map 或 --map-scope"),
-    (lambda a, mapping: a.single_scope_to and not a.installation_manifest,
-     "--single-scope-to 需要 --installation-manifest"),
+    (
+        lambda a, mapping: mapping is not None and not a.installation_manifest,
+        "--scope-map/--map-scope 需要 --installation-manifest",
+    ),
+    (
+        lambda a, mapping: a.installation_manifest and mapping is None and not a.single_scope_to,
+        "manifest 模式必须显式提供 --scope-map 或 --map-scope",
+    ),
+    (
+        lambda a, mapping: a.single_scope_to and not a.installation_manifest,
+        "--single-scope-to 需要 --installation-manifest",
+    ),
 )
 
 
@@ -88,7 +119,9 @@ def _scope_mapping(args: argparse.Namespace, parser: argparse.ArgumentParser) ->
             payload = json.loads(Path(args.scope_map).expanduser().resolve().read_text(encoding="utf-8"))
         except (OSError, UnicodeError, json.JSONDecodeError) as exc:
             parser.error(f"scope map 无法读取: {exc}")
-        if not isinstance(payload, dict) or any(type(key) is not str or type(value) is not str for key, value in payload.items()):
+        if not isinstance(payload, dict) or any(
+            type(key) is not str or type(value) is not str for key, value in payload.items()
+        ):
             parser.error("scope map 必须是 source scope 到 audience 名/ID 的 JSON 对象")
         return payload
     if not args.map_scope:
@@ -113,30 +146,34 @@ def _catalog_only(args: argparse.Namespace, mapping: dict[str, str] | None) -> i
 
 def _archive_install_test(args: argparse.Namespace, mapping: dict[str, str] | None) -> int:
     """Install a TEST archive bound to the exact source/catalog digests and convert."""
-    source_hash = _require_hex64(args.source_hash, "--source-hash")
-    catalog_hash = _require_hex64(args.catalog_hash, "--catalog-hash")
-    target_path = _require_test_absolute_target(args.target)
+    source_hash = require_hex64(args.source_hash, "--source-hash")
+    catalog_hash = require_hex64(args.catalog_hash, "--catalog-hash")
+    target_path = require_test_absolute_target(args.target)
     catalog = build_legacy_catalog(args.source)
     if catalog["source_sha256"] != source_hash or catalog["catalog_sha256"] != catalog_hash:
         raise MigrationError("source or catalog digest does not match the current files")
-    report_path = _archive_report_path(target_path, args.report)
+    report_path = archive_report_path(target_path, args.report)
     receipt_path = report_path.with_suffix(".receipt")
     if _present(report_path) or _present(receipt_path):
         if not _present(report_path):
             raise MigrationError("preexisting receipt exists without matching report")
         if not _present(receipt_path):
             raise MigrationError("preexisting report exists without matching receipt")
-        _accept_identical_archive_run(
-            target_path=target_path, report_path=report_path, receipt_path=receipt_path,
-            catalog=catalog, batch_key=args.batch_key,
+        accept_identical_archive_run(
+            target_path=target_path,
+            report_path=report_path,
+            receipt_path=receipt_path,
+            catalog=catalog,
+            batch_key=args.batch_key,
         )
         _emit(json.loads(report_path.read_text(encoding="utf-8")))
         return 0
-    from scope_recall.adapters.hermes.installation import install_hermes_archive_migration
-
     _binding, manifest, catalog = install_hermes_archive_migration(
-        target_path, source_database=args.source, test_mode=True,
-        expected_source_hash=source_hash, expected_catalog_hash=catalog_hash,
+        target_path,
+        source_database=args.source,
+        test_mode=True,
+        expected_source_hash=source_hash,
+        expected_catalog_hash=catalog_hash,
     )
     report = migrate_legacy(
         args.source,
@@ -148,9 +185,12 @@ def _archive_install_test(args: argparse.Namespace, mapping: dict[str, str] | No
     if report["completion_status"] != "complete":
         _emit(report)
         return 3
-    _write_complete_archive_receipt(
-        target_path=target_path, report_path=report_path, receipt_path=receipt_path,
-        catalog=catalog, batch_key=args.batch_key,
+    write_complete_archive_receipt(
+        target_path=target_path,
+        report_path=report_path,
+        receipt_path=receipt_path,
+        catalog=catalog,
+        batch_key=args.batch_key,
     )
     _emit(report)
     return 0

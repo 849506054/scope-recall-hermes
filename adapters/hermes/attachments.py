@@ -1,9 +1,10 @@
 """Authorized host attachment metadata; reject untrusted paths and traversal."""
+
 from __future__ import annotations
 
-from dataclasses import dataclass
 import hashlib
 import re
+from dataclasses import dataclass
 from typing import Any
 
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")

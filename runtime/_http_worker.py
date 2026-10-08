@@ -1,4 +1,5 @@
 """Private stdlib HTTP worker for the bounded auxiliary transport."""
+
 from __future__ import annotations
 
 import base64
@@ -13,7 +14,6 @@ import sys
 import time
 import urllib.parse
 import urllib.request
-
 
 MAX_REQUEST_BYTES = 3 * 1024 * 1024
 _REQUEST_KEYS = frozenset({"url", "body_b64", "headers", "timeout_seconds", "max_response_bytes"})
@@ -146,13 +146,19 @@ def _parse_request(raw: bytes) -> tuple[urllib.parse.ParseResult, bytes, dict[st
     timeout_seconds, max_response_bytes = request["timeout_seconds"], request["max_response_bytes"]
     if type(body_b64) is not str or not isinstance(headers, dict):
         raise _Failure("http_protocol")
-    if type(timeout_seconds) not in (int, float) or not math.isfinite(float(timeout_seconds)) or float(timeout_seconds) <= 0:
+    if (
+        type(timeout_seconds) not in (int, float)
+        or not math.isfinite(float(timeout_seconds))
+        or float(timeout_seconds) <= 0
+    ):
         raise _Failure("timeout")
     if type(max_response_bytes) is not int or max_response_bytes <= 0:
         raise _Failure("response_limit")
     # Proxy credentials come only from the proxy URL, never from the caller.
-    if any(type(key) is not str or type(value) is not str or key.lower() == "proxy-authorization"
-           for key, value in headers.items()):
+    if any(
+        type(key) is not str or type(value) is not str or key.lower() == "proxy-authorization"
+        for key, value in headers.items()
+    ):
         raise _Failure("http_protocol")
     try:
         body = base64.b64decode(body_b64.encode("ascii"), validate=True)
@@ -188,8 +194,12 @@ def _take_connection(parsed, headers: dict[str, str], deadline: float, connectio
     A persistent worker keeps at most one connection; anything cached for a
     different key is closed rather than left half-open.
     """
-    cache_key = (parsed.scheme, parsed.hostname, parsed.port or (80 if parsed.scheme == "http" else 443),
-                 tuple(sorted(headers.items())))
+    cache_key = (
+        parsed.scheme,
+        parsed.hostname,
+        parsed.port or (80 if parsed.scheme == "http" else 443),
+        tuple(sorted(headers.items())),
+    )
     connection = None
     try:
         if connections is not None:
@@ -268,7 +278,8 @@ def _request(raw: bytes, connections: dict | None = None) -> bytes:
     finally:
         if connection is not None:
             if reusable and connections is not None:
-                setattr(connection, "scope_recall_idle_since", time.monotonic())
+                # Idle metadata belongs to this pool's connection instance, outside the stdlib class contract.
+                setattr(connection, "scope_recall_idle_since", time.monotonic())  # noqa: B010
                 connections[cache_key] = connection
             else:
                 connection.close()

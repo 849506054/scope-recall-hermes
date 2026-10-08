@@ -1,9 +1,9 @@
 """Real loopback and isolated-process checks for the bounded Qdrant transport."""
+
 from __future__ import annotations
 
 import base64
 import contextlib
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import shutil
 import socket
@@ -13,9 +13,9 @@ import sys
 import threading
 import time
 import traceback
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
-
 from scope_recall.vector import qdrant_http as transport
 from scope_recall.vector.qdrant_config import QdrantConfig
 
@@ -99,8 +99,10 @@ def children(monkeypatch):
         assert child.stdin.closed and child.stdout.closed
 
 
-@pytest.mark.parametrize("method,body", [("GET", None), ("PUT", {"vectors": {"size": 2}}),
-                                         ("POST", {"filter": {"must": []}}), ("DELETE", None)])
+@pytest.mark.parametrize(
+    "method,body",
+    [("GET", None), ("PUT", {"vectors": {"size": 2}}), ("POST", {"filter": {"must": []}}), ("DELETE", None)],
+)
 def test_methods_envelope_secret_stdin_and_owned_cleanup(server, children, monkeypatch, method, body):
     monkeypatch.setenv("HTTP_PROXY", "http://qdrant-secret-host:9")
     monkeypatch.setenv("HTTPS_PROXY", "http://qdrant-secret-host:9")
@@ -115,23 +117,38 @@ def test_methods_envelope_secret_stdin_and_owned_cleanup(server, children, monke
     child, args, options = children[0]
     assert args[0] == [sys.executable, "-I", "-B", str(transport._WORKER_PATH)]
     assert KEY not in repr(args) + repr(options)
-    assert not ({"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "UNRELATED_SECRET",
-                 "SCOPE_RECALL_QDRANT_API_KEY", "PYTHONPATH"} & options["env"].keys())
+    assert not (
+        {"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "UNRELATED_SECRET", "SCOPE_RECALL_QDRANT_API_KEY", "PYTHONPATH"}
+        & options["env"].keys()
+    )
     assert child.returncode == 0
 
 
 @pytest.mark.parametrize("status", [301, 302, 307, 308, 401, 403, 404, 429, 500, 503])
 def test_http_errors_are_sanitized_and_never_retried_or_redirected(server, children, status):
-    server.reply = lambda handler: reply(handler, (KEY + "private-response").encode(), status=status,
-                                        headers={"Location": server.config.url + "/stolen"})
+    server.reply = lambda handler: reply(
+        handler, (KEY + "private-response").encode(), status=status, headers={"Location": server.config.url + "/stolen"}
+    )
     with pytest.raises(transport.QdrantHTTPError) as caught:
         call(server.config, "PUT", body={"points": []})
     assert_safe(caught.value, code="http_status", status=status)
     assert len(server.requests) == len(children) == 1
 
 
-@pytest.mark.parametrize("body", [b"private-response", b"[]", b"null", b"1", b'{"x":NaN}',
-                                  b'{"x":Infinity}', b'{"x":-Infinity}', b'{"x":1e999}', b'\xff'])
+@pytest.mark.parametrize(
+    "body",
+    [
+        b"private-response",
+        b"[]",
+        b"null",
+        b"1",
+        b'{"x":NaN}',
+        b'{"x":Infinity}',
+        b'{"x":-Infinity}',
+        b'{"x":1e999}',
+        b"\xff",
+    ],
+)
 def test_invalid_non_object_and_nonfinite_json(server, body):
     server.reply = lambda handler: reply(handler, body)
     with pytest.raises(transport.QdrantHTTPError) as caught:
@@ -142,8 +159,11 @@ def test_invalid_non_object_and_nonfinite_json(server, body):
 @pytest.mark.parametrize("stage", ["headers", "body"])
 def test_slow_drip_has_one_absolute_deadline(server, children, stage):
     def drip(handler):
-        raw = (b"HTTP/1.1 200 OK\r\nX-Slow: private-response" if stage == "headers" else
-               b"HTTP/1.1 200 OK\r\nContent-Length: 10000\r\n\r\n{\"result\":\"")
+        raw = (
+            b"HTTP/1.1 200 OK\r\nX-Slow: private-response"
+            if stage == "headers"
+            else b'HTTP/1.1 200 OK\r\nContent-Length: 10000\r\n\r\n{"result":"'
+        )
         handler.connection.sendall(raw)
         while not server.stop.wait(0.025):
             handler.connection.sendall(b" ")
@@ -166,11 +186,14 @@ def fake_worker(tmp_path, monkeypatch, source):
 
 def test_dns_stall_and_stdin_stall_are_bounded(server, children, tmp_path, monkeypatch):
     worker_path = str(transport._WORKER_PATH)
-    fake_worker(tmp_path, monkeypatch,
-                "import socket,time,runpy\n"
-                "def stall(*a, **k):\n    time.sleep(30)\n"
-                "socket.getaddrinfo=stall\n"
-                f"runpy.run_path({worker_path!r}, run_name='__main__')\n")
+    fake_worker(
+        tmp_path,
+        monkeypatch,
+        "import socket,time,runpy\n"
+        "def stall(*a, **k):\n    time.sleep(30)\n"
+        "socket.getaddrinfo=stall\n"
+        f"runpy.run_path({worker_path!r}, run_name='__main__')\n",
+    )
     started = time.monotonic()
     with pytest.raises(transport.QdrantHTTPError) as caught:
         call(server.config, budget=0.25)
@@ -214,32 +237,54 @@ def test_response_limit_known_and_streamed(server, declared):
     assert_safe(caught.value, code="response_limit", status=200)
 
 
-@pytest.mark.parametrize("url", ["http://0x08080808:6333", "http://0X08080808", "http://134744072",
-                                 "http://127.1", "http://010.010.010.010", "http://8.8.8.8",
-                                 "https://example.test?", "https://example.test#"])
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://0x08080808:6333",
+        "http://0X08080808",
+        "http://134744072",
+        "http://127.1",
+        "http://010.010.010.010",
+        "http://8.8.8.8",
+        "https://example.test?",
+        "https://example.test#",
+    ],
+)
 def test_helper_stdin_uses_same_origin_validation_before_connect(monkeypatch, url):
     def forbidden(*args, **kwargs):
         pytest.fail("invalid origin reached connection")
 
     monkeypatch.setattr(transport.wire.http.client, "HTTPConnection", forbidden)
     monkeypatch.setattr(transport.wire.http.client, "HTTPSConnection", forbidden)
-    raw = json.dumps(dict(url=url, method="GET", path="/collections", api_key=KEY,
-                          body_b64=None, timeout_seconds=1)).encode()
+    raw = json.dumps(
+        dict(url=url, method="GET", path="/collections", api_key=KEY, body_b64=None, timeout_seconds=1)
+    ).encode()
     assert transport.wire._request(raw) == {"ok": False, "code": "request_invalid", "status": None}
 
 
 @pytest.mark.parametrize("addresses", [["8.8.8.8"], ["::ffff:8.8.8.8"], ["127.0.0.1", "8.8.8.8"]])
 def test_http_name_resolution_is_checked_before_connect(monkeypatch, addresses):
-    infos = [(socket.AF_INET6 if ":" in host else socket.AF_INET, socket.SOCK_STREAM, 6, "",
-              (host, 6333, 0, 0) if ":" in host else (host, 6333)) for host in addresses]
+    infos = [
+        (
+            socket.AF_INET6 if ":" in host else socket.AF_INET,
+            socket.SOCK_STREAM,
+            6,
+            "",
+            (host, 6333, 0, 0) if ":" in host else (host, 6333),
+        )
+        for host in addresses
+    ]
     monkeypatch.setattr(transport.wire.socket, "getaddrinfo", lambda *a, **kw: infos)
 
     def forbidden(*args, **kwargs):
         pytest.fail("public HTTP destination reached socket creation")
 
     monkeypatch.setattr(transport.wire.socket, "socket", forbidden)
-    raw = json.dumps(dict(url="http://vectors:6333", method="GET", path="/collections", api_key=KEY,
-                          body_b64=None, timeout_seconds=1)).encode()
+    raw = json.dumps(
+        dict(
+            url="http://vectors:6333", method="GET", path="/collections", api_key=KEY, body_b64=None, timeout_seconds=1
+        )
+    ).encode()
     assert transport.wire._request(raw) == {"ok": False, "code": "request_invalid", "status": None}
 
 
@@ -247,13 +292,18 @@ def test_a_full_dimension_batch_is_not_refused_by_the_shape_walk():
     """A 64-point batch at 2048 dimensions is 1.8 MB and 263,619 nodes: the walk
     must refuse a body by its bytes, not by a node count a legitimate batch
     exceeds."""
-    row = {"id": "p10:TEST@1:space", "scope_id": "TEST-scope", "source": "event",
-           "target": "{}", "content": "x", "summary": "",
-           "updated_at": "2026-09-25T00:00:00Z", "vector": [0.001] * 2048}
-    body = {"points": [{"id": "TEST-point", "vector": [0.001] * 2048, "payload": row}
-                       for _ in range(64)]}
-    transport.wire._bounded_shape(body, transport.wire.MAX_BODY_BYTES,
-                                  deadline=time.monotonic() + 30)
+    row = {
+        "id": "p10:TEST@1:space",
+        "scope_id": "TEST-scope",
+        "source": "event",
+        "target": "{}",
+        "content": "x",
+        "summary": "",
+        "updated_at": "2026-09-25T00:00:00Z",
+        "vector": [0.001] * 2048,
+    }
+    body = {"points": [{"id": "TEST-point", "vector": [0.001] * 2048, "payload": row} for _ in range(64)]}
+    transport.wire._bounded_shape(body, transport.wire.MAX_BODY_BYTES, deadline=time.monotonic() + 30)
     oversized = {"points": [{"id": f"TEST-{index}", "vector": [0.0]} for index in range(100)]}
     with pytest.raises(transport.wire._Failure) as caught:
         transport.wire._bounded_shape(oversized, 64, deadline=time.monotonic() + 30)
@@ -266,12 +316,19 @@ def test_internal_dns_connects_checked_address_once(server, monkeypatch):
     def resolve(host, port, *args, **kwargs):
         # Answer without touching a resolver: the test boundary denies real lookups.
         calls.append(host)
-        return [(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "",
-                 ("127.0.0.1", server.server_port))]
+        return [(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", ("127.0.0.1", server.server_port))]
 
     monkeypatch.setattr(transport.wire.socket, "getaddrinfo", resolve)
-    raw = json.dumps(dict(url=f"http://vectors:{server.server_port}", method="GET", path="/collections",
-                          api_key=KEY, body_b64=None, timeout_seconds=1)).encode()
+    raw = json.dumps(
+        dict(
+            url=f"http://vectors:{server.server_port}",
+            method="GET",
+            path="/collections",
+            api_key=KEY,
+            body_b64=None,
+            timeout_seconds=1,
+        )
+    ).encode()
     result = transport.wire._request(raw)
     assert result["ok"] is True
     assert calls == ["vectors"]
@@ -279,9 +336,12 @@ def test_internal_dns_connects_checked_address_once(server, monkeypatch):
 
 
 def test_request_limit_and_finite_object_before_spawn(server, children):
-    for body, code in [({"x": "x" * (8 * 1024 * 1024)}, "request_limit"),
-                       ({"x": float("nan")}, "request_invalid"),
-                       ({"x": float("inf")}, "request_invalid"), ([], "request_invalid")]:
+    for body, code in [
+        ({"x": "x" * (8 * 1024 * 1024)}, "request_limit"),
+        ({"x": float("nan")}, "request_invalid"),
+        ({"x": float("inf")}, "request_invalid"),
+        ([], "request_invalid"),
+    ]:
         with pytest.raises(transport.QdrantHTTPError) as caught:
             call(server.config, "PUT", body=body)
         assert_safe(caught.value, code=code)
@@ -296,9 +356,18 @@ def test_deadline_rejected_before_spawn(server, children, deadline):
     assert not children
 
 
-@pytest.mark.parametrize("method,path", [("PATCH", "/"), ("GET\r\n", "/"), ("GET", "//host/"),
-                                        ("GET", "https://qdrant-secret-host/"), ("GET", "/\r\n"),
-                                        ("GET", "/#secret"), ("GET", "/\\secret")])
+@pytest.mark.parametrize(
+    "method,path",
+    [
+        ("PATCH", "/"),
+        ("GET\r\n", "/"),
+        ("GET", "//host/"),
+        ("GET", "https://qdrant-secret-host/"),
+        ("GET", "/\r\n"),
+        ("GET", "/#secret"),
+        ("GET", "/\\secret"),
+    ],
+)
 def test_method_path_validation(server, children, method, path):
     with pytest.raises(transport.QdrantHTTPError) as caught:
         call(server.config, method, path)
@@ -324,8 +393,12 @@ def test_connection_refused_sanitized_and_only_own_process_reaped(server, childr
         reserved.bind(("127.0.0.1", 0))
         config = QdrantConfig(f"http://127.0.0.1:{reserved.getsockname()[1]}")
         popen = subprocess.Popen
-        sibling = popen([sys.executable, "-I", "-B", "-c", "import time; time.sleep(30)"],
-                        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        sibling = popen(
+            [sys.executable, "-I", "-B", "-c", "import time; time.sleep(30)"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
         try:
             with pytest.raises(transport.QdrantHTTPError) as caught:
                 call(config)
@@ -336,13 +409,16 @@ def test_connection_refused_sanitized_and_only_own_process_reaped(server, childr
             sibling.communicate(timeout=1)
 
 
-@pytest.mark.parametrize("source", [
-    "import sys; sys.stdin.buffer.read(); print('private-response')",
-    "import sys; sys.stdin.buffer.read(); print('{\"ok\":false,\"code\":\"private-response\"}')",
-    "import sys; sys.stdin.buffer.read(); print('{\"ok\":true,\"status\":200,\"body\":[]}')",
-    "import sys; sys.stdin.buffer.read(); print('{\"ok\":true,\"status\":200,\"body\":{\"x\":1e999}}')",
-    "import sys; sys.stdin.buffer.read(); sys.exit(3)",
-])
+@pytest.mark.parametrize(
+    "source",
+    [
+        "import sys; sys.stdin.buffer.read(); print('private-response')",
+        'import sys; sys.stdin.buffer.read(); print(\'{"ok":false,"code":"private-response"}\')',
+        'import sys; sys.stdin.buffer.read(); print(\'{"ok":true,"status":200,"body":[]}\')',
+        'import sys; sys.stdin.buffer.read(); print(\'{"ok":true,"status":200,"body":{"x":1e999}}\')',
+        "import sys; sys.stdin.buffer.read(); sys.exit(3)",
+    ],
+)
 def test_bad_worker_frame_is_sanitized(server, children, tmp_path, monkeypatch, source):
     fake_worker(tmp_path, monkeypatch, source + "\n")
     with pytest.raises(transport.QdrantHTTPError) as caught:
@@ -351,9 +427,12 @@ def test_bad_worker_frame_is_sanitized(server, children, tmp_path, monkeypatch, 
 
 
 def test_worker_output_is_bounded_before_json_parse(server, children, tmp_path, monkeypatch):
-    fake_worker(tmp_path, monkeypatch,
-                "import sys,time\nsys.stdin.buffer.read()\n"
-                "while True:\n    sys.stdout.buffer.write(b'x' * 65536)\n    sys.stdout.buffer.flush()\n")
+    fake_worker(
+        tmp_path,
+        monkeypatch,
+        "import sys,time\nsys.stdin.buffer.read()\n"
+        "while True:\n    sys.stdout.buffer.write(b'x' * 65536)\n    sys.stdout.buffer.flush()\n",
+    )
     with pytest.raises(transport.QdrantHTTPError) as caught:
         call(server.config, budget=5)
     assert_safe(caught.value, code="worker_protocol")
@@ -373,8 +452,13 @@ def test_truncated_body_cannot_masquerade_as_valid_json(server):
 def test_chunked_object_and_exact_size_limits(server):
     def chunked(handler):
         body = json.dumps(ENVELOPE).encode()
-        handler.connection.sendall(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
-                                   + f"{len(body):x}\r\n".encode() + body + b"\r\n0\r\n\r\n")
+        handler.connection.sendall(
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+            + f"{len(body):x}\r\n".encode()
+            + body
+            + b"\r\n0\r\n\r\n"
+        )
+
     server.reply = chunked
     assert call(server.config) == ENVELOPE
     exact_response = b'{"x":"' + b"x" * (16 * 1024 * 1024 - 8) + b'"}'
@@ -387,15 +471,22 @@ def test_chunked_object_and_exact_size_limits(server):
     assert len(server.requests[-1][3]) == 8 * 1024 * 1024
 
 
-@pytest.mark.parametrize("headers", [b"Content-Length: -1", b"Content-Length: invalid",
-                                     b"Content-Length: 2\r\nContent-Length: 2",
-                                     b"Content-Length: 2\r\nTransfer-Encoding: chunked",
-                                     b"Transfer-Encoding: gzip", b"Content-Encoding: gzip"])
+@pytest.mark.parametrize(
+    "headers",
+    [
+        b"Content-Length: -1",
+        b"Content-Length: invalid",
+        b"Content-Length: 2\r\nContent-Length: 2",
+        b"Content-Length: 2\r\nTransfer-Encoding: chunked",
+        b"Transfer-Encoding: gzip",
+        b"Content-Encoding: gzip",
+    ],
+)
 def test_ambiguous_http_framing_is_rejected(server, headers):
     def malformed(handler):
-        handler.connection.sendall(b"HTTP/1.1 200 OK\r\n" + headers
-                                   + b"\r\nConnection: close\r\n\r\n{}")
+        handler.connection.sendall(b"HTTP/1.1 200 OK\r\n" + headers + b"\r\nConnection: close\r\n\r\n{}")
         handler.close_connection = True
+
     server.reply = malformed
     with pytest.raises(transport.QdrantHTTPError) as caught:
         call(server.config)
@@ -403,9 +494,13 @@ def test_ambiguous_http_framing_is_rejected(server, headers):
 
 
 def test_isolated_helper_rejects_stdin_overflow_and_emits_only_json(server):
-    child = subprocess.run([sys.executable, "-I", "-B", str(transport._WORKER_PATH)],
-                           input=b"x" * (transport.wire.MAX_REQUEST_FRAME + 1),
-                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, env={}, timeout=3)
+    child = subprocess.run(
+        [sys.executable, "-I", "-B", str(transport._WORKER_PATH)],
+        input=b"x" * (transport.wire.MAX_REQUEST_FRAME + 1),
+        capture_output=True,
+        env={},
+        timeout=3,
+    )
     assert child.returncode == 0 and child.stderr == b""
     assert json.loads(child.stdout) == {"ok": False, "code": "request_limit", "status": None}
 
@@ -417,11 +512,32 @@ def test_tls_validates_certificate_and_ignores_ambient_ca_override(server, tmp_p
     request = tmp_path / "openssl.cnf"
     # The subject travels in a file: a bare ``/CN=localhost`` argument reads as an
     # absolute path to the test boundary, which denies it.
-    request.write_text("[req]\ndistinguished_name = dn\nprompt = no\nx509_extensions = v3\n"
-                       "[dn]\nCN = localhost\n[v3]\nsubjectAltName = IP:127.0.0.1\n", encoding="utf-8")
-    subprocess.run([openssl, "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
-                    "-keyout", str(key), "-out", str(cert), "-config", str(request)],
-                   check=True, capture_output=True, timeout=5)
+    request.write_text(
+        "[req]\ndistinguished_name = dn\nprompt = no\nx509_extensions = v3\n"
+        "[dn]\nCN = localhost\n[v3]\nsubjectAltName = IP:127.0.0.1\n",
+        encoding="utf-8",
+    )
+    subprocess.run(
+        [
+            openssl,
+            "req",
+            "-x509",
+            "-newkey",
+            "rsa:2048",
+            "-nodes",
+            "-days",
+            "1",
+            "-keyout",
+            str(key),
+            "-out",
+            str(cert),
+            "-config",
+            str(request),
+        ],
+        check=True,
+        capture_output=True,
+        timeout=5,
+    )
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     context.load_cert_chain(cert, key)
     server.socket = context.wrap_socket(server.socket, server_side=True)
@@ -434,10 +550,13 @@ def test_tls_validates_certificate_and_ignores_ambient_ca_override(server, tmp_p
 
 
 def test_worker_exit_is_inside_deadline(server, children, tmp_path, monkeypatch):
-    fake_worker(tmp_path, monkeypatch,
-                "import os,sys,time\nsys.stdin.buffer.read()\n"
-                "sys.stdout.buffer.write(b'{\"ok\":true,\"status\":200,\"body_b64\":\"e30=\"}')\n"
-                "sys.stdout.buffer.flush()\nos.close(1)\ntime.sleep(30)\n")
+    fake_worker(
+        tmp_path,
+        monkeypatch,
+        "import os,sys,time\nsys.stdin.buffer.read()\n"
+        'sys.stdout.buffer.write(b\'{"ok":true,"status":200,"body_b64":"e30="}\')\n'
+        "sys.stdout.buffer.flush()\nos.close(1)\ntime.sleep(30)\n",
+    )
     started = time.monotonic()
     with pytest.raises(transport.QdrantHTTPError) as caught:
         call(server.config, budget=0.25)
@@ -447,21 +566,35 @@ def test_worker_exit_is_inside_deadline(server, children, tmp_path, monkeypatch)
 
 def test_helper_frame_contract_is_duration_based(server):
     def run(frame):
-        child = subprocess.run([sys.executable, "-I", "-B", str(transport._WORKER_PATH)],
-                               input=json.dumps(frame).encode(), stdout=subprocess.PIPE,
-                               stderr=subprocess.PIPE, env={}, timeout=3)
+        child = subprocess.run(
+            [sys.executable, "-I", "-B", str(transport._WORKER_PATH)],
+            input=json.dumps(frame).encode(),
+            capture_output=True,
+            env={},
+            timeout=3,
+        )
         assert child.returncode == 0 and child.stderr == b""
         return json.loads(child.stdout)
 
-    base = {"url": server.config.url, "method": "GET", "path": "/collections/test",
-            "api_key": KEY, "body_b64": None, "timeout_seconds": 2.0}
+    base = {
+        "url": server.config.url,
+        "method": "GET",
+        "path": "/collections/test",
+        "api_key": KEY,
+        "body_b64": None,
+        "timeout_seconds": 2.0,
+    }
     ok = run(base)
     assert ok["ok"] is True and json.loads(base64.b64decode(ok["body_b64"])) == ENVELOPE
     assert server.requests[0][2]["api-key"] == KEY
-    broken = [{**base, "deadline": 1.0},
-              {name: value for name, value in base.items() if name != "timeout_seconds"},
-              {**base, "timeout_seconds": 0},
-              {**base, "api_key": None}, {**base, "method": "PATCH"}, {**base, "path": "relative"}]
+    broken = [
+        {**base, "deadline": 1.0},
+        {name: value for name, value in base.items() if name != "timeout_seconds"},
+        {**base, "timeout_seconds": 0},
+        {**base, "api_key": None},
+        {**base, "method": "PATCH"},
+        {**base, "path": "relative"},
+    ]
     for frame in broken:
         result = run(frame)
         assert result["ok"] is False and result["status"] is None
@@ -479,8 +612,8 @@ def test_one_huge_string_cannot_outrun_the_deadline(monkeypatch):
     config = QdrantConfig("http://127.0.0.1:6333", timeout_seconds=45.0)
     started = time.monotonic()
     with pytest.raises(transport.QdrantHTTPError) as exc:
-        transport.request_json(config, "POST", "/collections/x/points",
-                               {"huge": "x" * (8 * 1024 * 1024)},
-                               deadline=time.monotonic() + 0.05)
+        transport.request_json(
+            config, "POST", "/collections/x/points", {"huge": "x" * (8 * 1024 * 1024)}, deadline=time.monotonic() + 0.05
+        )
     assert exc.value.code == "request_limit"
     assert time.monotonic() - started < 1.0

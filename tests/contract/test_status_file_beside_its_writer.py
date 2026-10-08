@@ -7,6 +7,7 @@ refusal ended a supervisor.  It was seen as a nightly CI failure: ``control.read
 ``PermissionError: [Errno 13]`` in ``test_real_detached_supervisor_processes_future_local_work_after_host_exit``
 while the real supervisor process was writing the same file.
 """
+
 from __future__ import annotations
 
 import json
@@ -14,7 +15,6 @@ import os
 from pathlib import Path
 
 import pytest
-
 from scope_recall.runtime import worker_entry
 
 
@@ -42,7 +42,7 @@ def test_a_read_refused_for_an_instant_is_read_again(tmp_path, monkeypatch):
     read, calls = _refusing(3, Path.read_text)
     monkeypatch.setattr(Path, "read_text", read)
 
-    assert worker_entry._read_metadata(path) == {"state": "waiting", "wake_revision": 7}
+    assert worker_entry.read_worker_metadata(path) == {"state": "waiting", "wake_revision": 7}
     assert calls["count"] == 4
 
 
@@ -52,7 +52,7 @@ def test_a_replace_refused_for_an_instant_is_made_again(tmp_path, monkeypatch):
     replace, calls = _refusing(2, os.replace)
     monkeypatch.setattr(worker_entry.os, "replace", replace)
 
-    worker_entry._atomic_metadata(path, {"wake_revision": 2})
+    worker_entry.write_worker_metadata(path, {"wake_revision": 2})
 
     assert json.loads(path.read_text(encoding="utf-8")) == {"wake_revision": 2} and calls["count"] == 3
     assert [item.name for item in tmp_path.iterdir()] == [path.name], "no temporary file is left behind"
@@ -65,5 +65,5 @@ def test_a_file_that_is_really_forbidden_still_fails(tmp_path, monkeypatch):
     monkeypatch.setattr(Path, "read_text", read)
 
     with pytest.raises(PermissionError):
-        worker_entry._read_metadata(path)
+        worker_entry.read_worker_metadata(path)
     assert calls["count"] == worker_entry._SHARING_RETRIES

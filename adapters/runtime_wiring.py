@@ -4,18 +4,19 @@ Host-specific modules own only their lifecycle wakeup policy.  This module
 owns the one binding/configuration authority and never initializes storage as
 a side effect of an optional host hookup.
 """
+
 from __future__ import annotations
 
-from dataclasses import dataclass, field, replace
-from datetime import tzinfo
 import json
 import math
 import os
-from pathlib import Path
 import stat
 import tempfile
 import threading
 import time
+from dataclasses import dataclass, field, replace
+from datetime import tzinfo
+from pathlib import Path
 from typing import Any, Mapping
 
 from scope_recall.contracts import InstanceBinding
@@ -23,7 +24,8 @@ from scope_recall.core import CoreConfig, MemoryCore
 from scope_recall.core.recall_budget import canonical_render_json
 from scope_recall.runtime.instance import RuntimeInstance, RuntimeInstanceConfig, build_runtime_instance
 from scope_recall.runtime.worker_entry import load_config
-from scope_recall.runtime.worker_launch import EPHEMERAL_CONFIG_INFIX
+from scope_recall.runtime.worker_launch import EPHEMERAL_CONFIG_INFIX, RUNTIME_CONFIG_FILENAME
+
 from .tool_common import local_times
 
 GAP_UNCONFIGURED = "capability_gap:trusted_runtime_unconfigured"
@@ -32,7 +34,6 @@ GAP_BINDING_MISMATCH = "capability_gap:trusted_runtime_binding_mismatch"
 GAP_WORKER_BUSY = "capability_gap:trusted_runtime_worker_busy"
 GAP_WORKER_LAUNCH_FAILED = "capability_gap:trusted_runtime_worker_launch_failed"
 GAP_AUDIENCE_CAPACITY = "capability_gap:trusted_runtime_audience_capacity"
-RUNTIME_CONFIG_FILENAME = "runtime-config.json"
 #: Exact audiences a host may keep workers for at once, one active and one follower each.
 MAX_AUDIENCE_LANES = 8
 
@@ -98,10 +99,12 @@ def render_host_recall_context(
     if not canonical_text:
         return ""
     guidance = RECALL_CONTEXT_GUIDANCE
-    if entry is not None and context is not None and any(
-        label.get("id") != entry[0]
-        for item in context.get("items") or ()
-        for label in item.get("entries") or ()
+    if (
+        entry is not None
+        and context is not None
+        and any(
+            label.get("id") != entry[0] for item in context.get("items") or () for label in item.get("entries") or ()
+        )
     ):
         guidance = f"{guidance} {ENTRY_GUIDANCE.format(entry_id=entry[0], name=entry[1])}"
     return f"{guidance}\n{canonical_render_json(local_times(json.loads(canonical_text), zone))}"
@@ -162,7 +165,7 @@ def _basic_core(expected_binding: InstanceBinding, core: MemoryCore | None, cloc
     return MemoryCore(CoreConfig(expected_binding), clock=clock)
 
 
-def _strict_hook_budget(value: object) -> float:
+def strict_hook_budget(value: object) -> float:
     if type(value) not in (int, float):
         raise ValueError("hook_processing_seconds")
     parsed = float(value)
@@ -190,7 +193,7 @@ class TrustedHostRuntime:
     _last_worker_launch: float = 0.0
 
     def __post_init__(self) -> None:
-        self._hook_processing_seconds = _strict_hook_budget(self._hook_processing_seconds)
+        self._hook_processing_seconds = strict_hook_budget(self._hook_processing_seconds)
 
     @property
     def configured(self) -> bool:
@@ -205,7 +208,7 @@ class TrustedHostRuntime:
         """Return the budget from the verified runtime, or the safe default."""
         runtime = self._runtime
         value = runtime.config.hook_processing_seconds if runtime is not None else self._hook_processing_seconds
-        value = _strict_hook_budget(value)
+        value = strict_hook_budget(value)
         auto = getattr(self.core.config, "auto_recall_seconds", 5.0)
         if type(auto) not in (int, float) or not math.isfinite(auto) or not 0 < auto <= 5.0:
             raise ValueError("auto_recall_seconds")
@@ -328,21 +331,26 @@ def write_ephemeral_worker_config(
 def _reap_lane(active, tail):
     """Drop finished workers; a finished active worker promotes its follower."""
     if active is not None and active.poll() is not None:
-        active.communicate(timeout=.1)
+        active.communicate(timeout=0.1)
         active, tail = tail, None
     if active is not None and active.poll() is not None:
-        active.communicate(timeout=.1)
+        active.communicate(timeout=0.1)
         active = None
     if tail is not None and tail.poll() is not None:
-        tail.communicate(timeout=.1)
+        tail.communicate(timeout=0.1)
         tail = None
     return active, tail
 
 
-def launch_audience_worker(host: TrustedHostRuntime, *, session_id: str,
-                          allowed_scope_ids: frozenset[str], launcher,
-                          project_id: str | None = None,
-                          branch_id: str | None = None) -> tuple[str, ...]:
+def launch_audience_worker(
+    host: TrustedHostRuntime,
+    *,
+    session_id: str,
+    allowed_scope_ids: frozenset[str],
+    launcher,
+    project_id: str | None = None,
+    branch_id: str | None = None,
+) -> tuple[str, ...]:
     """At most eight exact audiences, each with one active and one follower.
 
     Coalescing never merges authority sets. Fresh hooks may request another
@@ -356,9 +364,13 @@ def launch_audience_worker(host: TrustedHostRuntime, *, session_id: str,
             # A shared store has one worker of its own, with its own credentials;
             # an entry's process carries the entry's (``runtime/worker_launch.py``).
             return ()
-        if (type(session_id) is not str or not session_id.strip()
-                or type(allowed_scope_ids) is not frozenset or not allowed_scope_ids
-                or not allowed_scope_ids <= runtime.config.binding.scope_ids):
+        if (
+            type(session_id) is not str
+            or not session_id.strip()
+            or type(allowed_scope_ids) is not frozenset
+            or not allowed_scope_ids
+            or not allowed_scope_ids <= runtime.config.binding.scope_ids
+        ):
             return (GAP_BINDING_MISMATCH,)
         lanes = host._worker_lanes
         for key, pair in tuple(lanes.items()):
@@ -385,10 +397,16 @@ def launch_audience_worker(host: TrustedHostRuntime, *, session_id: str,
             options["after_pid"] = active.pid
         if host._last_worker_launch and since_last < interval:
             options["delay_seconds"] = max(0.0, interval - since_last)
-        config_path = write_ephemeral_worker_config(host._config_path, session_id=session_id,
-                        allowed_scope_ids=allowed_scope_ids, expected_binding=runtime.config.binding,
-                        expected_partition=partition, host_adapter=host._host_adapter,
-                        project_id=partition[0], branch_id=partition[1])
+        config_path = write_ephemeral_worker_config(
+            host._config_path,
+            session_id=session_id,
+            allowed_scope_ids=allowed_scope_ids,
+            expected_binding=runtime.config.binding,
+            expected_partition=partition,
+            host_adapter=host._host_adapter,
+            project_id=partition[0],
+            branch_id=partition[1],
+        )
         try:
             worker = launcher(config_path, **options)
         except Exception:
@@ -414,7 +432,7 @@ def close_audience_workers(host: TrustedHostRuntime, *, detach: bool) -> None:
                 try:
                     if worker.poll() is None:
                         worker.terminate()
-                    worker.communicate(timeout=.1)
+                    worker.communicate(timeout=0.1)
                 except Exception:
                     pass
 

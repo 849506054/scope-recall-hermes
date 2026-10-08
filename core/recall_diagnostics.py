@@ -3,13 +3,14 @@
 Diagnostic records never store raw query text or item content.  They exist only
 for correlating capture, retrieval, and delivery phases within one installation.
 """
+
 from __future__ import annotations
 
-from collections import deque
-from dataclasses import dataclass
 import hashlib
 import json
 import threading
+from collections import deque
+from dataclasses import dataclass
 from typing import Deque
 
 _MAX_RECORDS = 64

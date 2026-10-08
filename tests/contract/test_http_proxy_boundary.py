@@ -1,4 +1,5 @@
 """Offline HTTP worker proxy and transport guards; no external network."""
+
 from __future__ import annotations
 
 import base64
@@ -9,7 +10,6 @@ from io import BytesIO
 from types import SimpleNamespace
 
 import pytest
-
 from scope_recall.runtime import _http_worker as worker
 
 
@@ -77,7 +77,8 @@ class _RecordingHTTPSConnection:
 class _RecordingHTTPConnection:
     created: list[tuple[object, ...]] = []
 
-    def __init__(self, host, port=80, timeout=object()) -> None:
+    # The constructor-local singleton distinguishes an omitted timeout from an explicit None.
+    def __init__(self, host, port=80, timeout=object()) -> None:  # noqa: B008
         self.created.append((host, port))
         self.host = host
         self.port = port

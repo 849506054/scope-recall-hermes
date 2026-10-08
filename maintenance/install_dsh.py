@@ -3,7 +3,7 @@ shared store.
 
 dsh has no store of its own here: ``scope-recall attach --host dsh`` makes its home an entry first, and this installer
 tells dsh to run, for that entry, the plugin ``distribution/dsh/scope-recall/index.mjs`` (recall before a turn's first
-step and capture of each turn, through the hook client of ``adapters/codex``) and the MCP stdio server (the explicit
+step and capture of each turn, through the hook client of ``adapters/clients``) and the MCP stdio server (the explicit
 tools).  dsh's hooks cannot capture (no turn, no reply, a compressed session log), so the plugin is the way.
 
 dsh composes every profile from patch layers; the home layer ``$DSH_HOME/cordis.patch.yml`` (``~/.dsh`` by default)
@@ -24,22 +24,22 @@ one of this install's rows without inserting it (``- id: scope-recall`` with ``d
 stays after the block, which a re-install writes where it stood and a fresh install before that operation; and the
 upload counts as off only as the operations leave it, the install's own switch going after every other.
 """
+
 from __future__ import annotations
 
 import codecs
 import json
 import os
-from pathlib import Path
 import re
+from pathlib import Path
 from typing import Any
 
 import yaml
-
 from scope_recall._version import __version__ as PACKAGE_VERSION
-from scope_recall.adapters.codex.config import CodexConfigError, load_shared_client
+from scope_recall.adapters.clients.config import CodexConfigError, load_shared_client
 from scope_recall.adapters.hermes.installation import attachment_path
 
-from .install_common import RUNTIME_CONFIG_LIMIT, InstallError, InstallPlan, _reject_symlink_chain, _require_file
+from .install_common import RUNTIME_CONFIG_LIMIT, InstallError, InstallPlan, reject_symlink_chain, require_file
 
 HOST = "dsh"
 PATCH_FILENAME = "cordis.patch.yml"
@@ -52,9 +52,11 @@ START = "# SCOPE_RECALL_DSH_START"
 END = "# SCOPE_RECALL_DSH_END"
 PRIVACY_START = "# SCOPE_RECALL_DSH_PRIVACY_START"
 PRIVACY_END = "# SCOPE_RECALL_DSH_PRIVACY_END"
-RESTART_NOTE = ("quit every running dsh (web, headless, tui, Desktop) before apply-install and start it again after; "
-                "check with dsh --profile headless --dump-config that the rows scope-recall and mcp-scope-recall are "
-                "there and session-log-deepseek has enabled: false")
+RESTART_NOTE = (
+    "quit every running dsh (web, headless, tui, Desktop) before apply-install and start it again after; "
+    "check with dsh --profile headless --dump-config that the rows scope-recall and mcp-scope-recall are "
+    "there and session-log-deepseek has enabled: false"
+)
 _SERVER_MODULE = "scope_recall.adapters.codex.mcp_entry"
 _MARKER = re.compile(re.escape(START) + r" \(scope-recall \S+ for (.+); apply-uninstall takes this block out\)$")
 
@@ -104,7 +106,7 @@ def validate_options(agent_workspace: str | None, env_file: Path | str | None) -
         raise InstallError("agent_workspace is not used for dsh installation")
     if env_file is None or str(env_file).strip() == "":
         return "", None
-    return "", _require_file(Path(env_file), "env_file")
+    return "", require_file(Path(env_file), "env_file")
 
 
 def validate_local_platforms(values: object) -> tuple[str, ...]:
@@ -137,6 +139,7 @@ def planned_files(plan: InstallPlan) -> dict[Path, str | bytes]:
 
 
 # -- the rows ---------------------------------------------------------------------------------------------------
+
 
 def _scalar(value: str) -> str:
     """``value`` as a double-quoted YAML scalar (JSON's quoting is YAML's)."""
@@ -188,6 +191,7 @@ def _privacy_rows() -> list[str]:
 
 # -- reading and writing the patch ------------------------------------------------------------------------------
 
+
 class _Loader(yaml.SafeLoader):
     """PyYAML's safe loader that reads dsh's ``!!js`` expressions as text instead of refusing the file."""
 
@@ -197,7 +201,7 @@ _Loader.add_constructor("tag:yaml.org,2002:js", lambda loader, node: ("!!js", lo
 
 def read_patch(path: Path) -> tuple[str, bytes | None]:
     """The patch file's text (without a byte order mark) and its bytes; ("", None) when there is none yet."""
-    _reject_symlink_chain(path)
+    reject_symlink_chain(path)
     if not path.exists():
         return "", None
     if not path.is_file() or path.stat().st_size > RUNTIME_CONFIG_LIMIT:
@@ -234,8 +238,9 @@ def _parse(text: str, path: Path) -> list[Any]:
 _PLACE = object()
 
 
-def _without_block(lines: list, start: str, end: str, *, home: Path | None = None,
-                   mark: bool = False) -> tuple[list, bool]:
+def _without_block(
+    lines: list, start: str, end: str, *, home: Path | None = None, mark: bool = False
+) -> tuple[list, bool]:
     """``lines`` without the marked block (only this entry's when ``home`` is given), with ``_PLACE`` where it stood
     when ``mark``, and whether one was there."""
     result: list = []
@@ -262,14 +267,20 @@ def _without_block(lines: list, start: str, end: str, *, home: Path | None = Non
 def _names_home(marker: str, home: Path) -> bool:
     """Whether a block's start line (``_rows``) names ``home``, a path that may hold spaces or semicolons."""
     found = _MARKER.match(marker)
-    return found is not None and (os.path.normcase(os.path.normpath(found.group(1)))
-                                  == os.path.normcase(os.path.normpath(home.as_posix())))
+    return found is not None and (
+        os.path.normcase(os.path.normpath(found.group(1))) == os.path.normcase(os.path.normpath(home.as_posix()))
+    )
 
 
 def _inserted(operations: list[Any]) -> list[dict[str, Any]]:
     """The rows the operations insert."""
-    return [row for operation in operations if isinstance(operation, dict) and isinstance(operation.get("insert"), list)
-            for row in operation["insert"] if isinstance(row, dict)]
+    return [
+        row
+        for operation in operations
+        if isinstance(operation, dict) and isinstance(operation.get("insert"), list)
+        for row in operation["insert"]
+        if isinstance(row, dict)
+    ]
 
 
 def _ids(operations: list[Any]) -> list[str]:
@@ -280,10 +291,16 @@ def _ids(operations: list[Any]) -> list[str]:
 def _server_names(operations: list[Any]) -> list[str]:
     """The MCP server names the operations give: an inserted row's, or an operation's that replaces another row's config
     (one that replaces this install's MCP row's config keeps that row's server)."""
-    rows = _inserted(operations) + [operation for operation in operations if isinstance(operation, dict)
-                                    and "insert" not in operation and operation.get("id") != MCP_ROW]
-    return [row["config"]["serverName"] for row in rows
-            if isinstance(row.get("config"), dict) and isinstance(row["config"].get("serverName"), str)]
+    rows = _inserted(operations) + [
+        operation
+        for operation in operations
+        if isinstance(operation, dict) and "insert" not in operation and operation.get("id") != MCP_ROW
+    ]
+    return [
+        row["config"]["serverName"]
+        for row in rows
+        if isinstance(row.get("config"), dict) and isinstance(row["config"].get("serverName"), str)
+    ]
 
 
 def upload_off(operations: list[Any]) -> bool:
@@ -293,8 +310,11 @@ def upload_off(operations: list[Any]) -> bool:
     disabled: Any = None
     enabled: Any = None
     for operation in operations:
-        rows = operation["insert"] if isinstance(operation, dict) and isinstance(operation.get("insert"), list) \
+        rows = (
+            operation["insert"]
+            if isinstance(operation, dict) and isinstance(operation.get("insert"), list)
             else [operation]
+        )
         for row in rows:
             if not isinstance(row, dict) or row.get("id") != PRIVACY_ROW:
                 continue
@@ -332,8 +352,10 @@ def _block_style(lines: list[str], path: Path) -> None:
         if _empty_list(line):
             continue
         if not line.startswith("- "):
-            raise InstallError(f"{path} is not a block list at column 0; add this entry's rows by hand "
-                               f"(see docs/install.md, section 13)")
+            raise InstallError(
+                f"{path} is not a block list at column 0; add this entry's rows by hand "
+                f"(see docs/install.md, section 13)"
+            )
         return
 
 
@@ -409,6 +431,7 @@ def unmerged_file(instance_root: Path, path: Path) -> bytes | None:
 
 # -- the entry --------------------------------------------------------------------------------------------------
 
+
 def foreign_instance_entries(instance_root: Path) -> list[str]:
     """A home this installer is asked to create: dsh's is only ever an attached one."""
     return [f"{instance_root} is not attached to a shared store; run scope-recall attach --host dsh first"]
@@ -434,8 +457,9 @@ def validate_reuse(plan: InstallPlan) -> None:
     if config.agent_id != plan.agent_id:
         raise InstallError("existing dsh entry agent_id mismatch: the store's is " + config.agent_id)
     if config.test_mode != plan.test_mode:
-        raise InstallError(f"existing dsh entry test_mode mismatch: stored={config.test_mode}, "
-                           f"requested={plan.test_mode}")
+        raise InstallError(
+            f"existing dsh entry test_mode mismatch: stored={config.test_mode}, requested={plan.test_mode}"
+        )
 
 
 def purge_identity(instance_root: Path) -> tuple[Path, str, str, Path]:

@@ -4,6 +4,60 @@ All notable changes to `scope-recall` will be documented in this file.
 
 ## [Unreleased]
 
+## [3.9.1.1] - 2026-10-08
+
+**Fork release.** Incorporates upstream v3.8.2, v3.9.0 and v3.9.1. The model clients
+live in `runtime`, and the Hermes capture and prefetch code follows the upstream split.
+The Qdrant backend, Voyage usage accounting, bounded embedding proxy, query warm-up,
+vector-loss diagnostics and remote maintenance commands retain their fork contracts.
+
+### Upgrading from 3.8.1.1
+
+Install the fork package, run `plan-install` and `apply-install`, then restart the hosts
+in the selected maintenance window. The store schema remains 1110.
+
+## [3.9.1] - 2026-10-08
+
+3.9.1 changes no behaviour. It is the clean-up's second part: stored content, recall results, hook and CLI output, log lines, configuration formats and the modules installed hosts run are those of 3.9.0.
+
+- **No import cycles, and imports follow the layers.** In 3.9.0 the package's modules imported each other in four cycles (of 27, 15, 2 and 2 modules, counting imports inside functions); the code that closed them moved to the modules it belongs with, and there are none now. No module imports from a layer above its own (contracts, core, vector, runtime, adapters, maintenance), but the entry modules in `adapters/codex` and the worker's two lazy imports of a host's authorization check. `scripts/quality.py` fails CI on an import cycle or an upward import.
+- **Imports at the top where every entry loads them anyway.** Imports inside functions went from 326 to 176; the largest groups left are in the composition root, the operator CLI and the resident recall server, where they keep a process from loading what it does not use. Every import block is sorted.
+- **Shared helpers have public names.** 3.9.0 imported another module's private name in 199 places; 3.9.1 in none.
+- **Moved modules.** `scope_recall.adapters.models`, `.codex_cli` and `.lance` are now `scope_recall.runtime.models`, `.codex_cli` and `.lance_port`, and `scope_recall.adapters` no longer re-exports the Lance names; `install_hermes_archive_migration`, the test-only archive migration install, moved from `scope_recall.adapters.hermes` to `scope_recall.maintenance.migration_activation`; the remote client's `install` command is carried out by `scope_recall.maintenance.install_remote`, reached through the same `scope_recall.adapters.codex.remote_client` command. Installed hooks and MCP servers name none of these. A script that imported a renamed helper by its private name imports the public one.
+
+### Upgrading from 3.9.0
+
+Install the package, run `plan-install` and `apply-install` where you upgrade, then restart the Hermes gateways and the clients' MCP servers. The schema is unchanged (1110), and so are the hook and MCP server commands the installers write.
+
+## [3.9.0] - 2026-10-07
+
+3.9.0 changes no behaviour. It is the first part of a clean-up: stored content, recall results, hook and CLI output, configuration formats and the modules installed hosts run are those of 3.8.2.
+
+- **One format and a quality check.** `ruff format` (line length 120) formats the tree, tests included; `git blame --ignore-revs-file .git-blame-ignore-revs` skips that commit. CI's `lint` job runs `scripts/quality.py`: formatting, and no more ruff or pyright findings per file and rule than `scripts/quality.baseline.json` records; a function over a size limit may not grow. ruff and pyright are pinned in the `dev` extra and `uv.lock` (CONTRIBUTING.md).
+- **The hook and MCP clients live in `adapters/clients`.** Codex, Claude Code, WorkBuddy, dsh and the remote client share that layer; `adapters/codex` keeps only the five modules installed configurations run (`hook_entry`, `mcp_entry`, `remote_client`, `remote_server`, `resident_entry`), so installed hooks keep their trust and MCP servers their approval. A script that imported another module of `scope_recall.adapters.codex` imports it from `scope_recall.adapters.clients`.
+- **The hook handler and the Hermes adapter are split by what they do**: a prompt's recall, reading a session record and each hook event; a capture, its retry, a turn, a turn's recall and the session binding. No file of either is over 600 lines, and no function of either is over complexity 25.
+
+### Upgrading from 3.8.2
+
+Install the package, run `plan-install` and `apply-install` where you upgrade, then restart the Hermes gateways and the clients' MCP servers. The schema is unchanged (1110), and so are the hook and MCP server commands the installers write.
+
+## [3.8.2] - 2026-10-07
+
+3.8.2 lets a Hermes agent on Gemini use its memory tools (#216, reported by @momolee-deep).
+
+### Fixes
+
+- **Gemini accepts Hermes's memory tools.** `revise` declared its new value as any type, an array among them without `items`, and Gemini refuses a request when any tool it carries does: through Hermes's own Gemini client every request with the tools failed with HTTP 400. The new value is now declared as what the core takes: the new value's text, an object of the fact's fields, or null to withdraw it. The core refused a number, true or false and a list anyway.
+- **`revise` with a null value withdraws a fact through the MCP server too** (Codex, Claude Code, WorkBuddy, dsh). The server dropped every argument left empty, a null new value included, and the core refused the call; the person's request was kept, but nothing was withdrawn. A capture still withdraws on its own a fact the person's request names alone; the tool is for a request that fits more than one.
+
+### Tests
+
+- The storage tier runs a known-answer check of three memory invariants on a fresh synthetic store: a fact needs a person's source and a worker pass, revise and forget need the person's own request in the same session naming the exact version, and nothing forgotten comes back, also after the vector companion is rebuilt. It also runs on its own against an installed release (`tests/known_answer/`, #213, by @Adam13y).
+
+### Upgrading from 3.8.1
+
+Install the package, run `plan-install` and `apply-install` where you upgrade, then restart the Hermes gateways. The schema is unchanged (1110).
+
 ## [3.8.1.1] - 2026-10-08
 
 **Fork release.** Upstream v3.8.1 is merged over v3.8.0.1 (5 non-merge commits, 22 files, +1229 -49):

@@ -5,6 +5,7 @@ a hand-copied allowlist, plus three version strings that had drifted apart.
 These tests make both conditions loud and tell the reader the one command that
 fixes them.
 """
+
 from __future__ import annotations
 
 import json
@@ -62,15 +63,15 @@ def test_every_entry_point_exists():
 )
 def test_semver_spelling_agrees_with_the_installer(version):
     """The build helper restates the installer's rule; it must not drift from it."""
-    from scope_recall.maintenance.install_common import _manifest_version
+    from scope_recall.maintenance.install_common import manifest_version
 
-    assert inventory.semver_version(version) == _manifest_version(version)
+    assert inventory.semver_version(version) == manifest_version(version)
 
 
 def test_post_release_versions_are_not_reintroduced():
     """``.postN`` is not something this toolchain can normalise.
 
-    ``_manifest_version`` only rewrites the ``X.Y.ZrcN`` prefix, so a post
+    ``manifest_version`` only rewrites the ``X.Y.ZrcN`` prefix, so a post
     segment survives into a plugin manifest as a version no host can parse.
     The project ships ``rcN`` and ``devN``; this keeps that decision visible in
     the place that would otherwise discover it in production.
@@ -90,6 +91,7 @@ def test_stamping_a_manifest_preserves_everything_else(tmp_path):
 # The documents a reader checks the version against
 # --------------------------------------------------------------------------
 
+
 def _read(name: str) -> str:
     return (REPO_ROOT / name).read_text(encoding="utf-8")
 
@@ -99,29 +101,28 @@ def test_the_readme_names_the_version_being_shipped() -> None:
     checks was the one thing nothing verified."""
     version = inventory.source_version(REPO_ROOT)
     readme = _read("README.md")
-    assert f"`{version}`" in readme, (
-        f"README.md does not mention {version}; update it when bumping _version.py")
+    assert f"`{version}`" in readme, f"README.md does not mention {version}; update it when bumping _version.py"
 
 
 def test_the_readme_does_not_still_advertise_an_older_candidate() -> None:
     version = inventory.source_version(REPO_ROOT)
-    stale = [line.strip() for line in _read("README.md").splitlines()
-             if "3.1.0rc" in line and version not in line]
+    stale = [line.strip() for line in _read("README.md").splitlines() if "3.1.0rc" in line and version not in line]
     assert not stale, f"README.md still names an older candidate: {stale}"
 
 
 def test_the_changelog_has_an_entry_for_this_version() -> None:
     version = inventory.source_version(REPO_ROOT)
     assert version in _read("CHANGELOG.md"), (
-        f"CHANGELOG.md has no entry for {version}; a shipped version with no "
-        "notes is a version nobody can review")
+        f"CHANGELOG.md has no entry for {version}; a shipped version with no notes is a version nobody can review"
+    )
 
 
 # --- one version string, one tree --------------------------------------------
 
+
 def _git(*args):
-    import subprocess
     import pathlib
+    import subprocess
 
     root = pathlib.Path(__file__).resolve().parents[2]
     done = subprocess.run(["git", *args], cwd=root, capture_output=True, text=True)
@@ -147,5 +148,5 @@ def test_a_tagged_version_is_not_reused_for_a_different_tree():
         return  # This version has never been tagged; nothing to contradict.
     _, head_tree = _git("rev-parse", "HEAD^{tree}")
     assert tagged == head_tree, (
-        "%s already names a different tree. Bump the version, or move the tag if "
-        "it was never published." % tag)
+        "%s already names a different tree. Bump the version, or move the tag if it was never published." % tag
+    )

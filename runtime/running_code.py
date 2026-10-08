@@ -26,16 +26,17 @@ has registered yet", not "everything is current".
 Not responsible for: acting on a stale process (doctor reports, the operator
 restarts), or any form of process control.
 """
+
 from __future__ import annotations
 
 import json
 import os
 import re
 import sys
+import time
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-import time
 from typing import Any, Iterator
 
 from .._version import __version__
@@ -89,9 +90,7 @@ class RunningCodeRecord:
                 start_token=None if raw.get("start_token") is None else str(raw["start_token"]),
                 host_adapter=None if raw.get("host_adapter") is None else str(raw["host_adapter"]),
                 installation_id=None if raw.get("installation_id") is None else str(raw["installation_id"]),
-                python_executable=(
-                    None if raw.get("python_executable") is None else str(raw["python_executable"])
-                ),
+                python_executable=(None if raw.get("python_executable") is None else str(raw["python_executable"])),
             )
         except (KeyError, TypeError, ValueError):
             return None
@@ -232,7 +231,7 @@ _VERSION_LINE = re.compile(r"""^__version__\s*=\s*["']([^"']+)["']""", re.MULTIL
 
 def version_on_disk(package_path: Path) -> str | None:
     """The version a restart would load from ``package_path``; ``None`` when it cannot be read.  A resident recall
-    server ends once it differs from its own (``adapters/codex/resident_entry``)."""
+    server ends once it differs from its own (``adapters/clients/resident_entry``)."""
     try:
         match = _VERSION_LINE.search((package_path / "_version.py").read_text(encoding="utf-8"))
     except OSError:

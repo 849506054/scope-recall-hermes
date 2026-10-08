@@ -2,23 +2,22 @@
 
 from __future__ import annotations
 
-from copy import deepcopy
-from dataclasses import replace
 import math
 import threading
 import time
+from copy import deepcopy
+from dataclasses import replace
 from uuid import UUID
 
 import pytest
-
-from scope_recall.adapters.lance import (
+from scope_recall.contracts import ContractError, InstanceBinding
+from scope_recall.core.deadline import RequestDeadline, using_request_deadline
+from scope_recall.runtime.lance_port import (
     LanceIndexWriter,
     LancePurgePort,
     LanceVectorRecord,
     _record_row,
 )
-from scope_recall.contracts import ContractError, InstanceBinding
-from scope_recall.core.deadline import RequestDeadline, using_request_deadline
 from scope_recall.vector import VectorStore, VectorStoreCompatibilityError
 from scope_recall.vector.qdrant_config import QdrantConfig
 from scope_recall.vector.qdrant_http import QdrantHTTPError
@@ -36,7 +35,8 @@ class Server:
         self.hook = None
         self.page_size = 2
 
-    def __call__(self, config, method, path, body, *, deadline):
+    # Keep the fake REST routes together so every mutation observes the same gate and collection state.
+    def __call__(self, config, method, path, body, *, deadline):  # noqa: C901, PLR0911, PLR0912, PLR0915
         assert isinstance(config, QdrantConfig)
         assert deadline > time.monotonic()
         self.calls.append((method, path, deepcopy(body), deadline))
@@ -47,9 +47,7 @@ class Server:
         route = path.split("?", 1)[0]
         parts = route.strip("/").split("/")
         if parts == ["collections"]:
-            return self.ok(
-                {"collections": [{"name": name} for name in self.collections]}
-            )
+            return self.ok({"collections": [{"name": name} for name in self.collections]})
         name = parts[1]
         if method == "PUT" and len(parts) == 2:
             assert self.gate.status()["collection"] == name
@@ -67,8 +65,7 @@ class Server:
         if method == "POST" and parts[2:] == ["snapshots"]:
             assert "wait=true" in path
             index = len(collection["snapshots"]) + 1
-            snapshot = {"name": f"{name}-{index}.snapshot", "size": 4096,
-                        "checksum": f"sha256:{index:064x}"}
+            snapshot = {"name": f"{name}-{index}.snapshot", "size": 4096, "checksum": f"sha256:{index:064x}"}
             collection["snapshots"][snapshot["name"]] = snapshot
             return self.ok(dict(snapshot))
         if method == "GET" and parts[2:] == ["snapshots"]:
@@ -94,9 +91,7 @@ class Server:
         if method == "PUT" and parts[2] == "index":
             assert "wait=true" in path
             assert self.gate.status()["collection"] == name
-            collection["payload_schema"][body["field_name"]] = {
-                "data_type": body["field_schema"]
-            }
+            collection["payload_schema"][body["field_name"]] = {"data_type": body["field_schema"]}
             return self.completed()
         points = collection["points"]
         if method == "PUT" and parts[2:] == ["points"]:
@@ -119,17 +114,11 @@ class Server:
             return self.ok({"count": len(points)})
         if parts[2:] == ["points"]:
             assert body["with_payload"] is True and body["with_vector"] is True
-            return self.ok(
-                [deepcopy(points[key]) for key in body["ids"] if key in points]
-            )
+            return self.ok([deepcopy(points[key]) for key in body["ids"] if key in points])
         if parts[2:] == ["points", "scroll"]:
             assert "filter" not in body
             assert body["with_payload"] is True and body["with_vector"] is True
-            keys = sorted(
-                key
-                for key in points
-                if body.get("offset") is None or key >= body["offset"]
-            )
+            keys = sorted(key for key in points if body.get("offset") is None or key >= body["offset"])
             size = min(body["limit"], self.page_size)
             page = [deepcopy(points[key]) for key in keys[:size]]
             return self.ok(
@@ -150,18 +139,12 @@ class Server:
             selected = []
             for point in points.values():
                 if point["payload"]["scope_id"] in scopes:
-                    score = sum(
-                        left * right for left, right in zip(point["vector"], vector)
-                    ) / (norm or 1)
+                    score = sum(left * right for left, right in zip(point["vector"], vector, strict=True)) / (norm or 1)
                     selected.append(
                         {
                             "id": point["id"],
                             "score": score,
-                            "payload": {
-                                key: point["payload"][key]
-                                for key in wanted
-                                if key in point["payload"]
-                            },
+                            "payload": {key: point["payload"][key] for key in wanted if key in point["payload"]},
                         }
                     )
             selected.sort(key=lambda point: -point["score"])
@@ -178,9 +161,7 @@ class Server:
 
 @pytest.fixture
 def setup(tmp_path):
-    binding = InstanceBinding(
-        "agent", "install", tmp_path / "truth", frozenset({"scope"}), test_mode=True
-    )
+    binding = InstanceBinding("agent", "install", tmp_path / "truth", frozenset({"scope"}), test_mode=True)
     server = Server(binding.data_directory)
     config = QdrantConfig("http://qdrant:6333", timeout_seconds=4)
     store = QdrantVectorStore(
@@ -223,9 +204,7 @@ def row(number=1, **kwargs):
 
 
 def purge(store, *, space="space", ref="event:one", seconds=4):
-    return LancePurgePort(
-        store, embedding_spaces=[space], agent_id="agent", installation_id="install"
-    ).purge_active(
+    return LancePurgePort(store, embedding_spaces=[space], agent_id="agent", installation_id="install").purge_active(
         "operation",
         receipt={
             "physical_members": [{"kind": "event", "ref": ref}],
@@ -235,9 +214,7 @@ def purge(store, *, space="space", ref="event:one", seconds=4):
     )
 
 
-def test_construction_is_io_free_and_identity_is_deterministic(
-    setup, monkeypatch, tmp_path
-):
+def test_construction_is_io_free_and_identity_is_deterministic(setup, monkeypatch, tmp_path):
     store, server, binding, config = setup
     assert isinstance(store, VectorStore)
     assert server.calls == [] and not binding.data_directory.exists()
@@ -277,10 +254,7 @@ def test_construction_is_io_free_and_identity_is_deterministic(
             )
             | kwargs
         )
-        assert (
-            QdrantVectorStore(tmp_path, **values).collection_name
-            != store.collection_name
-        )
+        assert QdrantVectorStore(tmp_path, **values).collection_name != store.collection_name
 
 
 def test_open_existing_only_reads_and_shape_mismatch_is_preserved(setup):
@@ -297,10 +271,7 @@ def test_open_existing_only_reads_and_shape_mismatch_is_preserved(setup):
     server.collections[store.collection_name]["config"]["params"]["vectors"]["size"] = 3
     with pytest.raises(VectorStoreCompatibilityError):
         store.open_existing()
-    assert (
-        server.collections[store.collection_name]["config"]["params"]["vectors"]["size"]
-        == 3
-    )
+    assert server.collections[store.collection_name]["config"]["params"]["vectors"]["size"] == 3
 
 
 def test_describe_reports_a_missing_collection_without_creating_it(setup):
@@ -337,8 +308,12 @@ def test_describe_marks_a_shape_mismatch_without_raising(setup):
 
 @pytest.mark.parametrize(
     "code,status",
-    [("network_error", "unreachable"), ("timeout", "unreachable"),
-     ("credential_invalid", "unauthorized"), ("http_status", "unknown")],
+    [
+        ("network_error", "unreachable"),
+        ("timeout", "unreachable"),
+        ("credential_invalid", "unauthorized"),
+        ("http_status", "unknown"),
+    ],
 )
 def test_describe_turns_a_remote_fault_into_a_status(setup, code, status):
     store, server, _, _ = setup
@@ -491,9 +466,7 @@ def test_guard_rejection_and_bad_batch_never_mark(setup):
     store, server, _, _ = setup
     store.open()
     calls = len(server.calls)
-    assert not store.fenced_upsert_records(
-        [row()], guard=lambda: False, remaining_seconds=4
-    )
+    assert not store.fenced_upsert_records([row()], guard=lambda: False, remaining_seconds=4)
     assert len(server.calls) == calls and server.gate.status() is None
     for bad in (
         row(2) | {"vector": [math.nan, 1]},
@@ -508,9 +481,7 @@ def test_guard_rejection_and_bad_batch_never_mark(setup):
     assert server.gate.status() is None
 
 
-@pytest.mark.parametrize(
-    "failure", ["acknowledged", "wait_timeout", "timeout", "http_status", "readback"]
-)
+@pytest.mark.parametrize("failure", ["acknowledged", "wait_timeout", "timeout", "http_status", "readback"])
 def test_uncertain_write_blocks_fresh_store_and_empty_purge(setup, failure):
     store, server, binding, config = setup
     store.open()
@@ -518,16 +489,10 @@ def test_uncertain_write_blocks_fresh_store_and_empty_purge(setup, failure):
     def hook(method, path, body):
         if method == "PUT" and "/points" in path:
             if failure in {"timeout", "http_status"}:
-                raise QdrantHTTPError(
-                    failure, 503 if failure == "http_status" else None
-                )
+                raise QdrantHTTPError(failure, 503 if failure == "http_status" else None)
             if failure != "readback":
                 return server.ok({"operation_id": 1, "status": failure})
-        if (
-            failure == "readback"
-            and method == "POST"
-            and path.split("?")[0].endswith("/points")
-        ):
+        if failure == "readback" and method == "POST" and path.split("?")[0].endswith("/points"):
             return server.ok([])
         return None
 
@@ -559,9 +524,7 @@ def test_uncertain_write_blocks_fresh_store_and_empty_purge(setup, failure):
         assert server.gate.status() == pending
 
 
-@pytest.mark.parametrize(
-    "damage", ["payload", "identity", "duplicate", "cursor", "missing_cursor", "vector"]
-)
+@pytest.mark.parametrize("damage", ["payload", "identity", "duplicate", "cursor", "missing_cursor", "vector"])
 def test_corrupt_inventory_fails_closed(setup, damage):
     store, server, _, _ = setup
     store.open()
@@ -643,7 +606,7 @@ def test_empty_purge_waits_for_writer_and_observes_its_commit(setup):
     def write():
         try:
             store.upsert_records([row()])
-        except Exception as error:
+        except Exception as error:  # noqa: BLE001 - Surface writer-thread failures in the outcome assertion.
             outcomes.append(error)
 
     server.hook = hook
@@ -670,12 +633,7 @@ def test_every_mutation_requires_completion_and_readback(setup, operation):
         store.upsert_records([row()])
 
     def hook(method, path, body):
-        if (
-            operation == "create"
-            and method == "PUT"
-            and "/points" not in path
-            and "/index" not in path
-        ):
+        if operation == "create" and method == "PUT" and "/points" not in path and "/index" not in path:
             return server.ok(True)  # Lying success: collection never appeared.
         if operation == "index" and method == "PUT" and "/index" in path:
             return server.completed()  # Lying success: keyword index never appeared.
@@ -700,15 +658,11 @@ def test_existing_incompatible_collection_is_never_replaced(setup, damage):
     if damage == "metric":
         collection["config"]["params"]["vectors"]["distance"] = "Dot"
     elif damage == "named":
-        collection["config"]["params"]["vectors"] = {
-            "other": {"size": 2, "distance": "Cosine"}
-        }
+        collection["config"]["params"]["vectors"] = {"other": {"size": 2, "distance": "Cosine"}}
     elif damage == "index":
         collection["payload_schema"]["scope_id"]["data_type"] = "integer"
     else:
-        server.hook = lambda method, path, body: (
-            server.ok({"collections": []}) if path == "/collections" else None
-        )
+        server.hook = lambda method, path, body: server.ok({"collections": []}) if path == "/collections" else None
     server.calls.clear()
     with pytest.raises(VectorStoreCompatibilityError):
         store.open_existing()
@@ -722,9 +676,7 @@ def test_invalid_fence_budget_is_rejected_without_marker(setup, seconds):
     store.open()
     server.calls.clear()
     with pytest.raises(ValueError):
-        store.fenced_upsert_records(
-            [row()], guard=lambda: True, remaining_seconds=seconds
-        )
+        store.fenced_upsert_records([row()], guard=lambda: True, remaining_seconds=seconds)
     assert not server.calls and server.gate.status() is None
 
 
@@ -734,17 +686,13 @@ def test_explicit_fence_budget_is_independent_and_capped(setup):
     server.calls.clear()
     started = time.monotonic()
     with using_request_deadline(RequestDeadline.from_budget(-1)):
-        assert store.fenced_upsert_records(
-            [row()], guard=lambda: True, remaining_seconds=90
-        )
+        assert store.fenced_upsert_records([row()], guard=lambda: True, remaining_seconds=90)
     assert all(started + 44 < call[3] <= time.monotonic() + 45 for call in server.calls)
     assert purge(store, seconds=90)
 
 
 @pytest.mark.parametrize("fail_second", [False, True])
-def test_split_batch_uses_one_guard_and_one_pending_receipt(
-    setup, monkeypatch, fail_second
-):
+def test_split_batch_uses_one_guard_and_one_pending_receipt(setup, monkeypatch, fail_second):
     from scope_recall.vector import qdrant_store as module
 
     monkeypatch.setattr(module, "_BATCH_SIZE", 2)
@@ -766,16 +714,12 @@ def test_split_batch_uses_one_guard_and_one_pending_receipt(
     server.hook = hook
     if fail_second:
         with pytest.raises(QdrantHTTPError):
-            store.fenced_upsert_records(
-                [row(index) for index in range(1, 6)], guard=guard, remaining_seconds=4
-            )
+            store.fenced_upsert_records([row(index) for index in range(1, 6)], guard=guard, remaining_seconds=4)
         assert server.gate.status()["operation_id"] == markers[0]
         assert store.count_rows() == 2
         assert not purge(store)
     else:
-        assert store.fenced_upsert_records(
-            [row(index) for index in range(1, 6)], guard=guard, remaining_seconds=4
-        )
+        assert store.fenced_upsert_records([row(index) for index in range(1, 6)], guard=guard, remaining_seconds=4)
         assert len(markers) == 3 and store.count_rows() == 5
         assert server.gate.status() is None
         store.upsert_records([row(index) for index in range(1, 6)])
@@ -815,9 +759,7 @@ def test_shared_gate_blocks_other_embedding_space_but_store_purge_is_local(setup
     assert other.count_rows() == 1
 
 
-@pytest.mark.parametrize(
-    "failure", ["short_page", "cursor_loop", "bad_count", "bad_envelope"]
-)
+@pytest.mark.parametrize("failure", ["short_page", "cursor_loop", "bad_count", "bad_envelope"])
 def test_truncated_or_malformed_read_cannot_claim_complete_inventory(setup, failure):
     store, server, _, _ = setup
     store.open()
@@ -836,9 +778,7 @@ def test_truncated_or_malformed_read_cannot_claim_complete_inventory(setup, fail
             if failure == "short_page":
                 return server.ok({"points": points[:1], "next_page_offset": None})
             if failure == "cursor_loop":
-                return server.ok(
-                    {"points": points[:1], "next_page_offset": points[0]["id"]}
-                )
+                return server.ok({"points": points[:1], "next_page_offset": points[0]["id"]})
         return None
 
     server.hook = hook
@@ -865,9 +805,7 @@ def test_bad_guard_and_oversized_input_never_poison_gate(setup):
     assert not server.calls and server.gate.status() is None
 
 
-@pytest.mark.parametrize(
-    "vector", [[0.0, 0.0], [1e-30, 1e-30], [1e30, 1e30], [-3.0, 4.0]]
-)
+@pytest.mark.parametrize("vector", [[0.0, 0.0], [1e-30, 1e-30], [1e30, 1e30], [-3.0, 4.0]])
 def test_original_vector_roundtrip_and_float32_safe_direction(setup, vector):
     store, server, _, _ = setup
     store.open()
@@ -936,11 +874,17 @@ def test_search_rejects_out_of_partition_results(setup):
     store.upsert_records([row(scope="private")])
     point = next(iter(server.collections[store.collection_name]["points"].values()))
     server.hook = lambda method, path, body: (
-        server.ok({"points": [{
-            "id": point["id"],
-            "score": 1,
-            "payload": {key: point["payload"][key] for key in body["with_payload"]},
-        }]})
+        server.ok(
+            {
+                "points": [
+                    {
+                        "id": point["id"],
+                        "score": 1,
+                        "payload": {key: point["payload"][key] for key in body["with_payload"]},
+                    }
+                ]
+            }
+        )
         if "/query" in path
         else None
     )
@@ -1037,7 +981,9 @@ def test_open_settles_a_marker_whose_write_already_landed(setup):
     # A process that dies between the write and its ack leaves this behind.
     with pytest.raises(ContractError):
         with store.mutation_gate.mutation(
-            "upsert", store.collection_name, time.monotonic() + 4,
+            "upsert",
+            store.collection_name,
+            time.monotonic() + 4,
             ids=[row(1)["id"]],
         ):
             pass

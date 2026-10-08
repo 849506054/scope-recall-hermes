@@ -1,27 +1,46 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
 import sqlite3
 import sys
+from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[3]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from probes.hermes.p11_a2a_testkit import (
-    A2A_PORT, AUX_RESERVE_OUTPUT, CORE_DIR, HERMES_CONFIG, HERMES_PYTHON, LEDGER, MAIN_BRIDGE_PORT, MAIN_MODEL,
-    MAX_MODEL_POSTS, STATE, TEST_AGENT_ID, TEST_CONTEXT, TEST_WORKSPACE,
-    AUX_MODEL, UPSTREAM_ENDPOINT, UPSTREAM_KEY_ENV, budget_mapping, port_status,
-)
-from probes.hermes.p11_prepare_a2a_test import _test_audiences
-from probes.hermes.p11_a2a_bridge import Bridge, FORMAL_BATCH_NAME
-from probes.hermes.p11_start_a2a_test import (
-    ZERO_MODEL_DIAGNOSTIC_DUMMY, _gateway_log_offset, _gateway_processing_ready, _resolve_upstream_key,
-)
-from scope_recall.adapters.models import AuxiliaryBudgetLedger, OpenAIConsolidationAdapter
 from scope_recall.runtime.auxiliary import AuxiliaryRuntimeConfig
 from scope_recall.runtime.model_budget import initialize_auxiliary_budget_ledger
+from scope_recall.runtime.models import AuxiliaryBudgetLedger, OpenAIConsolidationAdapter
+
+from probes.hermes.p11_a2a_bridge import FORMAL_BATCH_NAME, Bridge
+from probes.hermes.p11_a2a_testkit import (
+    A2A_PORT,
+    AUX_MODEL,
+    AUX_RESERVE_OUTPUT,
+    CORE_DIR,
+    HERMES_CONFIG,
+    HERMES_PYTHON,
+    LEDGER,
+    MAIN_BRIDGE_PORT,
+    MAIN_MODEL,
+    MAX_MODEL_POSTS,
+    STATE,
+    TEST_AGENT_ID,
+    TEST_CONTEXT,
+    TEST_WORKSPACE,
+    UPSTREAM_ENDPOINT,
+    UPSTREAM_KEY_ENV,
+    budget_mapping,
+    port_status,
+)
+from probes.hermes.p11_prepare_a2a_test import _test_audiences
+from probes.hermes.p11_start_a2a_test import (
+    ZERO_MODEL_DIAGNOSTIC_DUMMY,
+    _gateway_log_offset,
+    _gateway_processing_ready,
+    _resolve_upstream_key,
+)
 
 
 def test_p11_testkit_isolated_and_offline_contract():
@@ -44,9 +63,7 @@ def test_p11_testkit_isolated_and_offline_contract():
 
 
 def test_p11_audience_is_explicitly_unthreaded():
-    audiences = _test_audiences(
-        {"conversation": "TEST-conversation", "owner_private": "TEST-owner-private"}
-    )
+    audiences = _test_audiences({"conversation": "TEST-conversation", "owner_private": "TEST-owner-private"})
     # The owner_private mapping is threaded ("main") like the installer's own;
     # only the A2A conversation is unthreaded, so select it by kind rather than
     # by position.
@@ -64,13 +81,17 @@ def test_p11_batch_guard_rejects_main_and_aux_atomically(tmp_path):
         db.execute("""CREATE TRIGGER p11_guard BEFORE INSERT ON requests
                      WHEN NEW.batch='P11_A2A_V2' AND (SELECT count(*) FROM requests WHERE batch=NEW.batch)>=8
                      BEGIN SELECT RAISE(ABORT,'p11_batch_call_cap'); END""")
-        db.executemany("INSERT INTO requests(batch,model) VALUES (?,?)",
-                       [("P11_A2A_V2", "deepseek-v4-flash" if i % 2 == 0 else "mimo-v2.5") for i in range(8)])
+        db.executemany(
+            "INSERT INTO requests(batch,model) VALUES (?,?)",
+            [("P11_A2A_V2", "deepseek-v4-flash" if i % 2 == 0 else "mimo-v2.5") for i in range(8)],
+        )
         network_attempts = []
         for route in ("main", "aux"):
             try:
-                db.execute("INSERT INTO requests(batch,model) VALUES (?,?)",
-                           ("P11_A2A_V2", "deepseek-v4-flash" if route == "main" else "mimo-v2.5"))
+                db.execute(
+                    "INSERT INTO requests(batch,model) VALUES (?,?)",
+                    ("P11_A2A_V2", "deepseek-v4-flash" if route == "main" else "mimo-v2.5"),
+                )
             except sqlite3.IntegrityError as exc:
                 assert str(exc) == "p11_batch_call_cap"
             else:
@@ -99,19 +120,23 @@ def test_formal_bridge_uses_p18_batch_and_not_p11_diagnostic_cap(monkeypatch, tm
 
 
 def _synthetic_prepare_layout(tmp_path: Path):
+    from scope_recall.runtime.model_budget import initialize_auxiliary_budget_ledger
+
     from probes.hermes.p11_a2a_testkit import budget_policy
     from probes.hermes.p11_prepare_a2a_test import PrepareLayout
-    from scope_recall.runtime.model_budget import initialize_auxiliary_budget_ledger
 
     state = tmp_path / "isolated-prepare-state"
     ledger = tmp_path / "synthetic-fixture-ledger.sqlite3"
     initialize_auxiliary_budget_ledger(ledger, budget_policy())
     sentinel = tmp_path / "SYNTHETIC-P15-SENTINEL-NOT-A-HISTORICAL-P11-REPORT.json"
     sentinel.write_text(
-        json.dumps({
-            "fixture_kind": "synthetic_readonly_p15_sentinel",
-            "note": "Not a historical P11 report. Digest is observed before and after prepare.",
-        }, sort_keys=True),
+        json.dumps(
+            {
+                "fixture_kind": "synthetic_readonly_p15_sentinel",
+                "note": "Not a historical P11 report. Digest is observed before and after prepare.",
+            },
+            sort_keys=True,
+        ),
         encoding="utf-8",
     )
     return PrepareLayout(
@@ -130,6 +155,7 @@ def _synthetic_prepare_layout(tmp_path: Path):
 
 def test_p11_prepare_writes_isolated_artifacts_and_observes_zero_post(monkeypatch, tmp_path):
     import urllib.request
+
     from probes.hermes.p11_prepare_a2a_test import run_prepare
 
     http_attempts = []
@@ -189,6 +215,7 @@ def test_p11_main_asserts_default_paths_before_run_prepare(monkeypatch, capsys):
 
 def test_p11_main_success_receipt_keeps_host_source_and_wrapper_hashes(monkeypatch, tmp_path, capsys):
     import hashlib
+
     import probes.hermes.p11_prepare_a2a_test as prepare
 
     hermes_root = tmp_path / "frozen-h-fixture"
@@ -266,34 +293,38 @@ def test_p11_real_aux_config_reserves_main_and_aux_without_transport(monkeypatch
     # test exists to observe. The value is never sent anywhere: ``NoTransport``
     # asserts if the HTTP path is entered at all.
     monkeypatch.setenv(UPSTREAM_KEY_ENV, "TEST-scope-recall-unused-credential")
-    config = AuxiliaryRuntimeConfig.from_mapping({
-        "external_embedding": False,
-        "external_consolidation": True,
-        "installation_dir": str(CORE_DIR),
-        "ledger_path": str(LEDGER),
-        "budget": budget_mapping(),
-        "consolidation": {
-            "model": AUX_MODEL,
-            "endpoint": UPSTREAM_ENDPOINT,
-            "credential_env": UPSTREAM_KEY_ENV,
-            "output_limit_field": "max_completion_tokens",
-            "max_output_tokens": 4096,
-            "thinking": {"type": "disabled"},
-            "response_format": {"type": "json_object"},
-            "stream": False,
-            "n": 1,
-        },
-        "consolidation_reserve_input": 32768,
-    })
+    config = AuxiliaryRuntimeConfig.from_mapping(
+        {
+            "external_embedding": False,
+            "external_consolidation": True,
+            "installation_dir": str(CORE_DIR),
+            "ledger_path": str(LEDGER),
+            "budget": budget_mapping(),
+            "consolidation": {
+                "model": AUX_MODEL,
+                "endpoint": UPSTREAM_ENDPOINT,
+                "credential_env": UPSTREAM_KEY_ENV,
+                "output_limit_field": "max_completion_tokens",
+                "max_output_tokens": 4096,
+                "thinking": {"type": "disabled"},
+                "response_format": {"type": "json_object"},
+                "stream": False,
+                "n": 1,
+            },
+            "consolidation_reserve_input": 32768,
+        }
+    )
     ledger_path = tmp_path / "reserve-only.sqlite3"
     initialize_auxiliary_budget_ledger(ledger_path, config.budget)
     main_ledger = AuxiliaryBudgetLedger(ledger_path, config.budget)
-    messages = [{"role": "system", "content": "TEST_SCOPE_RECALL system"},
-                {"role": "user", "content": "TEST_SCOPE_RECALL reserve"}]
-    main_body = json.dumps({"model": MAIN_MODEL, "messages": messages, "max_tokens": 4096,
-                            "stream": False, "n": 1}, separators=(",", ":")).encode()
-    main_id = main_ledger.reserve(MAIN_MODEL, main_body, reserved_input=32768,
-                                   reserved_output=4096, timeout_seconds=45)
+    messages = [
+        {"role": "system", "content": "TEST_SCOPE_RECALL system"},
+        {"role": "user", "content": "TEST_SCOPE_RECALL reserve"},
+    ]
+    main_body = json.dumps(
+        {"model": MAIN_MODEL, "messages": messages, "max_tokens": 4096, "stream": False, "n": 1}, separators=(",", ":")
+    ).encode()
+    main_id = main_ledger.reserve(MAIN_MODEL, main_body, reserved_input=32768, reserved_output=4096, timeout_seconds=45)
 
     class StopAfterReserve(RuntimeError):
         pass
@@ -309,9 +340,12 @@ def test_p11_real_aux_config_reserves_main_and_aux_without_transport(monkeypatch
             raise AssertionError("network transport must not be reached")
 
     aux_ledger = ReserveOnlyLedger(ledger_path, config.budget)
-    adapter = OpenAIConsolidationAdapter(config.consolidation, ledger=aux_ledger,
-                                         reserve_input=config.consolidation_reserve_input,
-                                         transport=NoTransport())
+    adapter = OpenAIConsolidationAdapter(
+        config.consolidation,
+        ledger=aux_ledger,
+        reserve_input=config.consolidation_reserve_input,
+        transport=NoTransport(),
+    )
     try:
         adapter.propose(messages, remaining_seconds=45)
     except StopAfterReserve as exc:
@@ -321,8 +355,10 @@ def test_p11_real_aux_config_reserves_main_and_aux_without_transport(monkeypatch
     with sqlite3.connect(ledger_path) as db:
         rows = db.execute("SELECT model,reserved_input,reserved_output,status FROM requests ORDER BY id").fetchall()
     assert main_id != aux_id
-    assert rows == [(MAIN_MODEL, 32768, 4096, "reserved_before_network"),
-                    (AUX_MODEL, 32768, 131072, "reserved_before_network")]
+    assert rows == [
+        (MAIN_MODEL, 32768, 4096, "reserved_before_network"),
+        (AUX_MODEL, 32768, 131072, "reserved_before_network"),
+    ]
 
 
 def test_p11_prepare_uses_clean_distribution_wrapper():

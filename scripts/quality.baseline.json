@@ -1,0 +1,1389 @@
+{
+ "pyright": {
+  "_lance_worker.py": {
+   "reportArgumentType": 2,
+   "reportOptionalMemberAccess": 2
+  },
+  "adapters/clients/boundary.py": {
+   "reportReturnType": 1
+  },
+  "adapters/clients/config.py": {
+   "reportPrivateImportUsage": 1
+  },
+  "adapters/clients/handler.py": {
+   "reportArgumentType": 1,
+   "reportAssignmentType": 1
+  },
+  "adapters/clients/hook_answer.py": {
+   "reportAttributeAccessIssue": 1
+  },
+  "adapters/clients/identity.py": {
+   "reportArgumentType": 1
+  },
+  "adapters/clients/mcp_server.py": {
+   "reportArgumentType": 1,
+   "reportOptionalMemberAccess": 3
+  },
+  "adapters/clients/prompt_recall.py": {
+   "reportArgumentType": 3,
+   "reportOptionalCall": 1
+  },
+  "adapters/clients/record_reader.py": {
+   "reportArgumentType": 1,
+   "reportAttributeAccessIssue": 1,
+   "reportOptionalMemberAccess": 1
+  },
+  "adapters/clients/remote_client.py": {
+   "reportArgumentType": 5,
+   "reportAttributeAccessIssue": 2
+  },
+  "adapters/clients/remote_server.py": {
+   "reportAttributeAccessIssue": 2,
+   "reportOptionalMemberAccess": 1
+  },
+  "adapters/clients/resident_entry.py": {
+   "reportAssignmentType": 1
+  },
+  "adapters/clients/transcript.py": {
+   "reportArgumentType": 8,
+   "reportOperatorIssue": 2,
+   "reportOptionalMemberAccess": 11
+  },
+  "adapters/hermes/__init__.py": {
+   "reportUnsupportedDunderAll": 2
+  },
+  "adapters/hermes/boundary.py": {
+   "reportArgumentType": 2,
+   "reportOptionalOperand": 1
+  },
+  "adapters/hermes/capture.py": {
+   "reportArgumentType": 1
+  },
+  "adapters/hermes/identity.py": {
+   "reportArgumentType": 1
+  },
+  "adapters/hermes/installation.py": {
+   "reportArgumentType": 1
+  },
+  "adapters/hermes/tool_surface.py": {
+   "reportAttributeAccessIssue": 15
+  },
+  "adapters/runtime_wiring.py": {
+   "reportArgumentType": 2
+  },
+  "core/candidate_evaluations.py": {
+   "reportArgumentType": 1
+  },
+  "core/candidate_intake.py": {
+   "reportArgumentType": 2
+  },
+  "core/candidate_sweeps.py": {
+   "reportOperatorIssue": 1
+  },
+  "core/claims.py": {
+   "reportGeneralTypeIssues": 1
+  },
+  "core/composition.py": {
+   "reportOptionalSubscript": 1
+  },
+  "core/consolidate.py": {
+   "reportArgumentType": 2,
+   "reportGeneralTypeIssues": 2
+  },
+  "core/consolidation_chunks.py": {
+   "reportArgumentType": 12,
+   "reportOptionalMemberAccess": 1
+  },
+  "core/consolidation_summary.py": {
+   "reportArgumentType": 5
+  },
+  "core/episode_storage.py": {
+   "reportArgumentType": 1,
+   "reportCallIssue": 1
+  },
+  "core/evidence_question.py": {
+   "reportGeneralTypeIssues": 1
+  },
+  "core/inbox_rules.py": {
+   "reportArgumentType": 1,
+   "reportAssignmentType": 1
+  },
+  "core/mutate.py": {
+   "reportArgumentType": 2,
+   "reportAssignmentType": 1,
+   "reportOptionalOperand": 2
+  },
+  "core/recall.py": {
+   "reportArgumentType": 2,
+   "reportAttributeAccessIssue": 3,
+   "reportGeneralTypeIssues": 2,
+   "reportOptionalMemberAccess": 2
+  },
+  "core/recall_needs.py": {
+   "reportGeneralTypeIssues": 1,
+   "reportOperatorIssue": 1
+  },
+  "core/recall_packet.py": {
+   "reportGeneralTypeIssues": 1,
+   "reportOptionalMemberAccess": 4
+  },
+  "core/requalify.py": {
+   "reportArgumentType": 3
+  },
+  "core/retrieval_storage.py": {
+   "reportArgumentType": 2,
+   "reportOperatorIssue": 1
+  },
+  "core/storage.py": {
+   "reportArgumentType": 4,
+   "reportAssignmentType": 1,
+   "reportReturnType": 1
+  },
+  "core/trace.py": {
+   "reportArgumentType": 1
+  },
+  "core/work_storage.py": {
+   "reportReturnType": 1
+  },
+  "core/worker.py": {
+   "reportArgumentType": 2
+  },
+  "core/worker_candidates.py": {
+   "reportArgumentType": 4,
+   "reportOptionalMemberAccess": 8
+  },
+  "core/worker_consolidation.py": {
+   "reportArgumentType": 1,
+   "reportOptionalMemberAccess": 1
+  },
+  "core/worker_outcomes.py": {
+   "reportAttributeAccessIssue": 1
+  },
+  "core/worker_projection.py": {
+   "reportArgumentType": 2
+  },
+  "distribution/hermes/__init__.py": {
+   "reportCallIssue": 1
+  },
+  "maintenance/cli.py": {
+   "reportArgumentType": 1
+  },
+  "maintenance/doctor.py": {
+   "reportArgumentType": 1,
+   "reportOptionalMemberAccess": 1,
+   "reportOptionalSubscript": 2
+  },
+  "maintenance/install_codex.py": {
+   "reportArgumentType": 1
+  },
+  "maintenance/install_dsh.py": {
+   "reportArgumentType": 2
+  },
+  "maintenance/install_hermes.py": {
+   "reportArgumentType": 2
+  },
+  "maintenance/legacy_catalog.py": {
+   "reportArgumentType": 3,
+   "reportAttributeAccessIssue": 2
+  },
+  "maintenance/legacy_conversion.py": {
+   "reportArgumentType": 4,
+   "reportAttributeAccessIssue": 1
+  },
+  "maintenance/legacy_sources.py": {
+   "reportArgumentType": 1,
+   "reportOptionalSubscript": 4
+  },
+  "maintenance/legacy_v2_compat.py": {
+   "reportArgumentType": 1
+  },
+  "maintenance/migration_activation.py": {
+   "reportArgumentType": 6,
+   "reportPrivateImportUsage": 1
+  },
+  "maintenance/migration_index.py": {
+   "reportArgumentType": 2
+  },
+  "maintenance/migration_records.py": {
+   "reportArgumentType": 1
+  },
+  "maintenance/package_health.py": {
+   "reportArgumentType": 3
+  },
+  "maintenance/package_upgrade.py": {
+   "reportArgumentType": 6
+  },
+  "maintenance/rollback.py": {
+   "reportArgumentType": 8
+  },
+  "maintenance/shared.py": {
+   "reportOptionalMemberAccess": 1
+  },
+  "runtime/codex_cli.py": {
+   "reportAttributeAccessIssue": 1,
+   "reportOptionalMemberAccess": 4
+  },
+  "runtime/http_session.py": {
+   "reportOptionalMemberAccess": 7
+  },
+  "runtime/instance.py": {
+   "reportArgumentType": 10,
+   "reportOptionalSubscript": 1
+  },
+  "runtime/lance_port.py": {
+   "reportArgumentType": 8,
+   "reportGeneralTypeIssues": 1,
+   "reportReturnType": 2
+  },
+  "runtime/models.py": {
+   "reportArgumentType": 4,
+   "reportAssignmentType": 1,
+   "reportAttributeAccessIssue": 2,
+   "reportOptionalMemberAccess": 1
+  },
+  "runtime/process_probe.py": {
+   "reportAttributeAccessIssue": 2
+  },
+  "runtime/scheduling.py": {
+   "reportOptionalMemberAccess": 4
+  },
+  "runtime/subscription_budget.py": {
+   "reportArgumentType": 2
+  },
+  "runtime/validation.py": {
+   "reportArgumentType": 1
+  },
+  "runtime/vector_retention.py": {
+   "reportOptionalMemberAccess": 1
+  },
+  "runtime/vector_upkeep.py": {
+   "reportArgumentType": 3,
+   "reportAttributeAccessIssue": 2,
+   "reportCallIssue": 2
+  },
+  "runtime/worker_entry.py": {
+   "reportArgumentType": 4
+  },
+  "runtime/worker_watchdog.py": {
+   "reportAttributeAccessIssue": 1
+  },
+  "scripts/build.package_manifest.py": {
+   "reportMissingImports": 1
+  },
+  "scripts/check.py": {
+   "reportArgumentType": 1
+  },
+  "scripts/dead_code.py": {
+   "reportArgumentType": 4,
+   "reportCallIssue": 1,
+   "reportOperatorIssue": 1,
+   "reportOptionalOperand": 3
+  },
+  "vector/lance_native.py": {
+   "reportArgumentType": 1,
+   "reportCallIssue": 1,
+   "reportReturnType": 1
+  },
+  "vector/process_store.py": {
+   "reportArgumentType": 2,
+   "reportAttributeAccessIssue": 1,
+   "reportOperatorIssue": 1,
+   "reportOptionalMemberAccess": 3
+  },
+  "vector/sqlite_store.py": {
+   "reportArgumentType": 2
+  },
+  "vector/store.py": {
+   "reportArgumentType": 4,
+   "reportOptionalMemberAccess": 1,
+   "reportOptionalOperand": 1,
+   "reportReturnType": 1
+  }
+ },
+ "ruff": {
+  ".github/scripts/release_provenance.py": {
+   "PLR0913": {
+    "verify_provenance": 9
+   }
+  },
+  "_lance_worker.py": {
+   "BLE001": 2,
+   "C901": {
+    "main": 17
+   },
+   "PLR0912": {
+    "main": 16
+   },
+   "PLR0915": {
+    "main": 72
+   }
+  },
+  "adapters/clients/boundary.py": {
+   "PLR0913": {
+    "tool_use_source_event": 9
+   }
+  },
+  "adapters/clients/config.py": {
+   "UP035": 1
+  },
+  "adapters/clients/handler.py": {
+   "BLE001": 2,
+   "UP017": 1,
+   "UP035": 1,
+   "UP037": 2
+  },
+  "adapters/clients/hook_entry.py": {
+   "BLE001": 2,
+   "PLR0912": {
+    "main": 16
+   }
+  },
+  "adapters/clients/hook_events.py": {
+   "E501": 1
+  },
+  "adapters/clients/identity.py": {
+   "UP035": 1
+  },
+  "adapters/clients/local_endpoint.py": {
+   "C901": {
+    "ensure_resident": 16
+   },
+   "E501": 1,
+   "PLR0911": {
+    "Recaller._exchange": 11,
+    "ensure_resident": 12
+   },
+   "UP035": 1,
+   "UP041": 2
+  },
+  "adapters/clients/mcp_server.py": {
+   "E501": 3,
+   "PLR0913": {
+    "CodexMCPServer.entity": 9,
+    "CodexMCPServer.recall": 9,
+    "CodexMCPServer.revise": 9,
+    "CodexMCPServer.trace": 10
+   }
+  },
+  "adapters/clients/record_reader.py": {
+   "B905": 1,
+   "E501": 1,
+   "UP037": 2
+  },
+  "adapters/clients/remote_client.py": {
+   "UP017": 1,
+   "UP037": 1
+  },
+  "adapters/clients/remote_server.py": {
+   "UP017": 3,
+   "UP035": 1
+  },
+  "adapters/clients/session_marks.py": {
+   "UP037": 2
+  },
+  "adapters/clients/transcript.py": {
+   "E501": 1,
+   "PLR0911": {
+    "said": 9
+   },
+   "UP017": 2,
+   "UP035": 1
+  },
+  "adapters/hermes/attachments.py": {
+   "PLR0911": {
+    "authorize_attachment_metadata": 9
+   }
+  },
+  "adapters/hermes/audiences.py": {
+   "PLR0913": {
+    "audience_entry": 11
+   },
+   "UP035": 1
+  },
+  "adapters/hermes/boundary.py": {
+   "PLR0913": {
+    "SourceObservationLedger.observe": 11,
+    "sync_turn_source_events": 9,
+    "tool_call_source_event": 9
+   },
+   "UP017": 1
+  },
+  "adapters/hermes/capture.py": {
+   "PLR0913": {
+    "CaptureWriter.write": 9
+   }
+  },
+  "adapters/hermes/capture_retry.py": {
+   "E501": 1
+  },
+  "adapters/hermes/gating.py": {
+   "UP045": 1
+  },
+  "adapters/hermes/hooks.py": {
+   "BLE001": 1,
+   "UP035": 1
+  },
+  "adapters/hermes/identity.py": {
+   "UP035": 1
+  },
+  "adapters/hermes/installation.py": {
+   "PLR0913": {
+    "build_installation_manifest": 18,
+    "client_entry_record": 9,
+    "install_hermes_scope_recall": 16
+   },
+   "UP035": 1
+  },
+  "adapters/hermes/protocol.py": {
+   "UP006": 8,
+   "UP035": 2,
+   "UP045": 1
+  },
+  "adapters/hermes/provider.py": {
+   "BLE001": 2,
+   "E501": 1,
+   "UP006": 10,
+   "UP017": 1,
+   "UP035": 2,
+   "UP045": 1
+  },
+  "adapters/hermes/session_binding.py": {
+   "UP031": 1
+  },
+  "adapters/hermes/tool_surface.py": {
+   "E501": 1,
+   "UP006": 3,
+   "UP035": 2
+  },
+  "adapters/hermes/worker.py": {
+   "BLE001": 1,
+   "UP035": 1
+  },
+  "adapters/runtime_wiring.py": {
+   "BLE001": 1,
+   "PLR0913": {
+    "attach_trusted_host_runtime": 10
+   },
+   "UP035": 1
+  },
+  "adapters/tool_common.py": {
+   "E501": 1,
+   "UP035": 1
+  },
+  "contracts.py": {
+   "C901": {
+    "validate_proposal_references": 22
+   },
+   "PLR0912": {
+    "validate_proposal_references": 21
+   }
+  },
+  "core/admission.py": {
+   "E501": 3,
+   "PLR0911": {
+    "classify": 9
+   }
+  },
+  "core/artifact_storage.py": {
+   "E501": 2,
+   "PLR0913": {
+    "Artifacts.register": 9
+   }
+  },
+  "core/background_context.py": {
+   "C901": {
+    "background_candidates": 19
+   },
+   "PLR0912": {
+    "background_candidates": 18
+   }
+  },
+  "core/candidate_debounce.py": {
+   "UP017": 1
+  },
+  "core/candidate_evaluations.py": {
+   "E501": 2
+  },
+  "core/candidate_intake.py": {
+   "E501": 2
+  },
+  "core/candidate_sweeps.py": {
+   "E501": 3
+  },
+  "core/candidate_tables.py": {
+   "UP017": 2
+  },
+  "core/capture.py": {
+   "C901": {
+    "record_event": 21
+   },
+   "PLR0912": {
+    "record_event": 20
+   }
+  },
+  "core/capture_inbox.py": {
+   "E501": 1,
+   "PLR0913": {
+    "_commit": 9
+   },
+   "UP017": 2
+  },
+  "core/claim_normalization.py": {
+   "C901": {
+    "normalize_frame": 19
+   },
+   "PLR0911": {
+    "normalize_frame": 11
+   },
+   "PLR0912": {
+    "normalize_frame": 18
+   }
+  },
+  "core/claim_storage.py": {
+   "C901": {
+    "Claims.append": 20
+   },
+   "E501": 12,
+   "PLR0912": {
+    "Claims.append": 20
+   }
+  },
+  "core/claims.py": {
+   "UP017": 1
+  },
+  "core/composition.py": {
+   "UP017": 1
+  },
+  "core/consolidate.py": {
+   "B905": 2,
+   "E501": 11
+  },
+  "core/consolidation_summary.py": {
+   "E501": 1
+  },
+  "core/deadline.py": {
+   "UP035": 1
+  },
+  "core/delete_storage.py": {
+   "C901": {
+    "Deletions.purge_sqlite": 17
+   },
+   "E501": 14,
+   "PLR0912": {
+    "Deletions.purge_sqlite": 17
+   }
+  },
+  "core/deletion.py": {
+   "E501": 2
+  },
+  "core/duplicate_collapse.py": {
+   "UP035": 1
+  },
+  "core/episode_storage.py": {
+   "E501": 11
+  },
+  "core/episodes.py": {
+   "C901": {
+    "qualify_resume": 18
+   },
+   "E501": 3,
+   "PLR0912": {
+    "qualify_resume": 17
+   }
+  },
+  "core/evidence_question.py": {
+   "UP035": 1
+  },
+  "core/fact_actions.py": {
+   "UP037": 1
+  },
+  "core/fact_identity.py": {
+   "UP037": 1
+  },
+  "core/fact_temporal_semantics.py": {
+   "E501": 1
+  },
+  "core/failure_retry.py": {
+   "E501": 2
+  },
+  "core/file_lock.py": {
+   "B009": 3,
+   "C901": {
+    "advisory_file_lock": 18
+   },
+   "PLR0912": {
+    "advisory_file_lock": 20
+   },
+   "PLR0915": {
+    "advisory_file_lock": 79
+   },
+   "UP035": 1
+  },
+  "core/gating.py": {
+   "E501": 1
+  },
+  "core/inbox_rules.py": {
+   "E501": 1
+  },
+  "core/index_rebuild.py": {
+   "E501": 2,
+   "UP017": 2
+  },
+  "core/inspect_service.py": {
+   "C901": {
+    "inspect_object": 16
+   }
+  },
+  "core/lexical_index.py": {
+   "UP035": 1
+  },
+  "core/lineage.py": {
+   "E501": 2,
+   "PLR0913": {
+    "link": 10
+   }
+  },
+  "core/mutate.py": {
+   "C901": {
+    "_revise_in_transaction": 24
+   },
+   "E501": 7,
+   "PLR0912": {
+    "_revise_in_transaction": 24
+   },
+   "PLR0915": {
+    "_revise_in_transaction": 78
+   }
+  },
+  "core/read_views.py": {
+   "UP035": 1
+  },
+  "core/recall.py": {
+   "BLE001": 5,
+   "C901": {
+    "RetrievalPipeline._expand": 26
+   },
+   "PLR0911": {
+    "RetrievalPipeline._expand": 10
+   },
+   "PLR0912": {
+    "RetrievalPipeline._expand": 24
+   }
+  },
+  "core/recall_diagnostics.py": {
+   "PLR0913": {
+    "RecallDiagnostics.record": 16
+   },
+   "UP006": 1,
+   "UP035": 1
+  },
+  "core/recall_packet.py": {
+   "B905": 1,
+   "BLE001": 2,
+   "PLR0911": {
+    "RecallPacketCompiler._fence": 9
+   },
+   "UP035": 1
+  },
+  "core/recall_policy.py": {
+   "UP017": 1,
+   "UP035": 1
+  },
+  "core/recall_scope.py": {
+   "B905": 2,
+   "C901": {
+    "_named_days": 20
+   },
+   "PLR0912": {
+    "_named_days": 16
+   },
+   "UP017": 1,
+   "UP035": 1
+  },
+  "core/reference_storage.py": {
+   "B905": 1,
+   "C901": {
+    "References._explicit_candidate_mention": 16,
+    "References.apply": 24
+   },
+   "E501": 3,
+   "PLR0912": {
+    "References.apply": 24
+   },
+   "PLR0915": {
+    "References.apply": 65
+   }
+  },
+  "core/requalify.py": {
+   "E501": 3
+  },
+  "core/restore.py": {
+   "C901": {
+    "replay_deletion_ledger": 26
+   },
+   "E501": 10,
+   "PLR0912": {
+    "replay_deletion_ledger": 26
+   },
+   "PLR0915": {
+    "replay_deletion_ledger": 77
+   }
+  },
+  "core/retrieval.py": {
+   "C901": {
+    "SearchContext.__post_init__": 18
+   },
+   "PLR0912": {
+    "SearchContext.__post_init__": 17
+   },
+   "UP017": 1,
+   "UP037": 2
+  },
+  "core/retrieval_storage.py": {
+   "B905": 1,
+   "C901": {
+    "RetrievalStorage.collection": 16
+   },
+   "E501": 6,
+   "PLR0912": {
+    "RetrievalStorage.collection": 17
+   },
+   "UP017": 1,
+   "UP035": 1
+  },
+  "core/schema.py": {
+   "E501": 18
+  },
+  "core/source_qualification.py": {
+   "E501": 2
+  },
+  "core/storage.py": {
+   "B010": 1,
+   "BLE001": 4,
+   "E501": 16
+  },
+  "core/trace.py": {
+   "C901": {
+    "read_trace": 30
+   },
+   "PLR0912": {
+    "read_trace": 29
+   },
+   "PLR0915": {
+    "read_trace": 95
+   }
+  },
+  "core/truth_connection.py": {
+   "B009": 1,
+   "B010": 12,
+   "BLE001": 2
+  },
+  "core/vector_failure.py": {
+   "BLE001": 1
+  },
+  "core/work_storage.py": {
+   "E501": 9,
+   "PLR0911": {
+    "WorkItems._operator_retry_rejection": 10
+   },
+   "UP017": 2
+  },
+  "core/worker.py": {
+   "C901": {
+    "drain_worker": 22
+   },
+   "PLR0912": {
+    "drain_worker": 23
+   },
+   "PLR0913": {
+    "drain_worker": 9
+   },
+   "PLR0915": {
+    "drain_worker": 91
+   }
+  },
+  "core/worker_candidates.py": {
+   "BLE001": 1,
+   "C901": {
+    "process_candidate_evaluation": 25
+   },
+   "PLR0911": {
+    "process_candidate_evaluation": 15
+   },
+   "PLR0912": {
+    "process_candidate_evaluation": 26
+   },
+   "PLR0913": {
+    "_candidate_failure": 11
+   },
+   "PLR0915": {
+    "process_candidate_evaluation": 76
+   }
+  },
+  "core/worker_consolidation.py": {
+   "BLE001": 1,
+   "C901": {
+    "decode_consolidation_result": 19,
+    "process_consolidate": 25
+   },
+   "PLR0911": {
+    "process_consolidate": 16
+   },
+   "PLR0912": {
+    "decode_consolidation_result": 18,
+    "process_consolidate": 26
+   },
+   "PLR0915": {
+    "process_consolidate": 70
+   }
+  },
+  "core/worker_outcomes.py": {
+   "E501": 3,
+   "PLR0913": {
+    "finalize_work": 11
+   }
+  },
+  "core/worker_projection.py": {
+   "B905": 1,
+   "BLE001": 6,
+   "C901": {
+    "_purge_layers": 20,
+    "process_embed": 22
+   },
+   "PLR0911": {
+    "_purge_layers": 15,
+    "process_embed": 13
+   },
+   "PLR0912": {
+    "_purge_layers": 19
+   },
+   "PLR0913": {
+    "_publish_kind": 9,
+    "process_embed": 9
+   },
+   "UP035": 1
+  },
+  "core/writer_lease.py": {
+   "B009": 5,
+   "B010": 19,
+   "BLE001": 3,
+   "UP035": 1
+  },
+  "maintenance/autostart.py": {
+   "UP017": 1
+  },
+  "maintenance/cli.py": {
+   "E501": 1,
+   "PLR0911": {
+    "_upgrade_store": 10
+   },
+   "PLR0915": {
+    "_upgrade_store": 68
+   },
+   "UP017": 1,
+   "UP035": 1
+  },
+  "maintenance/doctor.py": {
+   "E501": 2,
+   "PLR0915": {
+    "_check_storage": 75
+   },
+   "UP017": 7
+  },
+  "maintenance/install.py": {
+   "BLE001": 1,
+   "C901": {
+    "apply_install": 17,
+    "plan_install": 22
+   },
+   "E501": 1,
+   "PLR0912": {
+    "apply_install": 17,
+    "plan_install": 23,
+    "plan_uninstall": 16
+   },
+   "PLR0913": {
+    "plan_install": 11
+   },
+   "PLR0915": {
+    "plan_install": 67
+   }
+  },
+  "maintenance/install_purge.py": {
+   "UP035": 1
+  },
+  "maintenance/install_receipt.py": {
+   "UP035": 1
+  },
+  "maintenance/install_remote.py": {
+   "UP017": 1
+  },
+  "maintenance/install_workbuddy.py": {
+   "UP035": 1
+  },
+  "maintenance/legacy_catalog.py": {
+   "E501": 14
+  },
+  "maintenance/legacy_claims.py": {
+   "E501": 5,
+   "PLR0913": {
+    "_insert_version": 14
+   }
+  },
+  "maintenance/legacy_conversion.py": {
+   "E501": 10,
+   "PLR0913": {
+    "_prepare": 15,
+    "migrate_legacy": 15
+   },
+   "UP017": 1,
+   "UP035": 1
+  },
+  "maintenance/legacy_deletions.py": {
+   "E501": 3
+  },
+  "maintenance/legacy_episode_membership.py": {
+   "E501": 5
+  },
+  "maintenance/legacy_plan.py": {
+   "UP035": 1
+  },
+  "maintenance/legacy_sources.py": {
+   "PLR0913": {
+    "_source_event": 9,
+    "archive": 10
+   },
+   "UP035": 1
+  },
+  "maintenance/legacy_v2_compat.py": {
+   "B905": 2
+  },
+  "maintenance/migrate_v2.py": {
+   "E501": 1,
+   "UP035": 1
+  },
+  "maintenance/migration_activation.py": {
+   "PLR0913": {
+    "install_hermes_archive_migration": 10
+   },
+   "UP035": 1
+  },
+  "maintenance/migration_records.py": {
+   "UP017": 1,
+   "UP035": 1
+  },
+  "maintenance/package_upgrade.py": {
+   "C901": {
+    "replace_package": 17
+   },
+   "PLR0912": {
+    "replace_package": 16
+   },
+   "PLR0915": {
+    "replace_package": 73
+   }
+  },
+  "maintenance/shared.py": {
+   "C901": {
+    "attach": 17
+   },
+   "PLR0912": {
+    "attach": 19
+   },
+   "PLR0913": {
+    "attach": 11
+   },
+   "UP017": 1
+  },
+  "maintenance/shared_import.py": {
+   "C901": {
+    "_import_rows": 19,
+    "import_entry": 16
+   },
+   "PLR0912": {
+    "import_entry": 18
+   },
+   "PLR0915": {
+    "_import_rows": 100,
+    "import_entry": 61
+   },
+   "UP017": 1,
+   "UP035": 1
+  },
+  "maintenance/upgrade.py": {
+   "UP017": 1
+  },
+  "runtime/_http_worker.py": {
+   "UP012": 1,
+   "UP041": 1
+  },
+  "runtime/auxiliary.py": {
+   "UP035": 1
+  },
+  "runtime/codex_cli.py": {
+   "B905": 1
+  },
+  "runtime/embedding_retry.py": {
+   "UP035": 1
+  },
+  "runtime/instance.py": {
+   "BLE001": 4,
+   "UP035": 1,
+   "UP037": 3
+  },
+  "runtime/lance_port.py": {
+   "B905": 3,
+   "BLE001": 2,
+   "UP017": 1,
+   "UP037": 1
+  },
+  "runtime/model_budget.py": {
+   "BLE001": 2,
+   "UP035": 1
+  },
+  "runtime/models.py": {
+   "BLE001": 1,
+   "C901": {
+    "_responses_output_text": 16
+   },
+   "PLR0913": {
+    "_metered_post": 13
+   },
+   "UP037": 1
+  },
+  "runtime/resume_entry.py": {
+   "BLE001": 1,
+   "UP017": 1
+  },
+  "runtime/running_code.py": {
+   "UP017": 2,
+   "UP035": 1,
+   "UP037": 1
+  },
+  "runtime/scheduling.py": {
+   "C901": {
+    "next_wake": 26,
+    "supervise": 23
+   },
+   "PLR0912": {
+    "next_wake": 22,
+    "supervise": 23
+   },
+   "PLR0915": {
+    "next_wake": 77,
+    "supervise": 84
+   },
+   "UP017": 5
+  },
+  "runtime/subscription_budget.py": {
+   "E501": 1,
+   "UP017": 1
+  },
+  "runtime/validation.py": {
+   "UP017": 1,
+   "UP035": 1
+  },
+  "runtime/vector_retention.py": {
+   "E501": 1,
+   "UP017": 2,
+   "UP035": 1
+  },
+  "runtime/vector_upkeep.py": {
+   "UP017": 3
+  },
+  "runtime/worker_entry.py": {
+   "BLE001": 2
+  },
+  "runtime/worker_watchdog.py": {
+   "BLE001": 2,
+   "C901": {
+    "_run_once": 18
+   },
+   "PLR0915": {
+    "_run_once": 61
+   }
+  },
+  "scripts/check.py": {
+   "B905": 1,
+   "BLE001": 2,
+   "C901": {
+    "select_tests": 17
+   },
+   "PLR0912": {
+    "select_tests": 17
+   },
+   "PLR0915": {
+    "_execute": 76,
+    "select_tests": 62
+   }
+  },
+  "scripts/execution_boundary.py": {
+   "UP035": 1
+  },
+  "tests/conftest.py": {
+   "E501": 1
+  },
+  "tests/contract/test_a_pass_that_ends_hands_back_its_group.py": {
+   "E501": 1
+  },
+  "tests/contract/test_autonomous_admission.py": {
+   "E501": 1
+  },
+  "tests/contract/test_autonomous_worker.py": {
+   "E501": 2
+  },
+  "tests/contract/test_candidate_debounce.py": {
+   "UP017": 1
+  },
+  "tests/contract/test_claim_embed_recovery.py": {
+   "UP017": 1
+  },
+  "tests/contract/test_comprehensive_storage_diagnostics.py": {
+   "B905": 1,
+   "E501": 1,
+   "UP017": 3
+  },
+  "tests/contract/test_dev7_closeout.py": {
+   "E501": 5,
+   "UP017": 1
+  },
+  "tests/contract/test_embed_group_bookkeeping.py": {
+   "UP017": 1
+  },
+  "tests/contract/test_embedding_respace.py": {
+   "UP017": 4
+  },
+  "tests/contract/test_every_store_meets_the_runtime.py": {
+   "E501": 1
+  },
+  "tests/contract/test_failure_retry.py": {
+   "B905": 1,
+   "E501": 1
+  },
+  "tests/contract/test_finite_supervisor.py": {
+   "PLR0913": {
+    "queue": 9
+   },
+   "UP017": 2
+  },
+  "tests/contract/test_http_proxy_boundary.py": {
+   "B008": 1
+  },
+  "tests/contract/test_p08_retrieval.py": {
+   "F841": 2
+  },
+  "tests/contract/test_p09_recall_packet.py": {
+   "E501": 1,
+   "F841": 1
+  },
+  "tests/contract/test_p13_operator_retry.py": {
+   "UP017": 1
+  },
+  "tests/contract/test_provider_hold.py": {
+   "UP017": 1
+  },
+  "tests/contract/test_r1_candidate_lifecycle.py": {
+   "E501": 2
+  },
+  "tests/contract/test_rc37_turn_replies.py": {
+   "B905": 2
+  },
+  "tests/contract/test_rc38_queue_backpressure.py": {
+   "B905": 1
+  },
+  "tests/contract/test_recall_row_crossings.py": {
+   "E501": 2
+  },
+  "tests/contract/test_recall_scope.py": {
+   "E501": 1,
+   "UP017": 15
+  },
+  "tests/contract/test_running_code.py": {
+   "UP017": 5
+  },
+  "tests/contract/test_runtime_auxiliary.py": {
+   "E501": 2
+  },
+  "tests/contract/test_settle_window_wake.py": {
+   "B905": 1,
+   "UP017": 4
+  },
+  "tests/contract/test_sprint_consolidation_chunks.py": {
+   "B905": 1,
+   "E501": 1
+  },
+  "tests/contract/test_storage_growth.py": {
+   "E501": 3
+  },
+  "tests/contract/test_trace.py": {
+   "UP017": 2
+  },
+  "tests/contract/test_v11_aliases.py": {
+   "E501": 1
+  },
+  "tests/contract/test_v11_claims.py": {
+   "BLE001": 1,
+   "E501": 2,
+   "F841": 2
+  },
+  "tests/contract/test_v11_consolidation_input.py": {
+   "B905": 1
+  },
+  "tests/contract/test_v11_deletion.py": {
+   "B023": 3,
+   "F841": 1
+  },
+  "tests/contract/test_v11_lance_embed_fence.py": {
+   "BLE001": 2,
+   "F841": 1,
+   "UP017": 1
+  },
+  "tests/contract/test_v11_recall_admission.py": {
+   "E501": 2,
+   "PLR0913": {
+    "recall": 10
+   },
+   "UP035": 1
+  },
+  "tests/contract/test_v11_retained_artifacts.py": {
+   "E713": 1
+  },
+  "tests/contract/test_v11_storage.py": {
+   "E501": 2
+  },
+  "tests/contract/test_v11_worker.py": {
+   "E501": 4,
+   "F841": 11
+  },
+  "tests/contract/test_v11_worker_incremental_batch.py": {
+   "E501": 7,
+   "F841": 3
+  },
+  "tests/contract/test_vector_failure.py": {
+   "B007": 1,
+   "UP031": 1
+  },
+  "tests/contract/test_vector_retention.py": {
+   "E501": 3,
+   "UP017": 1
+  },
+  "tests/host/codex/test_mcp.py": {
+   "PLR0915": {
+    "test_mcp_stdio_all_tools_and_host_thread_bound_mutations": 63
+   }
+  },
+  "tests/host/codex/test_remote.py": {
+   "E501": 1,
+   "UP017": 7
+  },
+  "tests/host/codex/test_shared_client.py": {
+   "B023": 2,
+   "E501": 5,
+   "UP017": 9
+  },
+  "tests/host/hermes/test_dedupe.py": {
+   "B007": 1
+  },
+  "tests/host/hermes/test_p11_a2a_prepare.py": {
+   "E402": 7,
+   "UP012": 1
+  },
+  "tests/host/hermes/test_runtime_bounds.py": {
+   "BLE001": 1
+  },
+  "tests/host/test_eval_model_runtime.py": {
+   "E501": 1
+  },
+  "tests/host/test_runtime_wiring_common.py": {
+   "E501": 1,
+   "UP017": 1
+  },
+  "tests/known_answer/recall_invariants_check.py": {
+   "PLR0915": {
+    "run": 99
+   }
+  },
+  "tests/migration/legacy_fixture.py": {
+   "E501": 19
+  },
+  "tests/migration/release_fixture.py": {
+   "E501": 1
+  },
+  "tests/migration/test_v11_migration.py": {
+   "E501": 10
+  },
+  "tests/packaging/test_check_selection.py": {
+   "UP031": 1
+  },
+  "tests/packaging/test_clean_v11_wheel.py": {
+   "E501": 4
+  },
+  "tests/packaging/test_install_v11.py": {
+   "E402": 2,
+   "E501": 2,
+   "PLR0915": {
+    "test_preview_creates_nothing_and_codex_install_doctor_uninstall": 61
+   }
+  },
+  "tests/packaging/test_package_manifest.py": {
+   "UP031": 1
+  },
+  "tests/packaging/test_release_notes.py": {
+   "B007": 1
+  },
+  "tests/packaging/test_shared_cli.py": {
+   "E501": 2,
+   "PLR0915": {
+    "test_a_workbuddy_entry_installs_into_workbuddy_s_own_files_and_uninstalls_only_its_own": 82
+   }
+  },
+  "tests/storage_native/test_vector_compaction.py": {
+   "UP017": 5
+  },
+  "tests/test_cold_open_overlap.py": {
+   "B017": 2,
+   "E501": 1
+  },
+  "tests/unit/test_workbuddy_record.py": {
+   "E731": 1
+  },
+  "tests/v11_guard.py": {
+   "UP031": 1
+  },
+  "tests/v11_support.py": {
+   "UP017": 1
+  },
+  "vector/__init__.py": {
+   "E501": 1,
+   "UP035": 1
+  },
+  "vector/compaction.py": {
+   "UP017": 3
+  },
+  "vector/lance_native.py": {
+   "BLE001": 1
+  },
+  "vector/process_store.py": {
+   "BLE001": 3,
+   "C901": {
+    "ProcessLanceVectorStore._invoke_locked": 18
+   },
+   "E501": 1,
+   "PLR0912": {
+    "ProcessLanceVectorStore._invoke_locked": 19
+   },
+   "UP035": 1
+  },
+  "vector/sqlite_store.py": {
+   "B905": 3,
+   "BLE001": 1,
+   "E501": 1,
+   "UP035": 1
+  },
+  "vector/store.py": {
+   "BLE001": 1,
+   "E501": 1,
+   "UP035": 1
+  }
+ }
+}

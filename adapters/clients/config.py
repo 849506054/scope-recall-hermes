@@ -4,13 +4,14 @@ The same adapter serves a local client that is an entry of a shared store
 (``SharedClientConfig``): Codex, or Claude Code, whose hooks and MCP stdio
 server speak the protocol Codex's were modelled on.
 """
+
 from __future__ import annotations
 
-from dataclasses import dataclass
-from functools import partial
 import hashlib
 import json
 import os
+from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Mapping
@@ -26,9 +27,9 @@ from scope_recall.adapters.hermes.installation import (
     read_attachment,
     shared_entry_manifest,
 )
-from scope_recall.adapters.runtime_wiring import RUNTIME_CONFIG_FILENAME
 from scope_recall.contracts import InstanceBinding
 from scope_recall.core import CoreConfig, MemoryCore
+from scope_recall.runtime.worker_launch import RUNTIME_CONFIG_FILENAME
 
 
 class CodexConfigError(RuntimeError):
@@ -125,7 +126,10 @@ def load_codex_config(config_path: Path | str) -> CodexInstallationConfig:
     required = frozenset({"owner_private", "project", "shared"})
     if not required <= audience_scopes.keys():
         raise CodexConfigError("audience_scopes incomplete")
-    if any(type(key) is not str or type(value) is not str or not key.strip() or not value.strip() for key, value in audience_scopes.items()):
+    if any(
+        type(key) is not str or type(value) is not str or not key.strip() or not value.strip()
+        for key, value in audience_scopes.items()
+    ):
         raise CodexConfigError("audience_scopes must contain strings")
     if frozenset(audience_scopes.values()) != scope_ids:
         raise CodexConfigError("scope binding mismatch")
@@ -221,8 +225,14 @@ def load_shared_client(home: Path | str, host: str) -> SharedClientConfig:
     if attachment.host != host or manifest.entry_host != host:
         raise CodexConfigError(f"home is attached as a {attachment.host} entry, not {host}")
     scope = HermesRuntimeScope(
-        platform=host, user_id=LOCAL_USER_ID, chat_type="private", chat_id=LOCAL_USER_ID, thread_id="main",
-        agent_identity=manifest.agent_id, agent_workspace="default", agent_context="primary",
+        platform=host,
+        user_id=LOCAL_USER_ID,
+        chat_type="private",
+        chat_id=LOCAL_USER_ID,
+        thread_id="main",
+        agent_identity=manifest.agent_id,
+        agent_workspace="default",
+        agent_context="primary",
         entry_id=str(manifest.entry_id),
     )
     audience = resolve_runtime_audience(manifest, scope)

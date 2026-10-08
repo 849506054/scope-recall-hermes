@@ -1,18 +1,19 @@
 """Deadline-safe fan-out regressions for the Lance vector adapter."""
+
 from __future__ import annotations
 
-from dataclasses import replace
 import json
 import sys
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
-
 from scope_recall.core import deadline as request_deadline
-from scope_recall.adapters.lance import LanceVectorPort
 from scope_recall.core.recall_policy import SPACE_ID
 from scope_recall.core.retrieval import SearchContext, SearchLimits
+from scope_recall.runtime.lance_port import LanceVectorPort
 from scope_recall.vector.process_store import ProcessLanceVectorStore
+
 from tests.v11_support import context as trusted_context
 
 
@@ -104,9 +105,7 @@ class TimedSearchStore:
         return [_candidate_row(scope_id)]
 
 
-def test_fanout_stops_before_over_budget_rpc_and_keeps_worker_usable(
-    tmp_path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_fanout_stops_before_over_budget_rpc_and_keeps_worker_usable(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
     import scope_recall.vector.process_store as process_store
 
     clock = ManualClock()
@@ -168,29 +167,54 @@ def test_started_transport_failure_is_not_masked(tmp_path, monkeypatch: pytest.M
         store.close()
 
 
-def test_an_entry_holding_a_hundred_scopes_searches_them_all_in_one_request(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_an_entry_holding_a_hundred_scopes_searches_them_all_in_one_request(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """A request per partition, in sorted order, until the budget ran out.
 
     On the pilot an entry held 110 scopes and searched seven of them before its budget ran out;
     the owner's own scope sorted 105th and was never searched, so what the owner had just told
     another agent was not found by meaning.  The whole trusted list is now one request.
     """
-    from scope_recall.adapters.lance import physical_partition_scope_id
     from scope_recall.contracts import InstanceBinding, TrustedContext
+    from scope_recall.runtime.lance_port import physical_partition_scope_id
 
     clock = ManualClock()
     monkeypatch.setattr(request_deadline, "time", SimpleNamespace(monotonic=clock.monotonic))
     scopes = [f"TEST-scope-{index:03d}" for index in range(110)]
     binding = InstanceBinding("TEST-agent", "TEST-installation", tmp_path / "TEST-data", frozenset(scopes), True)
     trusted = TrustedContext(binding, "TEST-session", frozenset(scopes), "human_direct")
-    context = SearchContext(query="PUBLIC semantic query", mode="auto", as_of=None, focus_refs=(), limits=SearchLimits(),
-                            deadline=clock.monotonic() + 1.0, now="2026-09-15T00:00:00Z", trusted_context=trusted)
+    context = SearchContext(
+        query="PUBLIC semantic query",
+        mode="auto",
+        as_of=None,
+        focus_refs=(),
+        limits=SearchLimits(),
+        deadline=clock.monotonic() + 1.0,
+        now="2026-09-15T00:00:00Z",
+        trusted_context=trusted,
+    )
     last = scopes[-1]
-    wanted = physical_partition_scope_id(agent_id="TEST-agent", installation_id="TEST-installation",
-                                         embedding_space=SPACE_ID, logical_scope_id=last, project_id=None, branch_id=None)
-    metadata = {"object_kind": "event", "object_ref": "TEST-owner-told", "object_revision": 1, "vector_id": "TEST-vector",
-                "embedding_space": SPACE_ID, "agent_id": "TEST-agent", "installation_id": "TEST-installation",
-                "project_id": None, "branch_id": None, "logical_scope_id": last}
+    wanted = physical_partition_scope_id(
+        agent_id="TEST-agent",
+        installation_id="TEST-installation",
+        embedding_space=SPACE_ID,
+        logical_scope_id=last,
+        project_id=None,
+        branch_id=None,
+    )
+    metadata = {
+        "object_kind": "event",
+        "object_ref": "TEST-owner-told",
+        "object_revision": 1,
+        "vector_id": "TEST-vector",
+        "embedding_space": SPACE_ID,
+        "agent_id": "TEST-agent",
+        "installation_id": "TEST-installation",
+        "project_id": None,
+        "branch_id": None,
+        "logical_scope_id": last,
+    }
 
     class Store:
         def __init__(self) -> None:
@@ -208,6 +232,7 @@ def test_an_entry_holding_a_hundred_scopes_searches_them_all_in_one_request(tmp_
 
     store = Store()
     found = LanceVectorPort(store, SyntheticQueryEmbedding(), clock=clock.monotonic).search(
-        context, limit=6, remaining_seconds=1.0)
+        context, limit=6, remaining_seconds=1.0
+    )
     assert [candidate.ref for candidate in found] == ["TEST-owner-told"]
     assert len(store.requests) == 1 and len(store.requests[0]) == len(scopes), "one request for every partition"

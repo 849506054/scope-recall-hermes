@@ -1,11 +1,11 @@
 """Identity binding and public signature contracts for the Hermes adapter."""
+
 from __future__ import annotations
 
 import inspect
 import sqlite3
 
 import pytest
-
 from scope_recall.adapters.hermes import (
     HermesIdentityError,
     ScopeRecallHermesAdapter,
@@ -14,8 +14,8 @@ from scope_recall.adapters.hermes import (
 )
 from scope_recall.adapters.hermes.hooks import unsupported_host_fields
 from scope_recall.adapters.hermes.provider import public_signatures_match
-from scope_recall.core import CoreConfig, MemoryCore
 from scope_recall.contracts import ContractError
+from scope_recall.core import CoreConfig, MemoryCore
 
 
 def test_public_memory_provider_signatures_match(adapter, initialize_kwargs):
@@ -75,8 +75,7 @@ def test_a2a_default_context_is_not_human_attested(hermes_home, initialize_kwarg
         )
         with sqlite3.connect(hermes_home / "scope-recall" / "memory.sqlite3") as connection:
             rows = connection.execute(
-                "SELECT event_id, source_revision, origin FROM source_events "
-                "WHERE role='user' ORDER BY rowid DESC"
+                "SELECT event_id, source_revision, origin FROM source_events WHERE role='user' ORDER BY rowid DESC"
             ).fetchall()
         assert rows and all(row[2] == "origin_unknown" for row in rows)
         row = rows[0]

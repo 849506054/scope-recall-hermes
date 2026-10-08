@@ -1,16 +1,16 @@
 """Pure source admission. No database, host, environment, or model calls."""
+
 from __future__ import annotations
 
-from dataclasses import dataclass
 import functools
 import hashlib
 import re
 import unicodedata
+from dataclasses import dataclass
 
-from .capture_filters import sanitize_source_capture_text
 from ..contracts import ContractError, SourceEvent, TrustedContext, decode_payload, validate_capture
+from .capture_filters import sanitize_source_capture_text
 from .secret_patterns import contains_secret_like_text
-
 
 MAX_SEGMENT_CHARS = 65536
 
@@ -59,11 +59,13 @@ def prepare_capture(value: SourceEvent | dict | str | bytes, context: TrustedCon
     total = (len(filtered) + MAX_SEGMENT_CHARS - 1) // MAX_SEGMENT_CHARS
     events = []
     for index in range(total):
-        event = {**raw, "source_event_key": segment_key(raw["source_event_key"], index),
-                 "content": filtered[index*MAX_SEGMENT_CHARS:(index+1)*MAX_SEGMENT_CHARS],
-                 "capture_state": state,
-                 "segment": {"group_key": raw["source_event_key"], "index": index,
-                             "total": total, "truncated": bool(gaps)}}
+        event = {
+            **raw,
+            "source_event_key": segment_key(raw["source_event_key"], index),
+            "content": filtered[index * MAX_SEGMENT_CHARS : (index + 1) * MAX_SEGMENT_CHARS],
+            "capture_state": state,
+            "segment": {"group_key": raw["source_event_key"], "index": index, "total": total, "truncated": bool(gaps)},
+        }
         events.append(validate_capture(event, context))
     return PreparedCapture(tuple(events), gaps)
 
@@ -79,7 +81,7 @@ def stored_content_digest(content: str) -> str:
     return hashlib.sha256(sanitize_source_capture_text(content)[:MAX_SEGMENT_CHARS].encode("utf-8")).hexdigest()
 
 
-_CJK = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]+")
+CJK_RUN = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]+")
 _IDENTIFIER = re.compile(r"[a-z0-9]+(?:[._/-][a-z0-9]+)*")
 _FILENAME = re.compile(r"(?<![\w-])[\w-]+(?:\.[\w-]+)+", re.UNICODE)
 #: A dotted release version with a pre-release or build suffix, after
@@ -104,8 +106,10 @@ def version_suffixes(text: str) -> frozenset[str]:
 _WITHHELD_TOOL_OUTPUT = re.compile(r"Tool execution summary\b.*\b(?:output omitted|output_preview=omitted)\b", re.S)
 #: The same placeholders as a condition on ``source_events e``, cheap enough to test before the role.  Leading
 #: whitespace is passed over as ``withheld_tool_output`` passes it over.
-WITHHELD_TOOL_OUTPUT_SQL = ("ltrim(e.content, char(32,9,10,13)) LIKE 'Tool execution summary%' AND "
-                            "(e.content LIKE '%output omitted%' OR e.content LIKE '%output_preview=omitted%')")
+WITHHELD_TOOL_OUTPUT_SQL = (
+    "ltrim(e.content, char(32,9,10,13)) LIKE 'Tool execution summary%' AND "
+    "(e.content LIKE '%output omitted%' OR e.content LIKE '%output_preview=omitted%')"
+)
 #: The tool's own error text, the one part of a placeholder that is the output's: 4,348 of the shared store's carry
 #: one ("...; error=<up to 160 characters>; output_preview=omitted").
 _WITHHELD_ERROR = re.compile(r";\s*error=(.*);\s*output_preview=", re.S)
@@ -132,10 +136,10 @@ def lexical_terms(text: str) -> tuple[str, ...]:
     terms = set(_IDENTIFIER.findall(normalized)) | set(_FILENAME.findall(normalized))
     terms.update(part for token in tuple(terms) for part in token.split("/"))
     terms.update(_VERSION_SUFFIX.findall(normalized))
-    for run in _CJK.findall(normalized):
+    for run in CJK_RUN.findall(normalized):
         if len(run) == 1:
             terms.add(run)
-        terms.update(run[i:i+2] for i in range(len(run)-1))
+        terms.update(run[i : i + 2] for i in range(len(run) - 1))
     # Pathological uninterrupted identifiers are available by source expansion,
     # but are not unbounded index keys. Normal identifiers remain exact.
     return tuple(sorted(t for t in terms if 0 < len(t) <= 240))

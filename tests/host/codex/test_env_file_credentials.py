@@ -6,6 +6,7 @@ already reads them from its autostart control file; these tests pin the same
 contract for the two host entries: only declared names, absolute paths only,
 and a missing key costs the semantic channel but never the process.
 """
+
 from __future__ import annotations
 
 import io
@@ -14,9 +15,8 @@ import types
 from pathlib import Path
 
 import pytest
-
-from scope_recall.adapters.codex import hook_entry, mcp_entry
-from scope_recall.runtime import resume_entry
+from scope_recall.adapters.clients import hook_entry, mcp_entry
+from scope_recall.runtime import worker_entry
 
 KEY = "SCOPE_RECALL_TEST_EMBED_KEY"
 
@@ -33,27 +33,24 @@ def _stub_runtime_config(*names: str):
 def test_host_process_credential_environment_reads_only_declared_names(tmp_path: Path, monkeypatch) -> None:
     runtime_config = tmp_path / "runtime-config.json"
     runtime_config.write_text("{}", encoding="utf-8")
-    monkeypatch.setattr(resume_entry, "load_config", lambda path: _stub_runtime_config(KEY))
+    monkeypatch.setattr(worker_entry, "load_config", lambda path: _stub_runtime_config(KEY))
     env_file = tmp_path / "embedding.env"
     env_file.write_text(
-        "# comment\n"
-        f"export {KEY}='secret-value'  \n"
-        "SCOPE_RECALL_UNDECLARED=leak\n"
-        "PATH=/tmp/not-touched\n",
+        f"# comment\nexport {KEY}='secret-value'  \nSCOPE_RECALL_UNDECLARED=leak\nPATH=/tmp/not-touched\n",
         encoding="utf-8",
     )
 
-    loaded = resume_entry.host_process_credential_environment(runtime_config, env_file)
+    loaded = worker_entry.host_process_credential_environment(runtime_config, env_file)
 
     assert loaded == {KEY: "secret-value"}
     with pytest.raises(ValueError, match="runtime_config_path_not_absolute"):
-        resume_entry.host_process_credential_environment(Path("relative/runtime-config.json"), env_file)
+        worker_entry.host_process_credential_environment(Path("relative/runtime-config.json"), env_file)
     with pytest.raises(ValueError, match="autostart_environment_invalid"):
-        resume_entry.host_process_credential_environment(runtime_config, Path("relative.env"))
+        worker_entry.host_process_credential_environment(runtime_config, Path("relative.env"))
 
 
 def _install(tmp_path: Path):
-    from scope_recall.adapters.codex import install_codex_scope_recall
+    from scope_recall.adapters.clients import install_codex_scope_recall
 
     project_root = tmp_path / "TEST-project"
     project_root.mkdir()
@@ -75,16 +72,23 @@ def test_mcp_entry_env_file_populates_environment_before_server_build(tmp_path: 
 
     def fake_build_server(*_args, **_kwargs):
         seen["environment_at_build"] = os.environ.get(KEY)
-        return types.SimpleNamespace(server=types.SimpleNamespace(run=lambda transport: seen.setdefault("transport", transport)))
+        return types.SimpleNamespace(
+            server=types.SimpleNamespace(run=lambda transport: seen.setdefault("transport", transport))
+        )
 
     monkeypatch.setattr(mcp_entry, "host_process_credential_environment", fake_credentials)
     monkeypatch.setattr(mcp_entry, "build_server", fake_build_server)
 
-    code = mcp_entry.main([
-        "--config", str(config.config_path),
-        "--workspace", str(project_root),
-        "--env-file", str(env_file),
-    ])
+    code = mcp_entry.main(
+        [
+            "--config",
+            str(config.config_path),
+            "--workspace",
+            str(project_root),
+            "--env-file",
+            str(env_file),
+        ]
+    )
 
     assert code == 0
     assert seen["runtime_config_path"] == config.data_directory / "runtime-config.json"
@@ -107,14 +111,21 @@ def test_mcp_entry_unreadable_env_file_is_reported_and_server_still_starts(tmp_p
     monkeypatch.setattr(
         mcp_entry,
         "build_server",
-        lambda *a, **k: types.SimpleNamespace(server=types.SimpleNamespace(run=lambda transport: started.append(transport))),
+        lambda *a, **k: types.SimpleNamespace(
+            server=types.SimpleNamespace(run=lambda transport: started.append(transport))
+        ),
     )
 
-    code = mcp_entry.main([
-        "--config", str(config.config_path),
-        "--workspace", str(project_root),
-        "--env-file", str(tmp_path / "missing.env"),
-    ])
+    code = mcp_entry.main(
+        [
+            "--config",
+            str(config.config_path),
+            "--workspace",
+            str(project_root),
+            "--env-file",
+            str(tmp_path / "missing.env"),
+        ]
+    )
 
     assert code == 0
     assert started == ["stdio"]
@@ -122,11 +133,16 @@ def test_mcp_entry_unreadable_env_file_is_reported_and_server_still_starts(tmp_p
     assert "credential environment unavailable (autostart_environment_invalid)" in capsys.readouterr().err
 
     with pytest.raises(SystemExit, match="env-file must be absolute"):
-        mcp_entry.main([
-            "--config", str(config.config_path),
-            "--workspace", str(project_root),
-            "--env-file", "relative.env",
-        ])
+        mcp_entry.main(
+            [
+                "--config",
+                str(config.config_path),
+                "--workspace",
+                str(project_root),
+                "--env-file",
+                "relative.env",
+            ]
+        )
 
 
 def _stub_hook_handler(monkeypatch, seen: dict[str, object]) -> None:

@@ -1,12 +1,14 @@
 """Launch one bounded worker process without creating a second queue."""
+
 from __future__ import annotations
 
-from dataclasses import dataclass
 import os
-from pathlib import Path
+import re
 import signal
 import subprocess
 import sys
+from dataclasses import dataclass
+from pathlib import Path
 
 from .validation import absolute_path, strict_bool, strict_float, strict_int
 
@@ -15,14 +17,21 @@ from .validation import absolute_path, strict_bool, strict_float, strict_int
 #: file of that name and nothing else: given an operator's real ``runtime-config.json`` it
 #: deleted that, silently, and every host dropped to basic mode (#118).
 EPHEMERAL_CONFIG_INFIX = "-worker-"
+#: A runtime config's file name, beside the binding's data or an entry's attachment.
+RUNTIME_CONFIG_FILENAME = "runtime-config.json"
 
 
 def is_ephemeral_worker_config(path: Path) -> bool:
     """Whether ``path`` is named as a per-pass config copy, the only kind ``--cleanup-config`` removes."""
     stem, infix, tail = path.name.rpartition(EPHEMERAL_CONFIG_INFIX)
     random, _, suffix = tail.partition(".")
-    return bool(stem) and bool(infix) and suffix == "json" and len(random) == 8 and all(
-        character in "abcdefghijklmnopqrstuvwxyz0123456789_" for character in random)
+    return (
+        bool(stem)
+        and bool(infix)
+        and suffix == "json"
+        and len(random) == 8
+        and all(character in "abcdefghijklmnopqrstuvwxyz0123456789_" for character in random)
+    )
 
 
 def validate_wake_arguments(after_pid: int | None, delay_seconds: float) -> None:
@@ -166,9 +175,7 @@ def launch_worker(
         child_env.update(environment)
     package_root = Path(__file__).resolve().parents[1]
     inherited_pythonpath = child_env.get("PYTHONPATH")
-    child_env["PYTHONPATH"] = str(package_root) + (
-        os.pathsep + inherited_pythonpath if inherited_pythonpath else ""
-    )
+    child_env["PYTHONPATH"] = str(package_root) + (os.pathsep + inherited_pythonpath if inherited_pythonpath else "")
     process = subprocess.Popen(
         command,
         cwd=str(package_root),
@@ -182,6 +189,26 @@ def launch_worker(
         start_new_session=(os.name != "nt"),
     )
     return WorkerProcess(process=process, config_path=path)
+
+
+#: ``ExceptionClass: message`` -- the last line of a traceback, and nothing else.
+_TRACEBACK_TAIL = re.compile(r"^[A-Za-z_][\w.]*(?:Error|Exception|Exit|Interrupt)\b.*")
+
+
+def failure_reason(stderr: str) -> str | None:
+    """The one line of a child's stderr that names why it died, or None.
+
+    Only the last line of a Python traceback qualifies (``ModuleNotFoundError:
+    No module named 'scope_recall'``): bounded, no paths, no model text.  A
+    line that looks like a credential is dropped rather than recorded.
+    """
+    from ..core.secret_patterns import contains_secret_like_text
+
+    for line in reversed(stderr.splitlines()):
+        line = line.strip()
+        if _TRACEBACK_TAIL.match(line) and not contains_secret_like_text(line):
+            return line[:200]
+    return None
 
 
 __all__ = ["WorkerProcess", "launch_worker", "validate_wake_arguments"]

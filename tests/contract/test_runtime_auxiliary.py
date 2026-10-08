@@ -1,28 +1,17 @@
 """Contract tests for the production auxiliary-model runtime boundary."""
+
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
-from decimal import Decimal
 import hashlib
 import json
 import os
 import sqlite3
+from concurrent.futures import ThreadPoolExecutor
+from decimal import Decimal
 from pathlib import Path
 from threading import Barrier
 
 import pytest
-
-from scope_recall.adapters.models import (
-    AuxiliaryModelError,
-    ConsolidationRouteConfig,
-    EmbeddingRouteConfig,
-    GeminiEmbeddingAdapter,
-    OpenAIConsolidationAdapter,
-    build_gemini_embed_body,
-    parse_embedding_batch_response,
-    parse_embedding_response,
-    validate_embedding_vector,
-)
 from scope_recall.contracts import ContractError, SourceEvent
 from scope_recall.core.recall_policy import EMBEDDING_SPACE, encode_embedding_text
 from scope_recall.core.storage import StoredSource
@@ -33,6 +22,17 @@ from scope_recall.runtime.model_budget import (
     ModelPricing,
     initialize_auxiliary_budget_ledger,
     read_auxiliary_budget_status,
+)
+from scope_recall.runtime.models import (
+    AuxiliaryModelError,
+    ConsolidationRouteConfig,
+    EmbeddingRouteConfig,
+    GeminiEmbeddingAdapter,
+    OpenAIConsolidationAdapter,
+    build_gemini_embed_body,
+    parse_embedding_batch_response,
+    parse_embedding_response,
+    validate_embedding_vector,
 )
 
 
@@ -125,7 +125,9 @@ class FakeTransport:
 
     def post(self, url, *, body, headers, timeout_seconds, max_response_bytes):
         self.calls += 1
-        return self.handler(url=url, body=body, headers=headers, timeout_seconds=timeout_seconds, max_response_bytes=max_response_bytes)
+        return self.handler(
+            url=url, body=body, headers=headers, timeout_seconds=timeout_seconds, max_response_bytes=max_response_bytes
+        )
 
 
 def _vector(count: int = 3072, *, nan_at: int | None = None, length: int | None = None) -> list[float]:
@@ -222,7 +224,9 @@ def test_malformed_and_invalid_vectors(tmp_path, monkeypatch):
     transport = FakeTransport(
         lambda **kwargs: (
             200,
-            json.dumps({"embeddings": [{"values": _vector(nan_at=0)}], "usageMetadata": {"promptTokenCount": 10}}).encode(),
+            json.dumps(
+                {"embeddings": [{"values": _vector(nan_at=0)}], "usageMetadata": {"promptTokenCount": 10}}
+            ).encode(),
         )
     )
     runtime = build_auxiliary_runtime(config, transport=transport)
@@ -231,7 +235,9 @@ def test_malformed_and_invalid_vectors(tmp_path, monkeypatch):
     assert exc.value.error_type == "vector_nonfinite"
     transport.handler = lambda **kwargs: (
         200,
-        json.dumps({"embeddings": [{"values": _vector(length=10)}], "usageMetadata": {"promptTokenCount": 10}}).encode(),
+        json.dumps(
+            {"embeddings": [{"values": _vector(length=10)}], "usageMetadata": {"promptTokenCount": 10}}
+        ).encode(),
     )
     with pytest.raises(AuxiliaryModelError) as exc2:
         runtime.query_embedding.embed_query("hello", remaining_seconds=2.0)
@@ -249,7 +255,9 @@ def test_consolidation_returns_raw_content_without_json_repair(tmp_path, monkeyp
             json.dumps(
                 {
                     "usage": {"prompt_tokens": 10, "completion_tokens": 5},
-                    "choices": [{"message": {"role": "assistant", "content": "{not valid json"}, "finish_reason": "stop"}],
+                    "choices": [
+                        {"message": {"role": "assistant", "content": "{not valid json"}, "finish_reason": "stop"}
+                    ],
                 }
             ).encode(),
         )
@@ -263,10 +271,17 @@ def test_consolidation_returns_raw_content_without_json_repair(tmp_path, monkeyp
 
 
 def _cached_reply(usage):
-    return FakeTransport(lambda **kwargs: (200, json.dumps({
-        "usage": usage,
-        "choices": [{"message": {"role": "assistant", "content": "{}"}, "finish_reason": "stop"}],
-    }).encode()))
+    return FakeTransport(
+        lambda **kwargs: (
+            200,
+            json.dumps(
+                {
+                    "usage": usage,
+                    "choices": [{"message": {"role": "assistant", "content": "{}"}, "finish_reason": "stop"}],
+                }
+            ).encode(),
+        )
+    )
 
 
 def _ledger_rows(ledger):
@@ -275,11 +290,22 @@ def _ledger_rows(ledger):
         return [dict(row) for row in db.execute("SELECT * FROM requests ORDER BY id")]
 
 
-@pytest.mark.parametrize("usage,cached", [
-    ({"prompt_tokens": 1000, "completion_tokens": 5, "prompt_cache_hit_tokens": 640, "prompt_cache_miss_tokens": 360}, 640),
-    ({"prompt_tokens": 1000, "completion_tokens": 5, "prompt_tokens_details": {"cached_tokens": 512}}, 512),
-    ({"prompt_tokens": 1000, "completion_tokens": 5}, None),
-])
+@pytest.mark.parametrize(
+    "usage,cached",
+    [
+        (
+            {
+                "prompt_tokens": 1000,
+                "completion_tokens": 5,
+                "prompt_cache_hit_tokens": 640,
+                "prompt_cache_miss_tokens": 360,
+            },
+            640,
+        ),
+        ({"prompt_tokens": 1000, "completion_tokens": 5, "prompt_tokens_details": {"cached_tokens": 512}}, 512),
+        ({"prompt_tokens": 1000, "completion_tokens": 5}, None),
+    ],
+)
 def test_cached_prompt_tokens_are_recorded_beside_an_unchanged_charge(tmp_path, monkeypatch, usage, cached):
     """Whether a prompt layout reuses its prefix is invisible unless the ledger
     keeps what the provider reported; the charge still prices every token."""
@@ -302,12 +328,15 @@ def test_a_cache_count_that_cannot_be_true_is_not_recorded(tmp_path, monkeypatch
     assert _ledger_rows(ledger)[0]["cached_input"] is None
 
 
-@pytest.mark.parametrize("usage,unreported", [
-    ({"prompt_tokens": 1000, "completion_tokens": 5, "total_tokens": 9005}, 8000),
-    ({"prompt_tokens": 1000, "completion_tokens": 5, "total_tokens": 1005}, None),
-    ({"prompt_tokens": 1000, "completion_tokens": 5, "total_tokens": 900}, None),
-    ({"prompt_tokens": 1000, "completion_tokens": 5}, None),
-])
+@pytest.mark.parametrize(
+    "usage,unreported",
+    [
+        ({"prompt_tokens": 1000, "completion_tokens": 5, "total_tokens": 9005}, 8000),
+        ({"prompt_tokens": 1000, "completion_tokens": 5, "total_tokens": 1005}, None),
+        ({"prompt_tokens": 1000, "completion_tokens": 5, "total_tokens": 900}, None),
+        ({"prompt_tokens": 1000, "completion_tokens": 5}, None),
+    ],
+)
 def test_output_billed_outside_completion_tokens_is_recorded_and_charged(tmp_path, monkeypatch, usage, unreported):
     """beta's Gemini route recorded 325 completion tokens a call while the
     provider billed thousands of thinking tokens nobody could see."""
@@ -325,22 +354,29 @@ def test_a_ledger_from_before_the_cache_column_gains_it_on_first_use(tmp_path, m
     config, ledger, _ = _runtime_config(tmp_path)
     ledger.unlink()
     with sqlite3.connect(ledger) as db:
-        db.execute("CREATE TABLE requests (id INTEGER PRIMARY KEY, batch TEXT, model TEXT, body_sha256 TEXT, "
-                   "request_bytes INTEGER, reserved_input INTEGER, reserved_output INTEGER, actual_input INTEGER, "
-                   "actual_output INTEGER, charge_micro_usd INTEGER, status TEXT, started_ns INTEGER)")
+        db.execute(
+            "CREATE TABLE requests (id INTEGER PRIMARY KEY, batch TEXT, model TEXT, body_sha256 TEXT, "
+            "request_bytes INTEGER, reserved_input INTEGER, reserved_output INTEGER, actual_input INTEGER, "
+            "actual_output INTEGER, charge_micro_usd INTEGER, status TEXT, started_ns INTEGER)"
+        )
     monkeypatch.setenv("SCOPE_RECALL_TEST_CHAT_KEY", "test-key")
     usage = {"prompt_tokens": 1000, "completion_tokens": 5, "prompt_cache_hit_tokens": 640, "total_tokens": 2005}
     for _ in range(2):
         runtime = build_auxiliary_runtime(config, transport=_cached_reply(usage))
         runtime.consolidation.propose([{"role": "user", "content": "bounded input"}], remaining_seconds=2.0)
-    assert [(row["cached_input"], row["unreported_output"]) for row in _ledger_rows(ledger)] == [(640, 1000), (640, 1000)]
+    assert [(row["cached_input"], row["unreported_output"]) for row in _ledger_rows(ledger)] == [
+        (640, 1000),
+        (640, 1000),
+    ]
 
 
 def _chat_reply(message, finish_reason):
-    return json.dumps({
-        "usage": {"prompt_tokens": 10, "completion_tokens": 512},
-        "choices": [{"message": message, "finish_reason": finish_reason}],
-    }).encode()
+    return json.dumps(
+        {
+            "usage": {"prompt_tokens": 10, "completion_tokens": 512},
+            "choices": [{"message": message, "finish_reason": finish_reason}],
+        }
+    ).encode()
 
 
 def test_consolidation_reply_cut_off_at_output_limit_is_a_named_derivation_failure(tmp_path, monkeypatch):
@@ -367,7 +403,9 @@ def test_consolidation_reply_cut_off_at_output_limit_is_a_named_derivation_failu
 def test_truncated_reply_without_answer_text_keeps_its_shape_error(tmp_path, monkeypatch, message):
     config, _, _ = _runtime_config(tmp_path)
     monkeypatch.setenv("SCOPE_RECALL_TEST_CHAT_KEY", "test-key")
-    runtime = build_auxiliary_runtime(config, transport=FakeTransport(lambda **kwargs: (200, _chat_reply(message, "length"))))
+    runtime = build_auxiliary_runtime(
+        config, transport=FakeTransport(lambda **kwargs: (200, _chat_reply(message, "length")))
+    )
     with pytest.raises(AuxiliaryModelError) as exc:
         runtime.consolidation.propose([{"role": "user", "content": "bounded input"}], remaining_seconds=2.0)
     assert exc.value.error_type == "unsupported_response_shape"
@@ -435,32 +473,52 @@ def test_consolidation_route_includes_reasoning_effort_when_configured(tmp_path,
 
 
 def test_reasoning_none_is_allowed_only_for_opencode_go_route():
-    base = dict(model="deepseek-v4-flash", credential_env="SCOPE_RECALL_TEST_CHAT_KEY",
-                output_limit_field="max_tokens", max_output_tokens=512)
-    route = ConsolidationRouteConfig(**base, endpoint="https://opencode.ai/zen/go/v1/chat/completions",
-                                     reasoning_effort="none")
+    base = dict(
+        model="deepseek-v4-flash",
+        credential_env="SCOPE_RECALL_TEST_CHAT_KEY",
+        output_limit_field="max_tokens",
+        max_output_tokens=512,
+    )
+    route = ConsolidationRouteConfig(
+        **base, endpoint="https://opencode.ai/zen/go/v1/chat/completions", reasoning_effort="none"
+    )
     assert route.reasoning_effort == "none"
-    for endpoint in ("https://api.deepseek.com/chat/completions",
-                     "https://opencode.ai/zen/v1/chat/completions",
-                     "https://example.test/v1/chat/completions"):
+    for endpoint in (
+        "https://api.deepseek.com/chat/completions",
+        "https://opencode.ai/zen/v1/chat/completions",
+        "https://example.test/v1/chat/completions",
+    ):
         with pytest.raises(ValueError, match="reasoning_effort"):
             ConsolidationRouteConfig(**base, endpoint=endpoint, reasoning_effort="none")
         assert ConsolidationRouteConfig(**base, endpoint=endpoint, reasoning_effort="high").reasoning_effort == "high"
 
 
 def test_opencode_go_serializes_reasoning_none_with_original_bounds(tmp_path, monkeypatch):
-    config, _, _ = _runtime_config(tmp_path, consolidation={
-        "model": "deepseek-v4-flash", "endpoint": "https://opencode.ai/zen/go/v1/chat/completions",
-        "credential_env": "SCOPE_RECALL_TEST_CHAT_KEY", "output_limit_field": "max_tokens",
-        "max_output_tokens": 512, "thinking": {"type": "disabled"}, "reasoning_effort": "none",
-        "response_format": {"type": "json_object"},
-    })
+    config, _, _ = _runtime_config(
+        tmp_path,
+        consolidation={
+            "model": "deepseek-v4-flash",
+            "endpoint": "https://opencode.ai/zen/go/v1/chat/completions",
+            "credential_env": "SCOPE_RECALL_TEST_CHAT_KEY",
+            "output_limit_field": "max_tokens",
+            "max_output_tokens": 512,
+            "thinking": {"type": "disabled"},
+            "reasoning_effort": "none",
+            "response_format": {"type": "json_object"},
+        },
+    )
     monkeypatch.setenv("SCOPE_RECALL_TEST_CHAT_KEY", "test-key")
     bodies = []
+
     def handler(**kwargs):
         bodies.append(json.loads(kwargs["body"].decode()))
-        return 200, json.dumps({"usage": {"prompt_tokens": 10, "completion_tokens": 5},
-            "choices": [{"message": {"role": "assistant", "content": "{}"}, "finish_reason": "stop"}]}).encode()
+        return 200, json.dumps(
+            {
+                "usage": {"prompt_tokens": 10, "completion_tokens": 5},
+                "choices": [{"message": {"role": "assistant", "content": "{}"}, "finish_reason": "stop"}],
+            }
+        ).encode()
+
     runtime = build_auxiliary_runtime(config, transport=FakeTransport(handler))
     assert runtime.consolidation.propose([{"role": "user", "content": "bounded input"}], remaining_seconds=2.0) == "{}"
     assert len(bodies) == 1
@@ -774,28 +832,35 @@ def test_unknown_usage_keeps_reserve(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize("batch", [False, True], ids=["single", "batch"])
-@pytest.mark.parametrize("usage,actual,error", [
-    ({"prompt_tokens": 10}, 10, None),
-    ({"prompt_tokens": 0, "total_tokens": 10}, 0, None),
-    ({"prompt_tokens": 7, "total_tokens": 10}, 7, None),
-    ({"prompt_tokens": 7, "total_tokens": "bad"}, 7, None),
-    ({"total_tokens": 10}, 10, None),
-    ({"total_tokens": 0}, 0, None),
-    (None, None, "missing_usage"),
-    ({}, None, "missing_usage"),
-    ([], None, "missing_usage"),
-    ({"completion_tokens": 10}, None, "missing_usage"),
-    *[({"prompt_tokens": bad, "total_tokens": 10}, None, "missing_usage")
-      for bad in (None, True, False, "7", 7.0, -1)],
-    *[({"total_tokens": bad}, None, "missing_usage")
-      for bad in (None, True, False, "7", 7.0, -1)],
-    ({"total_tokens": 999_999}, 999_999, "meter_breach"),
-])
+@pytest.mark.parametrize(
+    "usage,actual,error",
+    [
+        ({"prompt_tokens": 10}, 10, None),
+        ({"prompt_tokens": 0, "total_tokens": 10}, 0, None),
+        ({"prompt_tokens": 7, "total_tokens": 10}, 7, None),
+        ({"prompt_tokens": 7, "total_tokens": "bad"}, 7, None),
+        ({"total_tokens": 10}, 10, None),
+        ({"total_tokens": 0}, 0, None),
+        (None, None, "missing_usage"),
+        ({}, None, "missing_usage"),
+        ([], None, "missing_usage"),
+        ({"completion_tokens": 10}, None, "missing_usage"),
+        *[
+            ({"prompt_tokens": bad, "total_tokens": 10}, None, "missing_usage")
+            for bad in (None, True, False, "7", 7.0, -1)
+        ],
+        *[({"total_tokens": bad}, None, "missing_usage") for bad in (None, True, False, "7", 7.0, -1)],
+        ({"total_tokens": 999_999}, 999_999, "meter_breach"),
+    ],
+)
 def test_openai_embedding_usage_settles_single_and_batch(tmp_path, monkeypatch, batch, usage, actual, error):
     _, ledger, budget = _runtime_config(tmp_path)
     route = EmbeddingRouteConfig(
-        credential_env="SCOPE_RECALL_TEST_EMBED_KEY", model=EMBEDDING_SPACE["model"],
-        endpoint="https://example.test/v1/embeddings", dimensions=8, dialect="openai",
+        credential_env="SCOPE_RECALL_TEST_EMBED_KEY",
+        model=EMBEDDING_SPACE["model"],
+        endpoint="https://example.test/v1/embeddings",
+        dimensions=8,
+        dialect="openai",
     )
     monkeypatch.setenv("SCOPE_RECALL_TEST_EMBED_KEY", "test-key")
     count = 2 if batch else 1
@@ -836,13 +901,16 @@ def test_openai_embedding_usage_settles_single_and_batch(tmp_path, monkeypatch, 
     assert transport.calls == len(_ledger_rows(ledger)) == 1
 
 
-@pytest.mark.parametrize("dialect,metadata,expected", [
-    ("openai", {"usage": {"total_tokens": 7}}, {"promptTokenCount": 7}),
-    ("gemini", {"usageMetadata": {"promptTokenCount": 7, "total_tokens": 10}}, {"promptTokenCount": 7}),
-    ("gemini", {"usageMetadata": {"promptTokenCount": -1}}, {"promptTokenCount": -1}),
-    ("gemini", {"usageMetadata": {"total_tokens": 7}, "usage": {"total_tokens": 7}}, None),
-    ("gemini", {"usageMetadata": {"promptTokenCount": True, "total_tokens": 7}}, None),
-])
+@pytest.mark.parametrize(
+    "dialect,metadata,expected",
+    [
+        ("openai", {"usage": {"total_tokens": 7}}, {"promptTokenCount": 7}),
+        ("gemini", {"usageMetadata": {"promptTokenCount": 7, "total_tokens": 10}}, {"promptTokenCount": 7}),
+        ("gemini", {"usageMetadata": {"promptTokenCount": -1}}, {"promptTokenCount": -1}),
+        ("gemini", {"usageMetadata": {"total_tokens": 7}, "usage": {"total_tokens": 7}}, None),
+        ("gemini", {"usageMetadata": {"promptTokenCount": True, "total_tokens": 7}}, None),
+    ],
+)
 def test_embedding_response_parsers_keep_dialect_usage(dialect, metadata, expected):
     payload = {"embeddings": [{"values": [1.0, 0.0]}], "data": [{"embedding": [1.0, 0.0]}], **metadata}
     assert parse_embedding_response(payload, dialect=dialect, dimensions=2) == ((1.0, 0.0), expected)
@@ -860,7 +928,8 @@ def test_chat_total_tokens_keeps_unknown_input_reserved(tmp_path, monkeypatch):
     assert row["status"] == "http_200_usage_unknown_reserved_charge_retained"
     assert (row["actual_input"], row["actual_output"]) == (None, None)
     assert row["charge_micro_usd"] == budget.pricing["deepseek-v4-flash"].charge_micro_usd(
-        row["reserved_input"], row["reserved_output"])
+        row["reserved_input"], row["reserved_output"]
+    )
 
 
 def test_concurrent_reservations_are_atomic(tmp_path, monkeypatch):
@@ -944,18 +1013,17 @@ def test_import_modules_in_either_order():
         "spec=importlib.util.spec_from_file_location('scope_recall',root+'/__init__.py',submodule_search_locations=[root]); "
         "package=importlib.util.module_from_spec(spec); sys.modules['scope_recall']=package; spec.loader.exec_module(package); "
     )
-    for order in (("adapters.models", "runtime.auxiliary"), ("runtime.auxiliary", "adapters.models")):
+    for order in (("runtime.models", "runtime.auxiliary"), ("runtime.auxiliary", "runtime.models")):
         program = bootstrap + (
             f"[importlib.import_module('scope_recall.'+name) for name in {order!r}]; "
-            "models=importlib.import_module('scope_recall.adapters.models'); "
+            "models=importlib.import_module('scope_recall.runtime.models'); "
             "auxiliary=importlib.import_module('scope_recall.runtime.auxiliary'); "
             "runtime_pkg=importlib.import_module('scope_recall.runtime'); "
             "assert models.AuxiliaryModelError is not None; "
             "assert auxiliary.build_auxiliary_runtime is not None; "
             "assert runtime_pkg.AuxiliaryRuntimeConfig is auxiliary.AuxiliaryRuntimeConfig"
         )
-        result = subprocess.run([sys.executable, "-I", "-B", "-c", program],
-                                capture_output=True, text=True, timeout=15)
+        result = subprocess.run([sys.executable, "-I", "-B", "-c", program], capture_output=True, text=True, timeout=15)
         assert result.returncode == 0, result.stderr
 
 
@@ -990,7 +1058,9 @@ def test_primary_error_not_suppressed_on_malformed_success_body(tmp_path, monkey
     transport = FakeTransport(
         lambda **kwargs: (
             200,
-            json.dumps({"embeddings": [{"values": _vector(nan_at=0)}], "usageMetadata": {"promptTokenCount": 10}}).encode(),
+            json.dumps(
+                {"embeddings": [{"values": _vector(nan_at=0)}], "usageMetadata": {"promptTokenCount": 10}}
+            ).encode(),
         )
     )
     runtime = build_auxiliary_runtime(config, transport=transport)
@@ -1231,9 +1301,7 @@ def test_response_metadata_does_not_hide_assistant_content(tmp_path, monkeypatch
         )
     )
     runtime = build_auxiliary_runtime(config, transport=transport)
-    assert runtime.consolidation.propose(
-        [{"role": "user", "content": "bounded input"}], remaining_seconds=2.0
-    ) == "ok"
+    assert runtime.consolidation.propose([{"role": "user", "content": "bounded input"}], remaining_seconds=2.0) == "ok"
 
 
 @pytest.mark.parametrize(
@@ -1268,7 +1336,10 @@ def test_nonassistant_response_is_rejected(tmp_path, monkeypatch):
         lambda **kwargs: (
             200,
             json.dumps(
-                {"usage": {"prompt_tokens": 1, "completion_tokens": 1}, "choices": [{"message": {"role": "user", "content": "ok"}}]}
+                {
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+                    "choices": [{"message": {"role": "user", "content": "ok"}}],
+                }
             ).encode(),
         )
     )
@@ -1311,7 +1382,10 @@ def test_transport_timeout_is_reduced_after_local_setup(tmp_path, monkeypatch):
 
 def _reserve(ledger_path: Path, policy: BudgetPolicy, model: str, *, body: bytes = b"x") -> int:
     return AuxiliaryBudgetLedger(ledger_path, policy).reserve(
-        model=model, body=body, reserved_input=1_000, reserved_output=100,
+        model=model,
+        body=body,
+        reserved_input=1_000,
+        reserved_output=100,
     )
 
 
@@ -1324,14 +1398,20 @@ def test_cumulative_caps_are_optional_and_zero_still_denies(tmp_path):
     everything", which would flip a fail-closed install to fail-open.
     """
     pricing = {"deepseek-v4-flash": ModelPricing(Decimal("0.44"), Decimal("1.32"))}
+
     def policy(**caps):
-        base = dict(cap_micro_usd=None, total_input_cap=None,
-                    total_output_cap=None, total_call_cap=None)
+        base = dict(cap_micro_usd=None, total_input_cap=None, total_output_cap=None, total_call_cap=None)
         base.update(caps)
         return BudgetPolicy(
-            batch="TEST-CAPS", max_request_bytes=32_000, default_reserve_input=32_768,
-            default_reserve_output=4_096, model_reserve_output={}, model_token_caps={},
-            pricing=pricing, approved_models=frozenset(pricing), **base,
+            batch="TEST-CAPS",
+            max_request_bytes=32_000,
+            default_reserve_input=32_768,
+            default_reserve_output=4_096,
+            model_reserve_output={},
+            model_token_caps={},
+            pricing=pricing,
+            approved_models=frozenset(pricing),
+            **base,
         )
 
     uncapped = policy()
@@ -1368,10 +1448,17 @@ def test_uncapped_policy_still_refuses_a_metered_breach(tmp_path):
     """
     pricing = {"deepseek-v4-flash": ModelPricing(Decimal("0.44"), Decimal("1.32"))}
     uncapped = BudgetPolicy(
-        batch="TEST-BREACH", cap_micro_usd=None, total_input_cap=None,
-        total_output_cap=None, total_call_cap=None, max_request_bytes=32_000,
-        default_reserve_input=32_768, default_reserve_output=4_096,
-        model_reserve_output={}, model_token_caps={}, pricing=pricing,
+        batch="TEST-BREACH",
+        cap_micro_usd=None,
+        total_input_cap=None,
+        total_output_cap=None,
+        total_call_cap=None,
+        max_request_bytes=32_000,
+        default_reserve_input=32_768,
+        default_reserve_output=4_096,
+        model_reserve_output={},
+        model_token_caps={},
+        pricing=pricing,
         approved_models=frozenset(pricing),
     )
     ledger = tmp_path / "breach.sqlite3"
@@ -1388,10 +1475,13 @@ def test_embedding_route_states_an_egress_proxy_for_its_helper(tmp_path, monkeyp
     the environment every other process shares alone."""
     monkeypatch.setenv("SCOPE_RECALL_TEST_EMBED_KEY", "synthetic-local-value")
     monkeypatch.delenv("HTTPS_PROXY", raising=False)
-    config, _, _ = _runtime_config(tmp_path, embedding={
-        "credential_env": "SCOPE_RECALL_TEST_EMBED_KEY",
-        "proxy_url": "http://proxy.local:7890",
-    })
+    config, _, _ = _runtime_config(
+        tmp_path,
+        embedding={
+            "credential_env": "SCOPE_RECALL_TEST_EMBED_KEY",
+            "proxy_url": "http://proxy.local:7890",
+        },
+    )
 
     runtime = build_auxiliary_runtime(config)
     try:
@@ -1432,7 +1522,10 @@ def test_embedding_route_rejects_a_proxy_the_helper_cannot_use(tmp_path, proxy_u
     """The helper tunnels TLS through an ``http://`` proxy and refuses any other scheme, so a route
     stating one the helper would reject is refused where the setting is read, not per request."""
     with pytest.raises(ValueError, match="embedding_route_proxy_url"):
-        _runtime_config(tmp_path, embedding={
-            "credential_env": "SCOPE_RECALL_TEST_EMBED_KEY",
-            "proxy_url": proxy_url,
-        })
+        _runtime_config(
+            tmp_path,
+            embedding={
+                "credential_env": "SCOPE_RECALL_TEST_EMBED_KEY",
+                "proxy_url": proxy_url,
+            },
+        )

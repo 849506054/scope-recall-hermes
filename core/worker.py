@@ -1,36 +1,36 @@
 """Bounded durable-work drain. Model and vector calls stay outside SQLite transactions."""
+
 from __future__ import annotations
 
+import math
+import time
 from collections import Counter
 from dataclasses import dataclass
 from functools import partial
-import math
-import time
 
 from ..contracts import ContractError, TrustedContext
 from .admission import resume_deferred
-from .candidate_lifecycle import PROCESS_BATCH_LIMIT, CandidateEvaluator, candidate_evaluation_messages
-from .consolidate import consolidation_messages
+from .candidate_lifecycle import PROCESS_BATCH_LIMIT, CandidateEvaluator
+from .consolidate import candidate_evaluation_messages, consolidation_messages
 from .storage import SQLiteStorage
 from .work_storage import CAPACITY_REFUSALS, MAX_RECOVERY_PAGE
-from .worker_candidates import _process_candidate_evaluation
+from .worker_candidates import process_candidate_evaluation
 from .worker_consolidation import (
     ConsolidationModel,
-    _decode_consolidation_result,
-    _process_consolidate,
     build_consolidation_model,
+    process_consolidate,
 )
-from .worker_outcomes import BUDGET_PAUSE_ERRORS, _model_exception_outcome, _remaining
+from .worker_outcomes import BUDGET_PAUSE_ERRORS, budget_left
 from .worker_projection import (
     EmbedGroupRefused,
     EmbedPort,
     PurgePort,
-    _process_embed,
     complete_embed_group,
-    publish_embed_group,
-    _process_purge,
-    _process_rebuild_projection,
     prepare_embed_group,
+    process_embed,
+    process_purge,
+    process_rebuild_projection,
+    publish_embed_group,
 )
 
 __all__ = [
@@ -43,11 +43,6 @@ __all__ = [
     "WorkerReceipt",
     "build_consolidation_model",
     "drain_worker",
-    # Reached through this module by the contract tests.
-    "_decode_consolidation_result",
-    "_model_exception_outcome",
-    "_process_consolidate",
-    "_process_embed",
 ]
 
 #: Provider answers that mean "send less traffic".  Distinct from the
@@ -79,7 +74,7 @@ PAGE_TURN_SECONDS = 0.02
 #: milliseconds and all sixteen still fit.
 SOURCE_PAGE_SECONDS = 5.0
 #: Source embeddings one group may carry.  The adapter sends them as consecutive
-#: full provider requests (``adapters/models.py``: a hundred each), so this is
+#: full provider requests (``runtime/models.py``: a hundred each), so this is
 #: how many items share one read, one group commit and one set of per-pass costs
 #: -- the numbers a drain is actually paying.  A pass still claims no more than
 #: its own ``max_items``.
@@ -115,11 +110,19 @@ class WorkerConfig:
     def __post_init__(self) -> None:
         if type(self.owner_id) is not str or not self.owner_id:
             raise ValueError("owner_id is required")
-        if type(self.lease_seconds) not in (int, float) or not math.isfinite(self.lease_seconds) or self.lease_seconds <= 0:
+        if (
+            type(self.lease_seconds) not in (int, float)
+            or not math.isfinite(self.lease_seconds)
+            or self.lease_seconds <= 0
+        ):
             raise ValueError("lease_seconds must be positive")
         if type(self.max_items) is not int or not 1 <= self.max_items <= 1000:
             raise ValueError("max_items must be between 1 and 1000")
-        if type(self.auto_retry_cooldown_seconds) not in (int, float) or not math.isfinite(self.auto_retry_cooldown_seconds) or not 60 <= self.auto_retry_cooldown_seconds <= 86400:
+        if (
+            type(self.auto_retry_cooldown_seconds) not in (int, float)
+            or not math.isfinite(self.auto_retry_cooldown_seconds)
+            or not 60 <= self.auto_retry_cooldown_seconds <= 86400
+        ):
             raise ValueError("auto_retry_cooldown_seconds")
         if type(self.max_auto_recoveries) is not int or not 0 <= self.max_auto_recoveries <= 4:
             raise ValueError("max_auto_recoveries")
@@ -130,8 +133,10 @@ class WorkerConfig:
         if type(self.embed_batch_limit) is not int or not 1 <= self.embed_batch_limit <= EMBED_BATCH_LIMIT:
             raise ValueError("embed_batch_limit")
         if self.request_seconds is not None and (
-                type(self.request_seconds) not in (int, float) or not math.isfinite(self.request_seconds)
-                or self.request_seconds <= 0):
+            type(self.request_seconds) not in (int, float)
+            or not math.isfinite(self.request_seconds)
+            or self.request_seconds <= 0
+        ):
             raise ValueError("request_seconds must be positive")
         if type(self.held_work_types) is not frozenset or not self.held_work_types <= _HOLDABLE_WORK_TYPES:
             raise ValueError("held_work_types")
@@ -167,29 +172,36 @@ class WorkerReceipt:
     settle_partial: bool = False
 
 
-def _resume_admission(storage, clock, context, config: WorkerConfig, started: float, budget: float,
-                      *, candidate_available: bool) -> None:
+def _resume_admission(
+    storage, clock, context, config: WorkerConfig, started: float, budget: float, *, candidate_available: bool
+) -> None:
     """Wake deferred captures and settle candidate pages before any claim."""
-    resume_deferred(storage, clock, context, config.admission_policy, limit=min(16, config.max_items),
-                    remaining_seconds=min(1.0, _remaining(started, clock, budget)))
+    resume_deferred(
+        storage,
+        clock,
+        context,
+        config.admission_policy,
+        limit=min(16, config.max_items),
+        remaining_seconds=min(1.0, budget_left(started, clock, budget)),
+    )
     # Each page is chosen in a read and linked in a write of its own, so a capture waits behind at most one
     # page's links, never its matching; the pages may take at most half of the pass, and at most
     # SOURCE_PAGE_SECONDS.
     pages_started = time.monotonic()
     for _ in range(SOURCE_PAGES_PER_PASS):
-        if _remaining(started, clock, budget) <= budget / 2:
+        if budget_left(started, clock, budget) <= budget / 2:
             break
-        with storage.read(context, remaining_seconds=min(1.0, _remaining(started, clock, budget))) as tx:
+        with storage.read(context, remaining_seconds=min(1.0, budget_left(started, clock, budget))) as tx:
             page = tx.candidates.next_source_page()
         if page is None:
             break
-        with storage.write(context, remaining_seconds=min(1.0, _remaining(started, clock, budget))) as tx:
+        with storage.write(context, remaining_seconds=min(1.0, budget_left(started, clock, budget))) as tx:
             tx.candidates.resume_source_pages(now=clock.utc_now(), page=page)
         time.sleep(PAGE_TURN_SECONDS)
         if time.monotonic() - pages_started >= SOURCE_PAGE_SECONDS:
             break
     page = min(config.candidate_batch_limit, config.max_items)
-    with storage.write(context, remaining_seconds=min(1.0, _remaining(started, clock, budget))) as tx:
+    with storage.write(context, remaining_seconds=min(1.0, budget_left(started, clock, budget))) as tx:
         tx.candidates.backfill(now=clock.utc_now(), limit=page)
         tx.candidates.archive_dormant(now=clock.utc_now(), limit=page)
         if not candidate_available:
@@ -200,11 +212,15 @@ def _queued_work_types(storage, clock, context, started: float, budget: float, k
     """Which of ``kinds`` have queued rows, so the receipt reports only real gaps."""
     if not kinds:
         return ()
-    with storage.read(context, remaining_seconds=_remaining(started, clock, budget)) as tx:
+    with storage.read(context, remaining_seconds=budget_left(started, clock, budget)) as tx:
         visible, params = tx.work._visible_filter()
-        queued = {row[0] for row in tx._check().execute(
-            f"SELECT DISTINCT work_type FROM work_items WHERE state IN ('pending','failed','leased') AND {visible}",
-            params)}
+        queued = {
+            row[0]
+            for row in tx._check().execute(
+                f"SELECT DISTINCT work_type FROM work_items WHERE state IN ('pending','failed','leased') AND {visible}",
+                params,
+            )
+        }
     return tuple(kind for kind in kinds if kind in queued)
 
 
@@ -237,17 +253,19 @@ STALE_PENDING_PAGE = 32
 RELEASE_SECONDS = 1.0
 
 
-def _release_group(storage, clock, context, members, error_code, started: float, budget: float,
-                   *, seconds: float = 0) -> None:
+def _release_group(
+    storage, clock, context, members, error_code, started: float, budget: float, *, seconds: float = 0
+) -> None:
     """Return leased work nobody will look at this pass, without spending its attempt."""
     if not members:
         return
     try:
-        with storage.write(context, remaining_seconds=max(_remaining(started, clock, budget), RELEASE_SECONDS)) as tx:
+        with storage.write(context, remaining_seconds=max(budget_left(started, clock, budget), RELEASE_SECONDS)) as tx:
             now = clock.utc_now()
             for member in members:
-                tx.work.defer_without_attempt(*member.lease, now=now,
-                                              error_code=str(error_code or "pass_ended"), seconds=seconds)
+                tx.work.defer_without_attempt(
+                    *member.lease, now=now, error_code=str(error_code or "pass_ended"), seconds=seconds
+                )
     except ContractError:
         # The lease expires on its own; a failure to hand work back early is
         # never worth failing a pass over.
@@ -258,12 +276,13 @@ def _other_work_ready(storage, clock, context, started: float, budget: float, ki
     """Whether work this pass can still do, other than candidate evaluation, is ready now."""
     if not kinds:
         return False
-    with storage.read(context, remaining_seconds=_remaining(started, clock, budget)) as tx:
+    with storage.read(context, remaining_seconds=budget_left(started, clock, budget)) as tx:
         return tx.work.other_work_ready(now=clock.utc_now(), kinds=kinds)
 
 
-def _recover_failed_work(storage, clock, context, config: WorkerConfig, allowed: frozenset[str],
-                         started: float, budget: float) -> tuple[int, str | None]:
+def _recover_failed_work(
+    storage, clock, context, config: WorkerConfig, allowed: frozenset[str], started: float, budget: float
+) -> tuple[int, str | None]:
     """Grant bounded fresh attempts to failures a later fix or budget may have cured.  Also says how far the settle
     sweep looked, for the wake plan (``runtime/scheduling``): ``"complete"``, ``"partial"`` when it filled its page
     (more may be ready behind it), or ``None`` when it did not look (a provider hold, no evaluator, a purge-only
@@ -274,21 +293,23 @@ def _recover_failed_work(storage, clock, context, config: WorkerConfig, allowed:
     if "evaluate_candidate" in allowed:
         # Which settled candidates to queue is read before the write: finding them walks every candidate still
         # settling, and under the writer lease that was 7.6 s of each pass on the shared store (2026-09-27).
-        with storage.read(context, remaining_seconds=_remaining(started, clock, budget)) as tx:
+        with storage.read(context, remaining_seconds=budget_left(started, clock, budget)) as tx:
             if tx.work.pending_depth("evaluate_candidate") < CANDIDATE_QUEUE_CEILING:
                 page = min(config.candidate_batch_limit, config.max_items)
                 settled = tx.candidates.settled_to_schedule(now=clock.utc_now(), limit=page)
                 sweep = "complete" if len(settled) < page else "partial"
             stale = tx.candidates.stale_pending(now=clock.utc_now(), limit=STALE_PENDING_PAGE)
-    with storage.write(context, remaining_seconds=_remaining(started, clock, budget)) as tx:
+    with storage.write(context, remaining_seconds=budget_left(started, clock, budget)) as tx:
         recovery_page = min(MAX_RECOVERY_PAGE, config.max_items)
         recovered = tx.work.recover_invalid_derivations(
-            now=clock.utc_now(), allowed_work_types=allowed, limit=recovery_page)
+            now=clock.utc_now(), allowed_work_types=allowed, limit=recovery_page
+        )
         # Corrections recorded with no claim to settle them (``close_unplaceable_updates``).
         tx.claims.close_unplaceable_updates(limit=64)
         if "consolidate" in allowed:
             recovered += tx.work.recover_oversized_consolidations(
-                now=clock.utc_now(), formatter=consolidation_messages, limit=min(8, config.max_items))
+                now=clock.utc_now(), formatter=consolidation_messages, limit=min(8, config.max_items)
+            )
         if "evaluate_candidate" in allowed:
             # Evidence stops arriving silently, so something has to notice.
             # observe_source no longer schedules while a candidate is still
@@ -299,25 +320,32 @@ def _recover_failed_work(storage, clock, context, config: WorkerConfig, allowed:
             # grow on its own: what is not queued now waits and is queued later.
             if settled:
                 tx.candidates.schedule_settled_candidates(
-                    now=clock.utc_now(), limit=min(config.candidate_batch_limit, config.max_items), refs=settled)
+                    now=clock.utc_now(), limit=min(config.candidate_batch_limit, config.max_items), refs=settled
+                )
             # Pending with nothing new to ask, left by releases before 3.4.0rc10 (``stale_pending``).
             if stale:
                 tx.candidates.settle_stale_pending(stale, now=clock.utc_now())
             recovered += tx.candidates.reschedule_budget_blocked_candidates(
-                now=clock.utc_now(), limit=min(8, config.max_items))
+                now=clock.utc_now(), limit=min(8, config.max_items)
+            )
             # The candidate twin of recover_oversized_consolidations, which
             # filters work_type='consolidate' and reformats a single source, so
             # it never reaches these rows.
             recovered += tx.candidates.recover_oversized_evaluations(
-                now=clock.utc_now(), formatter=candidate_evaluation_messages, limit=min(8, config.max_items))
+                now=clock.utc_now(), formatter=candidate_evaluation_messages, limit=min(8, config.max_items)
+            )
             # An attempt begun and never finished leaves nothing recorded; the
             # candidate would wait for evidence it already has.
             recovered += tx.work.recover_interrupted_attempts(
-                now=clock.utc_now(), allowed_work_types=allowed, limit=min(8, config.max_items))
+                now=clock.utc_now(), allowed_work_types=allowed, limit=min(8, config.max_items)
+            )
         recovered += tx.work.recover_transient_failures(
-            now=clock.utc_now(), allowed_work_types=allowed,
+            now=clock.utc_now(),
+            allowed_work_types=allowed,
             cooldown_seconds=config.auto_retry_cooldown_seconds,
-            max_recoveries=config.max_auto_recoveries, limit=recovery_page)
+            max_recoveries=config.max_auto_recoveries,
+            limit=recovery_page,
+        )
         if "purge" in allowed:
             recovered += tx.deletions.requeue_unfinished_purges(now=clock.utc_now(), limit=min(8, config.max_items))
     return recovered, sweep
@@ -349,18 +377,21 @@ def drain_worker(
         allowed = frozenset({"purge"})
         unavailable: tuple[str, ...] = ()
     else:
-        allowed = frozenset({"purge", "rebuild_projection",
-                             *(kind for kind, port in ports.items() if port is not None)}) - config.held_work_types
+        allowed = (
+            frozenset({"purge", "rebuild_projection", *(kind for kind, port in ports.items() if port is not None)})
+            - config.held_work_types
+        )
         _resume_admission(storage, clock, context, config, started, budget, candidate_available=candidate is not None)
-        unavailable = _queued_work_types(storage, clock, context, started, budget,
-                                         [kind for kind, port in ports.items() if port is None])
+        unavailable = _queued_work_types(
+            storage, clock, context, started, budget, [kind for kind, port in ports.items() if port is None]
+        )
     recovered, sweep = _recover_failed_work(storage, clock, context, config, allowed, started, budget)
     processors = {
-        "consolidate": partial(_process_consolidate, model=consolidation),
-        "embed": partial(_process_embed, embed=embed),
-        "evaluate_candidate": partial(_process_candidate_evaluation, evaluator=candidate),
-        "rebuild_projection": _process_rebuild_projection,
-        "purge": partial(_process_purge, purge=purge),
+        "consolidate": partial(process_consolidate, model=consolidation),
+        "embed": partial(process_embed, embed=embed),
+        "evaluate_candidate": partial(process_candidate_evaluation, evaluator=candidate),
+        "rebuild_projection": process_rebuild_projection,
+        "purge": partial(process_purge, purge=purge),
     }
     receipts: list[WorkerItemReceipt] = []
     dispositions: Counter[str] = Counter()
@@ -373,17 +404,23 @@ def drain_worker(
     reserve = 0.0 if config.request_seconds is None else config.request_seconds + FINALIZE_MARGIN_SECONDS
     paused: list[str] = []
     candidate_ceiling = min(config.candidate_batch_limit, config.max_items)
-    while len(receipts) < config.max_items and _remaining(started, clock, budget) > 0:
-        if _remaining(started, clock, budget) < reserve:
+    while len(receipts) < config.max_items and budget_left(started, clock, budget) > 0:
+        if budget_left(started, clock, budget) < reserve:
             allowed = allowed - model_bound
         # Every second claim prefers fresh conversation over the backlog.  The
         # first claim of a pass stays FIFO, so the lane holds at most half of
         # any pass, a one-claim pass included, and the oldest work keeps moving
         # however busy the chat is.  A default runtime pass (120 s, 45 s
         # requests) fits two model requests, so each such pass reaches the lane.
-        with storage.write(context, remaining_seconds=_remaining(started, clock, budget)) as tx:
-            claimed = tx.work.claim_next(config.owner_id, clock.utc_now(), lease_seconds=config.lease_seconds,
-                                         limit=1, allowed_work_types=allowed, fresh_lane=len(receipts) % 2 == 1)
+        with storage.write(context, remaining_seconds=budget_left(started, clock, budget)) as tx:
+            claimed = tx.work.claim_next(
+                config.owner_id,
+                clock.utc_now(),
+                lease_seconds=config.lease_seconds,
+                limit=1,
+                allowed_work_types=allowed,
+                fresh_lane=len(receipts) % 2 == 1,
+            )
         if not claimed:
             break
         item = claimed[0]
@@ -400,31 +437,55 @@ def drain_worker(
             # none is left leased on a pass that ends early.
             room = min(config.embed_batch_limit, config.max_items - len(receipts)) - 1
             if room > 0:
-                with storage.write(context, remaining_seconds=_remaining(started, clock, budget)) as tx:
-                    group = (item, *tx.work.claim_next(
-                        config.owner_id, clock.utc_now(), lease_seconds=config.lease_seconds,
-                        limit=room, allowed_work_types=frozenset({"embed"})))
+                with storage.write(context, remaining_seconds=budget_left(started, clock, budget)) as tx:
+                    group = (
+                        item,
+                        *tx.work.claim_next(
+                            config.owner_id,
+                            clock.utc_now(),
+                            lease_seconds=config.lease_seconds,
+                            limit=room,
+                            allowed_work_types=frozenset({"embed"}),
+                        ),
+                    )
                 claimed_at = clock.monotonic()
                 try:
-                    prepared_group = prepare_embed_group(storage, clock, context, group,
-                                                         embed=embed, started=started, budget=budget)
+                    prepared_group = prepare_embed_group(
+                        storage, clock, context, group, embed=embed, started=started, budget=budget
+                    )
                 except EmbedGroupRefused as refusal:
                     # The provider refused the group's request: no member was tried,
                     # so the whole group goes back unspent, parked as long as one
                     # refused member would be, and this pass asks for no more.
-                    _release_group(storage, clock, context, group, refusal.error_code, started, budget,
-                                   seconds=3600 if refusal.error_code in BUDGET_PAUSE_ERRORS else 0)
+                    _release_group(
+                        storage,
+                        clock,
+                        context,
+                        group,
+                        refusal.error_code,
+                        started,
+                        budget,
+                        seconds=3600 if refusal.error_code in BUDGET_PAUSE_ERRORS else 0,
+                    )
                     recorded = {item.work_id: ("deferred", refusal.error_code, "pending")}
                     group = (item,)
                 else:
                     # One commit for the group's vectors, for the same reason as one
                     # request for its texts: the per-item cost was the store's lock,
                     # not the work.  Then one record for the members it wrote.
-                    published_group = publish_embed_group(storage, clock, context, group, embed=embed,
-                                                          prepared_group=prepared_group,
-                                                          started=started, budget=budget)
-                    recorded = complete_embed_group(storage, clock, context, group, published=published_group,
-                                                    started=started, budget=budget)
+                    published_group = publish_embed_group(
+                        storage,
+                        clock,
+                        context,
+                        group,
+                        embed=embed,
+                        prepared_group=prepared_group,
+                        started=started,
+                        budget=budget,
+                    )
+                    recorded = complete_embed_group(
+                        storage, clock, context, group, published=published_group, started=started, budget=budget
+                    )
         disposition, error_code = "skipped", None
         for member in group:
             if member.work_id not in recorded:
@@ -442,27 +503,33 @@ def drain_worker(
         for index, member in enumerate(rest):
             member_budget = budget
             if len(group) > 1:
-                if _remaining(started, clock, lease_end) < GROUP_REQUEST_FLOOR_SECONDS:
+                if budget_left(started, clock, lease_end) < GROUP_REQUEST_FLOOR_SECONDS:
                     _release_group(storage, clock, context, rest[index:], "lease_ending", started, budget)
                     break
                 member_budget = min(budget, lease_end)
             claimed_types[member.work_type] += 1
-            run = (partial(_process_embed, embed=embed, prepared_group=prepared_group,
-                           published_group=published_group)
-                   if member.work_type == "embed" else processors[member.work_type])
+            run = (
+                partial(process_embed, embed=embed, prepared_group=prepared_group, published_group=published_group)
+                if member.work_type == "embed"
+                else processors[member.work_type]
+            )
             outcome = run(storage, clock, context, member, started=started, budget=member_budget)
             disposition, error_code, state = outcome
             dispositions[disposition] += 1
-            receipts.append(WorkerItemReceipt(member.work_id, member.work_type, disposition, state, error_code,
-                                              getattr(outcome, "detail", None)))
+            receipts.append(
+                WorkerItemReceipt(
+                    member.work_id, member.work_type, disposition, state, error_code, getattr(outcome, "detail", None)
+                )
+            )
             item = member
             refused = (disposition == "deferred" and error_code in BUDGET_PAUSE_ERRORS) or (
-                str(error_code or "").lower() in _RATE_LIMITED_ERRORS)
-            if refused or _remaining(started, clock, budget) <= 0:
+                str(error_code or "").lower() in _RATE_LIMITED_ERRORS
+            )
+            if refused or budget_left(started, clock, budget) <= 0:
                 # The rest of this group was leased for a request that is not
                 # going to be made. Hand it back unspent rather than holding it
                 # until the lease expires.
-                _release_group(storage, clock, context, rest[index + 1:], error_code, started, budget)
+                _release_group(storage, clock, context, rest[index + 1 :], error_code, started, budget)
                 break
         # Standing a work type down for the rest of the pass.  The per-item
         # backoff still decides when each item returns; this only decides how
@@ -490,11 +557,12 @@ def drain_worker(
             # eight a pass while its schedulers queued up to sixteen, so the
             # queue grew by eight a pass with no new conversation at all.
             if candidate_ceiling < config.max_items and not _other_work_ready(
-                    storage, clock, context, started, budget, allowed - {"evaluate_candidate"}):
+                storage, clock, context, started, budget, allowed - {"evaluate_candidate"}
+            ):
                 candidate_ceiling = config.max_items
             else:
                 allowed = allowed - {"evaluate_candidate"}
-        if _remaining(started, clock, budget) <= 0:
+        if budget_left(started, clock, budget) <= 0:
             break
     return WorkerReceipt(
         processed=len(receipts),

@@ -1,21 +1,20 @@
 """The durable gate fails closed across crashes and shares the caller's deadline."""
+
 from __future__ import annotations
 
 import json
 import os
-from pathlib import Path
 import signal
 import stat
 import subprocess
 import sys
 import threading
 import time
+from pathlib import Path
 
 import pytest
-
 from scope_recall.contracts import ContractError
 from scope_recall.vector import qdrant_mutation as mutation
-
 
 COLLECTION = "scope-recall-test"
 
@@ -54,7 +53,10 @@ else:
 """
     return subprocess.Popen(
         [sys.executable, "-u", "-c", script, str(repo), str(directory), action],
-        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
     )
 
 
@@ -221,7 +223,7 @@ def test_two_processes_serialize_empty_purge_inventory_after_write(tmp_path):
         observed = []
         reader = threading.Thread(target=lambda: observed.append(inventory.stdout.readline()), daemon=True)
         reader.start()
-        reader.join(.1)
+        reader.join(0.1)
         assert reader.is_alive()
         writer.stdin.write("complete\n")
         writer.stdin.flush()
@@ -245,10 +247,9 @@ def test_cross_process_lock_wait_consumes_deadline_before_guard(tmp_path):
         assert line(process) == "inventory"
         start = time.monotonic()
         with pytest.raises(TimeoutError):
-            with gate.mutation("delete", COLLECTION, start + .12,
-                               guard=lambda: calls.append("guard")):
+            with gate.mutation("delete", COLLECTION, start + 0.12, guard=lambda: calls.append("guard")):
                 pytest.fail("request")
-        assert .09 <= time.monotonic() - start < 1.0
+        assert 0.09 <= time.monotonic() - start < 1.0
         assert calls == []
         assert gate.status() is None
     finally:
@@ -270,7 +271,7 @@ def test_cross_thread_lock_and_guard_order(tmp_path):
     try:
         assert entered.wait(5)
         with pytest.raises(TimeoutError):
-            with gate.mutation("upsert", COLLECTION, future(.08), guard=lambda: pytest.fail("guard")):
+            with gate.mutation("upsert", COLLECTION, future(0.08), guard=lambda: pytest.fail("guard")):
                 pytest.fail("request")
         assert gate.status() is None
     finally:
@@ -351,8 +352,15 @@ def test_invalid_deadlines_do_not_create_marker(tmp_path, bad):
     assert gate.status() is None
 
 
-@pytest.mark.parametrize("field,value", [("operation", "payload with secret"), ("collection", "../escape"),
-                                         ("operation", "x" * 5000), ("collection", "x" * 5000)])
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("operation", "payload with secret"),
+        ("collection", "../escape"),
+        ("operation", "x" * 5000),
+        ("collection", "x" * 5000),
+    ],
+)
 def test_marker_metadata_is_bounded_identifiers(tmp_path, field, value):
     gate = mutation.QdrantMutationGate(tmp_path)
     args = {"operation": "upsert", "collection": COLLECTION, field: value}

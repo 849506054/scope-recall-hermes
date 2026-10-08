@@ -9,6 +9,7 @@ The provider takes a hundred texts per request and refuses more -- measured, not
 answered in 2.6s, 100 in 3.8s, 250 refused with HTTP 400 -- so a longer group is sent as
 consecutive full requests instead of being refused for its shape.
 """
+
 from __future__ import annotations
 
 import json
@@ -16,17 +17,15 @@ import sqlite3
 from types import SimpleNamespace
 
 import pytest
-
-from scope_recall.adapters.models import (
-    AuxiliaryModelError,
-    EMBED_REQUEST_CONCURRENCY,
-    MAX_EMBED_BATCH,
-    build_gemini_embed_body,
-)
 from scope_recall.core.work_storage import MAX_CLAIM_PAGE, MAX_RECOVERY_PAGE
 from scope_recall.core.worker import EMBED_BATCH_LIMIT, WorkerConfig
 from scope_recall.runtime.instance import _COUNT_BOUNDS
-
+from scope_recall.runtime.models import (
+    EMBED_REQUEST_CONCURRENCY,
+    MAX_EMBED_BATCH,
+    AuxiliaryModelError,
+    build_gemini_embed_body,
+)
 from test_v11_claims import app, capture  # noqa: F401  (fixtures)
 
 
@@ -52,20 +51,23 @@ class Recording:
 
 
 def _adapter(**options):
-    from scope_recall.adapters.models import GeminiEmbeddingAdapter
+    from scope_recall.runtime.models import GeminiEmbeddingAdapter
 
     made = Recording(**options)
     made.embed_texts = GeminiEmbeddingAdapter.embed_texts.__get__(made, Recording)
     return made
 
 
-@pytest.mark.parametrize("count,expected", [
-    (1, [1]),
-    (MAX_EMBED_BATCH, [MAX_EMBED_BATCH]),
-    (MAX_EMBED_BATCH + 1, [MAX_EMBED_BATCH, 1]),
-    (2 * MAX_EMBED_BATCH, [MAX_EMBED_BATCH, MAX_EMBED_BATCH]),
-    (EMBED_BATCH_LIMIT, [MAX_EMBED_BATCH] * (EMBED_BATCH_LIMIT // MAX_EMBED_BATCH)),
-])
+@pytest.mark.parametrize(
+    "count,expected",
+    [
+        (1, [1]),
+        (MAX_EMBED_BATCH, [MAX_EMBED_BATCH]),
+        (MAX_EMBED_BATCH + 1, [MAX_EMBED_BATCH, 1]),
+        (2 * MAX_EMBED_BATCH, [MAX_EMBED_BATCH, MAX_EMBED_BATCH]),
+        (EMBED_BATCH_LIMIT, [MAX_EMBED_BATCH] * (EMBED_BATCH_LIMIT // MAX_EMBED_BATCH)),
+    ],
+)
 def test_a_group_is_sent_as_full_requests(count, expected):
     adapter = _adapter()
     vectors = adapter.embed_texts([f"TEST 第{index}条" for index in range(count)], remaining_seconds=60)
@@ -75,8 +77,7 @@ def test_a_group_is_sent_as_full_requests(count, expected):
 
 def test_no_text_is_lost_or_reordered_across_requests():
     adapter = _adapter()
-    vectors = adapter.embed_texts([f"TEST {index}" for index in range(MAX_EMBED_BATCH + 7)],
-                                  remaining_seconds=60)
+    vectors = adapter.embed_texts([f"TEST {index}" for index in range(MAX_EMBED_BATCH + 7)], remaining_seconds=60)
     # The recording adapter answers with the index inside each request, so the
     # sequence proves the chunks were concatenated in order and none was dropped.
     assert [int(first) for first, _second in vectors] == list(range(MAX_EMBED_BATCH)) + list(range(7))
@@ -121,8 +122,7 @@ def test_reopening_failures_keeps_its_own_page(app):
     with sqlite3.connect(core.storage.path) as conn:
         conn.execute("UPDATE work_items SET state='done' WHERE work_type='consolidate'")
         conn.commit()
-    receipt = core.drain_worker(ctx, max_items=1000, remaining_seconds=30, owner_id="TEST-recover",
-                               embed=GroupEmbed())
+    receipt = core.drain_worker(ctx, max_items=1000, remaining_seconds=30, owner_id="TEST-recover", embed=GroupEmbed())
     assert receipt.completed == len(made), receipt
 
 
@@ -185,13 +185,13 @@ def test_a_group_asks_its_requests_at_the_same_time():
                 self.live += 1
                 self.most = max(self.most, self.live)
             try:
-                time.sleep(0.05)                      # a request is mostly waiting
+                time.sleep(0.05)  # a request is mostly waiting
                 return super()._embed_many(texts, remaining_seconds=remaining_seconds)
             finally:
                 with self._lock:
                     self.live -= 1
 
-    from scope_recall.adapters.models import GeminiEmbeddingAdapter
+    from scope_recall.runtime.models import GeminiEmbeddingAdapter
 
     adapter = Concurrent()
     adapter.embed_texts = GeminiEmbeddingAdapter.embed_texts.__get__(adapter, Concurrent)
@@ -230,4 +230,3 @@ def test_a_text_too_long_for_any_request_still_goes_alone():
     adapter = _adapter(max_request_bytes=1000)
     adapter.embed_texts(["TEST short", "TEST " + "x" * 5000, "TEST also short"], remaining_seconds=60)
     assert adapter.requests == [1, 1, 1]
-

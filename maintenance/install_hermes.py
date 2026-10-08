@@ -1,24 +1,33 @@
 """Hermes host: the distribution templates and setup skill it installs, plus the
 manifest-bound instance a receipt-backed uninstall verifies."""
+
 from __future__ import annotations
 
 from pathlib import Path
 
 from packaging.version import Version
-
 from scope_recall._version import __version__
 from scope_recall.adapters.hermes.audiences import (
-    LOCAL_PLATFORMS, HermesIdentityError, normalize_local_platforms, normalize_owner_logins,
+    LOCAL_PLATFORMS,
+    HermesIdentityError,
+    normalize_local_platforms,
+    normalize_owner_logins,
 )
 from scope_recall.adapters.hermes.installation import (
     approve_local_platforms as _approve_local_platforms,
+)
+from scope_recall.adapters.hermes.installation import (
     attachment_path,
     install_hermes_scope_recall,
     load_binding_for_home,
     load_installation_manifest,
-    unapproved_local_platforms as _unapproved_local_platforms,
-    unapproved_owner_logins as _unapproved_owner_logins,
     write_installation_manifest,
+)
+from scope_recall.adapters.hermes.installation import (
+    unapproved_local_platforms as _unapproved_local_platforms,
+)
+from scope_recall.adapters.hermes.installation import (
+    unapproved_owner_logins as _unapproved_owner_logins,
 )
 
 from .install_common import (
@@ -26,8 +35,8 @@ from .install_common import (
     SKILLS,
     InstallError,
     InstallPlan,
-    _reject_symlink_chain,
-    _validate_identifier,
+    reject_symlink_chain,
+    validate_identifier,
 )
 
 # Hermes 0.21+ ``_memory_provider_init_kwargs`` hardcodes agent_workspace="hermes".
@@ -70,7 +79,7 @@ def validate_options(agent_workspace: str | None, env_file: Path | str | None) -
     """Hermes processes inherit the gateway environment and must not carry a
     second credential path; the audience workspace defaults to the host value."""
     workspace = "" if agent_workspace is None else str(agent_workspace).strip()
-    workspace = _validate_identifier(workspace or DEFAULT_AGENT_WORKSPACE, "agent_workspace")
+    workspace = validate_identifier(workspace or DEFAULT_AGENT_WORKSPACE, "agent_workspace")
     if env_file is not None and str(env_file).strip() != "":
         raise InstallError("env_file is only used for Codex installation")
     return workspace, None
@@ -167,8 +176,11 @@ def unapproved_owner_logins(plan: InstallPlan) -> tuple[tuple[str, str], ...]:
 def approve_local_platforms(plan: InstallPlan) -> None:
     """Write the approvals, surfaces and logins, into an existing installation's manifest; the store is not touched."""
     manifest = load_installation_manifest(plan.instance_root)
-    write_installation_manifest(_approve_local_platforms(
-        manifest, plan.local_platforms, agent_workspace=_bound_workspace(manifest), logins=plan.owner_logins))
+    write_installation_manifest(
+        _approve_local_platforms(
+            manifest, plan.local_platforms, agent_workspace=_bound_workspace(manifest), logins=plan.owner_logins
+        )
+    )
 
 
 def installation_id(instance_root: Path) -> str:
@@ -197,17 +209,19 @@ def validate_reuse(plan: InstallPlan) -> None:
         raise InstallError("existing Hermes installation agent_workspace mismatch")
     if manifest.test_mode != plan.test_mode:
         raise InstallError(
-            "existing Hermes installation test_mode mismatch: "
-            f"stored={manifest.test_mode}, requested={plan.test_mode}"
+            f"existing Hermes installation test_mode mismatch: stored={manifest.test_mode}, requested={plan.test_mode}"
         )
     if not (manifest.data_directory / "memory.sqlite3").is_file():
         raise InstallError("existing Hermes installation database is missing")
     if manifest.entry_id is not None and (
-            _unapproved_local_platforms(manifest, plan.local_platforms, agent_workspace=_bound_workspace(manifest))
-            or _unapproved_owner_logins(manifest, plan.owner_logins, agent_workspace=_bound_workspace(manifest))):
+        _unapproved_local_platforms(manifest, plan.local_platforms, agent_workspace=_bound_workspace(manifest))
+        or _unapproved_owner_logins(manifest, plan.owner_logins, agent_workspace=_bound_workspace(manifest))
+    ):
         # Its grants live in the shared store's manifest, which this installer does not write.
-        raise InstallError("a shared store entry keeps the grants it was attached with; approve a local "
-                           "surface or an owner login in the home's own installation before attaching it")
+        raise InstallError(
+            "a shared store entry keeps the grants it was attached with; approve a local "
+            "surface or an owner login in the home's own installation before attaching it"
+        )
 
 
 def purge_identity(instance_root: Path) -> tuple[Path, str, str, Path]:
@@ -215,6 +229,6 @@ def purge_identity(instance_root: Path) -> tuple[Path, str, str, Path]:
     if attachment_path(instance_root).exists():
         raise InstallError("an entry of a shared store is never purged from its home; detach it instead")
     manifest = load_installation_manifest(instance_root)
-    _reject_symlink_chain(manifest.data_directory)
+    reject_symlink_chain(manifest.data_directory)
     data_directory = manifest.data_directory.resolve()
     return data_directory, manifest.installation_id, manifest.agent_id, data_directory / "installation.json"

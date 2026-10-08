@@ -4,6 +4,7 @@ Pipe I/O runs off the caller thread so the deadline also bounds blocked writes.
 Timeout/cancellation/protocol failure discards the helper, never replays a POST.
 Only the next caller may start a replacement. Stderr is never retained or logged.
 """
+
 from __future__ import annotations
 
 import atexit
@@ -56,8 +57,7 @@ class HttpWorkerSession:
         self._closed = True
         self.discard()
 
-    def exchange(self, command, request, *, deadline, max_stdout, startupinfo, creationflags,
-                 environment=None):
+    def exchange(self, command, request, *, deadline, max_stdout, startupinfo, creationflags, environment=None):
         """``environment`` is the helper's environment; ``None`` inherits this
         process's own, which is what a route that states no proxy wants."""
         if not self._lock.acquire(timeout=max(0, deadline - time.monotonic())):
@@ -70,9 +70,13 @@ class HttpWorkerSession:
             if self._process is None or self._process.poll() is not None:
                 self.discard()
                 self._process = subprocess.Popen(
-                    [*command, "--persistent"], stdin=subprocess.PIPE,
-                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=environment,
-                    startupinfo=startupinfo, creationflags=creationflags,
+                    [*command, "--persistent"],
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    env=environment,
+                    startupinfo=startupinfo,
+                    creationflags=creationflags,
                 )
             process = self._process
             if self._closed:  # close may race with process creation

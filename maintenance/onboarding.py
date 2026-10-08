@@ -2,21 +2,19 @@
 
 from __future__ import annotations
 
+import sqlite3
 from contextlib import closing
 from pathlib import Path
-import sqlite3
 
-from .backup import _safe_path
+from .backup import safe_path
 
 WORKFLOW = Path(__file__).with_name("AGENT_WORKFLOW.md")
 
 
-def inspect_installation(
-    home: str | Path, *, host: str = "hermes", database: str | Path | None = None
-) -> dict:
+def inspect_installation(home: str | Path, *, host: str = "hermes", database: str | Path | None = None) -> dict:
     if host not in {"hermes", "codex"}:
         raise ValueError("unsupported host")
-    root = _safe_path(home)
+    root = safe_path(home)
     candidates = (
         [root / "scope-recall" / "memory.sqlite3", root / "lancepro" / "memory.sqlite3"]
         if host == "hermes"
@@ -26,7 +24,7 @@ def inspect_installation(
     if database is not None:
         # Host configuration can select a nonstandard legacy location. An
         # explicit missing database is damage, never a fresh installation.
-        databases = [_safe_path(database, must_exist=True)]
+        databases = [safe_path(database, must_exist=True)]
     result = dict(
         format="scope-recall.agent-setup/1",
         host=host,
@@ -59,16 +57,11 @@ def inspect_installation(
                 safe_action="restore_verified_backup",
             )
         return result
-    database = _safe_path(databases[0], must_exist=True)
+    database = safe_path(databases[0], must_exist=True)
     try:
         with closing(sqlite3.connect(database.as_uri() + "?mode=ro", uri=True)) as conn:
             conn.execute("PRAGMA query_only=ON")
-            tables = {
-                r[0]
-                for r in conn.execute(
-                    "SELECT name FROM sqlite_master WHERE type='table'"
-                )
-            }
+            tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
             schema = conn.execute("PRAGMA user_version").fetchone()[0]
             result["database_schema"] = schema
     except sqlite3.DatabaseError:
@@ -79,11 +72,7 @@ def inspect_installation(
             safe_action="keep_original_and_restore_backup",
         )
     if {"source_events", "instance_meta"} <= tables:
-        manifest = root / (
-            "scope-recall/installation.json"
-            if host == "hermes"
-            else "codex-installation.json"
-        )
+        manifest = root / ("scope-recall/installation.json" if host == "hermes" else "codex-installation.json")
         if not manifest.is_file():
             return dict(
                 result,

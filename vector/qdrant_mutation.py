@@ -12,17 +12,19 @@ need a server-side fencing protocol. Keep this directory on a trusted durable
 local filesystem. Blocking filesystem syscalls cannot be preempted; deadline
 checks surround them, and elapsed persistence never authorizes a request.
 """
+
 from __future__ import annotations
 
-from contextlib import contextmanager
 import json
 import math
 import os
-from pathlib import Path
 import re
 import stat
 import time
-from typing import Any, Callable, Iterator
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from pathlib import Path
+from typing import Any
 from uuid import uuid4
 
 from ..contracts import ContractError
@@ -114,27 +116,32 @@ class QdrantMutationGate:
         except OSError:
             raise _uncertain() from None
         try:
-            if (not stat.S_ISREG(before.st_mode) or before.st_nlink != 1
-                    or not 0 < before.st_size <= _MAX_MARKER_BYTES):
+            if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1 or not 0 < before.st_size <= _MAX_MARKER_BYTES:
                 raise _uncertain()
             flags = os.O_RDONLY | _NOFOLLOW | _NONBLOCK
             descriptor = os.open(self.pending_path, flags)
             with os.fdopen(descriptor, "rb") as handle:
                 opened = os.fstat(handle.fileno())
-                if (not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1
-                        or (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino)
-                        or not 0 < opened.st_size <= _MAX_MARKER_BYTES):
+                if (
+                    not stat.S_ISREG(opened.st_mode)
+                    or opened.st_nlink != 1
+                    or (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino)
+                    or not 0 < opened.st_size <= _MAX_MARKER_BYTES
+                ):
                     raise _uncertain()
                 raw = handle.read(_MAX_MARKER_BYTES + 1)
             if len(raw) > _MAX_MARKER_BYTES:
                 raise _uncertain()
             value = json.loads(raw)
-            if (not isinstance(value, dict)
-                    or set(value) - {"ids"} != _MARKER_KEYS
-                    or type(value["version"]) is not int or value["version"] != 1
-                    or not isinstance(value["operation_id"], str)
-                    or not _OPERATION_ID.fullmatch(value["operation_id"])
-                    or ("ids" in value and not _valid_ids(value["ids"]))):
+            if (
+                not isinstance(value, dict)
+                or set(value) - {"ids"} != _MARKER_KEYS
+                or type(value["version"]) is not int
+                or value["version"] != 1
+                or not isinstance(value["operation_id"], str)
+                or not _OPERATION_ID.fullmatch(value["operation_id"])
+                or ("ids" in value and not _valid_ids(value["ids"]))
+            ):
                 raise _uncertain()
             _metadata(value["operation"], value["collection"])
             return value
@@ -176,8 +183,7 @@ class QdrantMutationGate:
         if len(raw) > _MAX_MARKER_BYTES:
             raise _uncertain()
         try:
-            descriptor = os.open(self.pending_path,
-                                 os.O_WRONLY | os.O_CREAT | os.O_EXCL | _NOFOLLOW, 0o600)
+            descriptor = os.open(self.pending_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | _NOFOLLOW, 0o600)
             with os.fdopen(descriptor, "wb") as handle:
                 info = os.fstat(handle.fileno())
                 if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
@@ -223,9 +229,14 @@ class QdrantMutationGate:
             self._clear(marker, deadline)
 
     @contextmanager
-    def mutation(self, operation: str, collection: str, deadline: float,
-                 guard: Callable[[], bool] | None = None,
-                 ids: list[str] | None = None) -> Iterator[MutationReceipt]:
+    def mutation(
+        self,
+        operation: str,
+        collection: str,
+        deadline: float,
+        guard: Callable[[], bool] | None = None,
+        ids: list[str] | None = None,
+    ) -> Iterator[MutationReceipt]:
         """Mark before yielding; clear only after complete() and a clean, timely exit.
 
         A false guard raises LeaseFenceRejected before marking/yielding. Guard
@@ -249,13 +260,11 @@ class QdrantMutationGate:
             if guard is not None and not guard():
                 raise LeaseFenceRejected("qdrant mutation lease fence rejected")
             _remaining(deadline)
-            marker = {"version": 1, "collection": collection,
-                      "operation_id": uuid4().hex, "operation": operation}
+            marker = {"version": 1, "collection": collection, "operation_id": uuid4().hex, "operation": operation}
             if ids is not None:
                 candidate = {**marker, "ids": list(ids)}
                 if _valid_ids(candidate["ids"]) and (
-                    len(json.dumps(candidate, sort_keys=True,
-                                   separators=(",", ":")).encode("ascii"))
+                    len(json.dumps(candidate, sort_keys=True, separators=(",", ":")).encode("ascii"))
                     <= _MAX_MARKER_BYTES // 2
                 ):
                     marker = candidate

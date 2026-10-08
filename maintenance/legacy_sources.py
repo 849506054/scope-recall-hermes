@@ -4,20 +4,29 @@ Every legacy record that carries content or history is archived as an imported
 source event so later authority (claims, episodes, deletions) can cite it by a
 stable Core id instead of a legacy row identity.
 """
+
 from __future__ import annotations
 
-from collections import defaultdict
 import hashlib
 import json
 import re
+from collections import defaultdict
 from typing import Any, Mapping, cast
 
 from scope_recall.maintenance.legacy_v2_compat import resolve_memory_scope
 
-from .legacy_catalog import _DIGEST_TABLES, _HISTORY
+from .legacy_catalog import DIGEST_TABLES, HISTORY_TABLES
 from .legacy_plan import Conversion, Row
 from .migration_records import (
-    LEGACY_BASELINE, _canon, _digest, _json, _recorded, _safe, _safe_text, _stable, _time,
+    LEGACY_BASELINE,
+    canonical_digest,
+    canonical_json,
+    json_value,
+    parse_instant,
+    recorded_time,
+    sanitized_text,
+    sanitized_value,
+    stable_legacy_id,
 )
 
 SOURCE_EVENT_FIELDS = (
@@ -63,7 +72,13 @@ _ROLE_ORIGINS = {
 }
 _SCOPE_MODES = ("local", "shared", "shared_pool")
 _JOURNAL_EXTRA = (
-    "turn_number", "platform", "user_id", "chat_id", "thread_id", "agent_identity", "agent_workspace",
+    "turn_number",
+    "platform",
+    "user_id",
+    "chat_id",
+    "thread_id",
+    "agent_identity",
+    "agent_workspace",
 )
 _DIGEST_EXTRA = {
     "memory_digest_sources": {
@@ -81,20 +96,21 @@ _DIGEST_EXTRA = {
 
 # --- row readers -----------------------------------------------------------
 
+
 def _role_origin(role: object) -> tuple[str, str]:
     return _ROLE_ORIGINS.get(str(role or "").lower(), ("unknown", "origin_unknown"))
 
 
 def _metadata(row: Row) -> dict[str, Any]:
-    value = _json(row.get("metadata"), {})
+    value = json_value(row.get("metadata"), {})
     return value if isinstance(value, dict) else {}
 
 
-def _text_or_none(value: object) -> str | None:
+def text_or_none(value: object) -> str | None:
     return str(value) if value is not None else None
 
 
-def _scope_value(row: Row) -> str | None:
+def own_scope_id(row: Row) -> str | None:
     """The row's own scope, or None when the column is absent or empty."""
     value = row.get("scope_id")
     return None if value is None or value == "" else str(value)
@@ -104,23 +120,23 @@ def _by_id(rows: list[Row], key: str) -> dict[str, Row]:
     return {str(row.get(key)): row for row in rows}
 
 
-def _json_list(value: object) -> list[object]:
-    parsed = _json(value, [])
+def json_list(value: object) -> list[object]:
+    parsed = json_value(value, [])
     return parsed if isinstance(parsed, list) else []
 
 
-def _evidence_items(value: object) -> list[dict[str, Any]]:
-    return [item for item in _json_list(value) if isinstance(item, dict)]
+def evidence_items(value: object) -> list[dict[str, Any]]:
+    return [item for item in json_list(value) if isinstance(item, dict)]
 
 
-def _safe_list(value: object) -> list[str]:
+def sanitized_list(value: object) -> list[str]:
     return [
-        _safe_text(item)[0] if isinstance(item, str) else _canon(_safe(item))
-        for item in _json_list(value)
+        sanitized_text(item)[0] if isinstance(item, str) else canonical_json(sanitized_value(item))
+        for item in json_list(value)
     ]
 
 
-def _anchor_ref(anchor: dict[str, Any]) -> object:
+def anchor_ref(anchor: dict[str, Any]) -> object:
     return anchor.get("source_ref") or anchor.get("source_id") or anchor.get("ref")
 
 
@@ -132,7 +148,7 @@ def journal_links(rows: dict[str, list[Row]]) -> dict[str, list[str]]:
     return links
 
 
-def _scope(row: Row) -> dict[str, Any]:
+def scope_descriptor(row: Row) -> dict[str, Any]:
     """Use resolved old scope_id; shared_scope_id alone is not a block."""
     metadata = _metadata(row)
     source_scope = str(row.get("__legacy_source_scope_id") or row.get("scope_id") or "legacy-scope")
@@ -159,7 +175,7 @@ def _scope(row: Row) -> dict[str, Any]:
     }
 
 
-def _map_scope_rows(
+def map_scope_rows(
     rows: list[Row],
     mapping: Mapping[str, str],
     *,
@@ -168,7 +184,7 @@ def _map_scope_rows(
     """Rewrite scope_id through the handoff map, remembering the source scope."""
     mapped: list[Row] = []
     for row in rows:
-        source = _scope_value(row)
+        source = own_scope_id(row)
         if source is None and default_source_scope is not None:
             row = {**row, "scope_id": default_source_scope, "__legacy_default_scope": default_source_scope}
             source = default_source_scope
@@ -185,7 +201,7 @@ def _map_scope_rows(
     return mapped
 
 
-def _resolve(
+def resolve_evidence_ref(
     raw: object,
     source_type: object,
     journals: dict[str, str],
@@ -210,6 +226,7 @@ def _resolve(
 
 # --- source events ---------------------------------------------------------
 
+
 def _source_event(
     table: str,
     identity: str,
@@ -223,8 +240,8 @@ def _source_event(
 ) -> Row:
     key = f"legacy:{table}:{identity}"
     stamp = row.get("created_at") or row.get("updated_at") or row.get("started_at")
-    occurred, precision = _time(stamp)
-    recorded = _recorded(row.get("updated_at") or row.get("created_at") or row.get("started_at"))
+    occurred, precision = parse_instant(stamp)
+    recorded = recorded_time(row.get("updated_at") or row.get("created_at") or row.get("started_at"))
     role = _role_origin(row.get("role"))[0] if table == "journal_entries" else "unknown"
     body = {
         "protocol_version": "1.1",
@@ -245,10 +262,10 @@ def _source_event(
         "source_kind": kind,
         "redaction_applied": redacted,
         "scope_authorization": scope,
-        **cast(dict[str, Any], _safe(extra)),
+        **cast(dict[str, Any], sanitized_value(extra)),
     }
     return {
-        "event_id": _stable("event", f"{table}:{identity}"),
+        "event_id": stable_legacy_id("event", f"{table}:{identity}"),
         "source_event_key": key,
         "source_revision": 1,
         "source_group_key": key,
@@ -256,13 +273,13 @@ def _source_event(
         "segment_total": None,
         "scope_id": scope["row_scope_id"],
         "session_id": str(row.get("session_id") or f"legacy-session-{scope['row_scope_id']}"),
-        "project_id": _text_or_none(row.get("project_id")),
-        "branch_id": _text_or_none(row.get("branch_id")),
+        "project_id": text_or_none(row.get("project_id")),
+        "branch_id": text_or_none(row.get("branch_id")),
         "origin": "imported",
         "role": role,
         "content": content,
         "content_sha256": hashlib.sha256(content.encode()).hexdigest(),
-        "event_sha256": _digest(body),
+        "event_sha256": canonical_digest(body),
         "occurred_at": occurred,
         "recorded_at": recorded,
         "persisted_at": recorded,
@@ -270,9 +287,9 @@ def _source_event(
         "capture_state": "complete",
         "source_original_origin": original,
         "dataset_id": "legacy-578b",
-        "import_provenance_sha256": _digest({"baseline": LEGACY_BASELINE, "key": key}),
-        "extra_json": _canon(extra_payload),
-        "capture_gaps_json": _canon([scope["gap"]] if scope["gap"] else []),
+        "import_provenance_sha256": canonical_digest({"baseline": LEGACY_BASELINE, "key": key}),
+        "extra_json": canonical_json(extra_payload),
+        "capture_gaps_json": canonical_json([scope["gap"]] if scope["gap"] else []),
         "read_blocked": int(bool(scope["gap"])),
         "suppressed": 0,
         "scope_gap": scope["gap"],
@@ -297,16 +314,33 @@ def archive(
     item = _source_event(table, identity, row, scope, content, kind, original, extra, redacted)
     cv.sources.append(item)
     if scope["gap"]:
-        cv.unmapped(table, item["source_event_key"], scope["gap"], scope_authorization=_safe(scope))
+        cv.unmapped(table, item["source_event_key"], scope["gap"], scope_authorization=sanitized_value(scope))
     return item
 
 
-def _archive_record(cv: Conversion, table: str, identity: str, scope_row: Row, row: Row, kind: str, scope: dict[str, Any] | None = None, **extra: Any) -> Row:
+def _archive_record(
+    cv: Conversion,
+    table: str,
+    identity: str,
+    scope_row: Row,
+    row: Row,
+    kind: str,
+    scope: dict[str, Any] | None = None,
+    **extra: Any,
+) -> Row:
     """Archive a row whose content is its own sanitized canonical JSON."""
-    content, changed = _safe_text(_canon(_safe(row)))
+    content, changed = sanitized_text(canonical_json(sanitized_value(row)))
     item = archive(
-        cv, table, identity, {**scope_row, "id": identity}, content, kind, "origin_unknown",
-        {"legacy_row": _safe(row), **extra}, scope if scope is not None else _scope(scope_row), changed,
+        cv,
+        table,
+        identity,
+        {**scope_row, "id": identity},
+        content,
+        kind,
+        "origin_unknown",
+        {"legacy_row": sanitized_value(row), **extra},
+        scope if scope is not None else scope_descriptor(scope_row),
+        changed,
     )
     cv.archives[(table, identity)] = item["event_id"]
     return item
@@ -315,11 +349,19 @@ def _archive_record(cv: Conversion, table: str, identity: str, scope_row: Row, r
 def archive_journal(cv: Conversion) -> None:
     for row in cv.rows["journal_entries"]:
         role, original = _role_origin(row.get("role"))
-        content, changed = _safe_text(row.get("content"))
+        content, changed = sanitized_text(row.get("content"))
         extra = {"role": role, **{key: row.get(key) for key in _JOURNAL_EXTRA}, "metadata": _metadata(row)}
         item = archive(
-            cv, "journal_entries", str(row.get("id") or "unknown"), row, content,
-            "raw_event", original, extra, _scope(row), changed,
+            cv,
+            "journal_entries",
+            str(row.get("id") or "unknown"),
+            row,
+            content,
+            "raw_event",
+            original,
+            extra,
+            scope_descriptor(row),
+            changed,
         )
         cv.journal_refs[str(row.get("id"))] = item["event_id"]
 
@@ -327,14 +369,14 @@ def archive_journal(cv: Conversion) -> None:
 def archive_memories(cv: Conversion) -> None:
     links = journal_links(cv.rows)
     for row in cv.rows["memories"]:
-        content, changed_content = _safe_text(row.get("content") or row.get("summary"))
-        summary, changed_summary = _safe_text(row.get("summary"))
+        content, changed_content = sanitized_text(row.get("content") or row.get("summary"))
+        summary, changed_summary = sanitized_text(row.get("summary"))
         meta = _metadata(row)
         ids = list(links.get(str(row.get("id")), []))
-        for ref in _json_list(meta.get("journal_entry_ids")):
+        for ref in json_list(meta.get("journal_entry_ids")):
             if str(ref) not in ids:
                 ids.append(str(ref))
-        scope = _scope(row)
+        scope = scope_descriptor(row)
         if cv.memory_authority is not None:
             scope = resolve_memory_scope(row, scope, authority=cv.memory_authority)
         extra = {
@@ -345,8 +387,16 @@ def archive_memories(cv: Conversion) -> None:
             "legacy_metadata": meta,
         }
         item = archive(
-            cv, "memories", str(row.get("id") or "unknown"), row, content,
-            "durable_memory_evidence", "origin_unknown", extra, scope, changed_content or changed_summary,
+            cv,
+            "memories",
+            str(row.get("id") or "unknown"),
+            row,
+            content,
+            "durable_memory_evidence",
+            "origin_unknown",
+            extra,
+            scope,
+            changed_content or changed_summary,
         )
         cv.memory_refs[str(row.get("id"))] = item["event_id"]
         cv.memory_items[str(row.get("id"))] = item
@@ -362,17 +412,31 @@ def archive_fact_records(cv: Conversion) -> None:
         identity = str(row.get("evidence_id") or row.get("claim_id") or "unknown")
         scope_row = row if row.get("scope_id") else _inherit(row, facts.get(str(row.get("claim_id")), {}))
         archive_row = {**row, "project_id": scope_row.get("project_id"), "branch_id": scope_row.get("branch_id")}
-        _archive_record(cv, "fact_claim_evidence", identity, archive_row, row, "legacy_fact_record", _scope(scope_row))
+        _archive_record(
+            cv, "fact_claim_evidence", identity, archive_row, row, "legacy_fact_record", scope_descriptor(scope_row)
+        )
 
 
 def _inherit(row: Row, parent: Row) -> Row:
-    return {**row, "scope_id": parent.get("scope_id"), "project_id": parent.get("project_id"), "branch_id": parent.get("branch_id")}
+    return {
+        **row,
+        "scope_id": parent.get("scope_id"),
+        "project_id": parent.get("project_id"),
+        "branch_id": parent.get("branch_id"),
+    }
 
 
 def report_target_tombstones(cv: Conversion) -> None:
     for row in cv.rows["privacy_purge_tombstones"]:
-        identity = _digest({key: row.get(key) for key in ("operation_id", "target_hash", "content_hash", "erased_at")})
-        cv.unmapped("privacy_purge_tombstones", identity, "unmapped_target_tombstone_blocks_cutover", redacted_row=_safe(row))
+        identity = canonical_digest(
+            {key: row.get(key) for key in ("operation_id", "target_hash", "content_hash", "erased_at")}
+        )
+        cv.unmapped(
+            "privacy_purge_tombstones",
+            identity,
+            "unmapped_target_tombstone_blocks_cutover",
+            redacted_row=sanitized_value(row),
+        )
 
 
 def _history_parent(table: str, row: Row, parents: dict[str, dict[str, Row]]) -> Row:
@@ -394,17 +458,23 @@ def archive_history(cv: Conversion) -> None:
         "memories": _by_id(cv.rows["memories"], "id"),
         "fact_claims": _by_id(cv.rows["fact_claims"], "claim_id"),
     }
-    for table in sorted(_HISTORY | {"procedural_playbooks", "playbook_versions"}):
+    for table in sorted(HISTORY_TABLES | {"procedural_playbooks", "playbook_versions"}):
         for row in cv.rows[table]:
             identity = str(
-                row.get("id") or row.get("action_id") or row.get("evidence_id")
-                or row.get("playbook_id") or row.get("version") or "unknown"
+                row.get("id")
+                or row.get("action_id")
+                or row.get("evidence_id")
+                or row.get("playbook_id")
+                or row.get("version")
+                or "unknown"
             )
             scope_row = row
             if not row.get("scope_id"):
                 parent = _history_parent(table, row, parents)
                 if not parent.get("scope_id"):
-                    cv.unmapped(table, identity, "history_scope_unresolved_blocks_cutover", redacted_row=_safe(row))
+                    cv.unmapped(
+                        table, identity, "history_scope_unresolved_blocks_cutover", redacted_row=sanitized_value(row)
+                    )
                     continue
                 scope_row = _inherit(row, parent)
             _archive_record(cv, table, identity, scope_row, row, "legacy_history")
@@ -421,7 +491,7 @@ def archive_digests(cv: Conversion) -> None:
     """
     memories = _by_id(cv.rows["memories"], "id")
     next_segment: dict[str, int] = {}
-    for table in sorted(_DIGEST_TABLES):
+    for table in sorted(DIGEST_TABLES):
         for row in cv.rows[table]:
             parent_item = None
             attached = False
@@ -476,5 +546,5 @@ def archive_sources(cv: Conversion) -> None:
     archive_history(cv)
     archive_digests(cv)
     cv.episode_refs = {
-        str(row.get("id")): _stable("episode", row.get("id")) for row in cv.rows["task_episodes"]
+        str(row.get("id")): stable_legacy_id("episode", row.get("id")) for row in cv.rows["task_episodes"]
     }
