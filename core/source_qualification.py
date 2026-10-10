@@ -211,12 +211,7 @@ def _pasted_at(content: str, position: int) -> bool:
     before = content[:position]
     fenced, outside = _outside_fences(before)
     line = before[before.rfind("\n") + 1 :]
-    return (
-        fenced
-        or _SPEAKER_LABEL.search(outside) is not None
-        or _quote_open(outside)
-        or line.lstrip().startswith(">")
-    )
+    return fenced or _SPEAKER_LABEL.search(outside) is not None or _quote_open(outside) or line.lstrip().startswith(">")
 
 
 def in_pasted_text(content: str, quote: str) -> bool:
