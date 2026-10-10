@@ -190,19 +190,30 @@ def _outside_fences(before: str) -> tuple[bool, str]:
 
 #: Quotation marks that open and close as a pair; a straight double quote does both.
 _QUOTE_PAIRS = (("“", "”"), ("「", "」"), ("『", "』"))
-#: A right single quote closes a quotation opened with ``‘``, unless a letter follows it: then it is an apostrophe
-#: (don’t, Alice’s).
-_CLOSING_SINGLE = re.compile(r"’(?![^\W\d_])")
+
+
+def _single_quote_open(text: str) -> bool:
+    """Whether a quotation in single quotes (‘ or '), opened at the start of a line, is still open at the end of
+    ``text``; it closes at the end of a line ending in a single quote.  Inside a line a single quote is as often an
+    apostrophe (don’t, the others’ choices) as a mark, so only a line's two ends are read."""
+    opened = False
+    for line in text.split("\n"):
+        line = line.strip()
+        if not opened and line[:1] in ("‘", "'"):
+            opened, line = True, line[1:]
+        if opened and line[-1:] in ("’", "'"):
+            opened = False
+    return opened
 
 
 def _quote_open(text: str) -> bool:
     """Whether a quotation opened in ``text`` is still open, across lines too: a pair's opening marks outnumber its
-    closing ones, or straight double quotes stand in an odd number.  Straight single quotes are left out: most are
-    apostrophes."""
+    closing ones, straight double quotes stand in an odd number, or a single-quoted one is open
+    (``_single_quote_open``)."""
     return (
         text.count('"') % 2 == 1
-        or text.count("‘") > len(_CLOSING_SINGLE.findall(text))
         or any(text.count(start) > text.count(end) for start, end in _QUOTE_PAIRS)
+        or _single_quote_open(text)
     )
 
 
