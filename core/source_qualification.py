@@ -185,17 +185,34 @@ def _fence_open(before: str) -> bool:
     return opened is not None
 
 
+#: Quotation marks that open and close as a pair; a straight double quote does both.
+_QUOTE_PAIRS = (("“", "”"), ("「", "」"), ("『", "』"))
+
+
+def _quote_open(before: str) -> bool:
+    """Whether a quotation opened in ``before`` is still open, across lines too: a pair's opening marks outnumber its
+    closing ones, or straight double quotes stand in an odd number.  Single quotes are left out: most are
+    apostrophes."""
+    return before.count('"') % 2 == 1 or any(before.count(start) > before.count(end) for start, end in _QUOTE_PAIRS)
+
+
 def _pasted_at(content: str, position: int) -> bool:
     before = content[:position]
     line = before[before.rfind("\n") + 1 :]
-    return _SPEAKER_LABEL.search(before) is not None or _fence_open(before) or line.lstrip().startswith(">")
+    return (
+        _SPEAKER_LABEL.search(before) is not None
+        or _fence_open(before)
+        or _quote_open(before)
+        or line.lstrip().startswith(">")
+    )
 
 
 def in_pasted_text(content: str, quote: str) -> bool:
     """Whether a first person in the quoted words stands in text the owner pasted rather than said, judged in the
-    whole message: after a line opening with a speaker's label (``_SPEAKER_LABEL``), inside a fenced block, or on a
-    quoted line (``> ...``).  A claim's evidence is read in a context narrowed to the quote's sentence, which leaves
-    all three out (``Alice:`` ... ``My preference is blue.``), and a quote may hold a fence's opening line itself."""
+    whole message: after a line opening with a speaker's label (``_SPEAKER_LABEL``), inside a fenced block, inside a
+    quotation still open across lines, or on a quoted line (``> ...``).  A claim's evidence is read in a context
+    narrowed to the quote's sentence, which leaves all of these out (``Alice:`` ... ``My preference is blue.``), and a
+    quote may hold a fence's opening line itself."""
     at = content.rfind(quote) if quote else -1
     if at < 0:
         return False
