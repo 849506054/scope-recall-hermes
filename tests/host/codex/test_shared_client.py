@@ -3856,6 +3856,10 @@ _NEEDS_NODE = pytest.mark.skipif(not _node_ok(), reason="node 20.6 or later is n
 
 
 def _run_plugin(config: dict, scenario: str = "turn", env: dict | None = None) -> dict:
+    # The plugin ends a prompt hook at 9 s, answered or not.  On a slow Windows runner one outlived that before it
+    # stored the prompt, which the Stop then stored from the turn's messages (``record:u-0``, not ``user:1``); the
+    # plugin takes the answer as soon as it is whole, so the longest wait it allows costs a test nothing.
+    config = {"recallTimeoutMs": 30_000, **config}
     process = subprocess.run(
         [
             NODE,
@@ -3936,7 +3940,10 @@ def test_the_plugin_recalls_before_the_first_step_and_stores_the_turn_at_its_end
         "the prompt (the step's last message of the person's) and the reply once each, the message taken with the "
         "prompt and what was said in between from the record, and none of dsh's own context"
     )
-    assert _plugin_keys(root) == ["assistant:1", "record:a-1", "record:u-1", "user:1"], "the reply is the turn's"
+    assert _plugin_keys(root) == ["assistant:1", "record:a-1", "record:u-1", "user:1"], (
+        "the reply is the turn's",
+        result["status"],
+    )
 
 
 @_NEEDS_NODE
@@ -3948,7 +3955,7 @@ def test_a_turn_that_did_not_complete_has_no_reply_and_keeps_what_was_said(dsh, 
         {"python": sys.executable, "home": str(home), "spool": str(tmp_path / "TEST-spool"), "endReason": "aborted"}
     )
     assert result["spool"] == [] and result["status"]["lastStore"]["error"] is None
-    assert _plugin_keys(root) == ["record:a-1", "record:a-2", "user:1"]
+    assert _plugin_keys(root) == ["record:a-1", "record:a-2", "user:1"], result["status"]
 
 
 @_NEEDS_NODE
@@ -3987,7 +3994,7 @@ def test_a_turn_larger_than_one_stop_is_stored_in_several_within_the_hook_s_inpu
         }
     )
     assert result["spool"] == [] and result["status"]["lastStore"]["error"] is None, result["warnings"]
-    assert _plugin_keys(root) == ["record:a-1", "record:a-2", "user:1"]
+    assert _plugin_keys(root) == ["record:a-1", "record:a-2", "user:1"], result["status"]
     stored = [content for role, _origin, content in _plugin_rows(root) if role == "assistant"]
     assert all(
         content.endswith("more characters not kept by Scope Recall]") and len(content.encode("utf-8")) < 36_000
