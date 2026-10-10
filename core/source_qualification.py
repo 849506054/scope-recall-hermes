@@ -170,39 +170,51 @@ def _everyday_self_report(content, left, occurrence):
     )
 
 
-def _fence_open(before: str) -> bool:
-    """Whether a fenced block is open at the end of ``before``: one opens on a line of three or more backticks or
-    tildes, and closes only on a line of the same character, at least as long, with nothing after it (CommonMark).
-    Inside a tilde block a backtick line is text."""
-    opened = None
+def _outside_fences(before: str) -> tuple[bool, str]:
+    """Whether a fenced block is open at the end of ``before``, and ``before`` without the blocks in it.  A block
+    opens on a line of three or more backticks or tildes, and closes only on a line of the same character, at least
+    as long, with nothing after it (CommonMark): inside a tilde block a backtick line is text."""
+    kept, opened, start = [], None, 0
     for match in _FENCE.finditer(before):
         marks, rest = match.group(1), match.group(2)
         if opened is None:
             if marks[0] != "`" or "`" not in rest:  # a backtick fence's info string holds no backtick
+                kept.append(before[start : match.start()])
                 opened = (marks[0], len(marks))
         elif marks[0] == opened[0] and len(marks) >= opened[1] and not rest.strip():
-            opened = None
-    return opened is not None
+            opened, start = None, match.end()
+    if opened is None:
+        kept.append(before[start:])
+    return opened is not None, "".join(kept)
 
 
 #: Quotation marks that open and close as a pair; a straight double quote does both.
 _QUOTE_PAIRS = (("“", "”"), ("「", "」"), ("『", "』"))
+#: A right single quote closes a quotation opened with ``‘``, unless a letter follows it: then it is an apostrophe
+#: (don’t, Alice’s).
+_CLOSING_SINGLE = re.compile(r"’(?![^\W\d_])")
 
 
-def _quote_open(before: str) -> bool:
-    """Whether a quotation opened in ``before`` is still open, across lines too: a pair's opening marks outnumber its
-    closing ones, or straight double quotes stand in an odd number.  Single quotes are left out: most are
+def _quote_open(text: str) -> bool:
+    """Whether a quotation opened in ``text`` is still open, across lines too: a pair's opening marks outnumber its
+    closing ones, or straight double quotes stand in an odd number.  Straight single quotes are left out: most are
     apostrophes."""
-    return before.count('"') % 2 == 1 or any(before.count(start) > before.count(end) for start, end in _QUOTE_PAIRS)
+    return (
+        text.count('"') % 2 == 1
+        or text.count("‘") > len(_CLOSING_SINGLE.findall(text))
+        or any(text.count(start) > text.count(end) for start, end in _QUOTE_PAIRS)
+    )
 
 
 def _pasted_at(content: str, position: int) -> bool:
+    """Labels and quotation marks are read outside fenced blocks: code's own (``x: int``, ``'"'``) mark no speaker."""
     before = content[:position]
+    fenced, outside = _outside_fences(before)
     line = before[before.rfind("\n") + 1 :]
     return (
-        _SPEAKER_LABEL.search(before) is not None
-        or _fence_open(before)
-        or _quote_open(before)
+        fenced
+        or _SPEAKER_LABEL.search(outside) is not None
+        or _quote_open(outside)
         or line.lstrip().startswith(">")
     )
 
