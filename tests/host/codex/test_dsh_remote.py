@@ -43,6 +43,19 @@ NODE = os.environ.get("SCOPE_RECALL_TEST_NODE") or shutil.which("node")
 HARNESS = Path(__file__).resolve().parent / "dsh_harness"
 
 
+def _node_runs() -> bool:
+    """node 20.6 or later (the harness's module hooks) that this tier may start.  The gate lets the host tier run the
+    node it found and refuses node to the other tiers, which skip here as test_shared_client's dsh tests do."""
+    if NODE is None:
+        return False
+    try:
+        version = subprocess.run([NODE, "--version"], capture_output=True, text=True, timeout=30).stdout.strip()
+        major, minor = (int(part) for part in version.lstrip("v").split(".")[:2])
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return False
+    return (major, minor) >= (20, 6)
+
+
 def _hook(client, **payload):
     return remote_client.run_hook(client, json.dumps(payload, ensure_ascii=False).encode("utf-8"))
 
@@ -364,7 +377,7 @@ def _plugin(home, config, scenario="turn"):
     return json.loads(result.stdout.strip().splitlines()[-1])
 
 
-@pytest.mark.skipif(NODE is None, reason="node is not installed")
+@pytest.mark.skipif(not _node_runs(), reason="node 20.6 or later is not installed, or this tier may not start it")
 def test_installed_remote_plugin_recalls_and_replays_unacknowledged_stop(remote, tmp_path):
     root, _home, client, bodies, records = remote
     home, rows = _installed(client, tmp_path)
