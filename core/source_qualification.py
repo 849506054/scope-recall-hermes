@@ -67,8 +67,9 @@ _SPEAKER_LABEL = re.compile(
     re.I,
 )
 _FIRST_PERSON = re.compile(r"\bI\b|\bmy\b|我", re.I)
-#: A line opening or closing a fenced block of pasted text (Markdown ``` or ~~~).
-_FENCE = re.compile(r"(?m)^[ \t]{0,3}(?:```|~~~)")
+#: A line of three or more backticks or tildes, which opens or closes a fenced block of pasted text (Markdown), with
+#: whatever follows it on the line.
+_FENCE = re.compile(r"(?m)^[ \t]{0,3}(`{3,}|~{3,})(.*)$")
 #: A speaker's own framing at the head of a clause, after a list marker too (老实说，一般来说，我跟你说，"That said,"):
 #: what follows it is their own words.  After a name it is someone else's again: 张三跟你说，…, "a message that
 #: said, …".
@@ -169,21 +170,37 @@ def _everyday_self_report(content, left, occurrence):
     )
 
 
+def _fence_open(before: str) -> bool:
+    """Whether a fenced block is open at the end of ``before``: one opens on a line of three or more backticks or
+    tildes, and closes only on a line of the same character, at least as long, with nothing after it (CommonMark).
+    Inside a tilde block a backtick line is text."""
+    opened = None
+    for match in _FENCE.finditer(before):
+        marks, rest = match.group(1), match.group(2)
+        if opened is None:
+            if marks[0] != "`" or "`" not in rest:  # a backtick fence's info string holds no backtick
+                opened = (marks[0], len(marks))
+        elif marks[0] == opened[0] and len(marks) >= opened[1] and not rest.strip():
+            opened = None
+    return opened is not None
+
+
+def _pasted_at(content: str, position: int) -> bool:
+    before = content[:position]
+    line = before[before.rfind("\n") + 1 :]
+    return _SPEAKER_LABEL.search(before) is not None or _fence_open(before) or line.lstrip().startswith(">")
+
+
 def in_pasted_text(content: str, quote: str) -> bool:
-    """Whether the quoted words stand in text the owner pasted rather than said, in the whole message: after a line
-    opening with a speaker's label (``_SPEAKER_LABEL``), inside a fenced block, or on a quoted line (``> ...``).  A
-    claim's evidence is read in a context narrowed to the quote's sentence, which leaves all three out (``Alice:``
-    ... ``My preference is blue.``)."""
+    """Whether a first person in the quoted words stands in text the owner pasted rather than said, judged in the
+    whole message: after a line opening with a speaker's label (``_SPEAKER_LABEL``), inside a fenced block, or on a
+    quoted line (``> ...``).  A claim's evidence is read in a context narrowed to the quote's sentence, which leaves
+    all three out (``Alice:`` ... ``My preference is blue.``), and a quote may hold a fence's opening line itself."""
     at = content.rfind(quote) if quote else -1
     if at < 0:
         return False
-    before = content[:at]
-    line = before[before.rfind("\n") + 1 :]
-    return (
-        _SPEAKER_LABEL.search(before) is not None
-        or len(_FENCE.findall(before)) % 2 == 1
-        or line.lstrip().startswith(">")
-    )
+    persons = [match.start() for match in _FIRST_PERSON.finditer(content, at, at + len(quote))] or [at]
+    return any(_pasted_at(content, position) for position in persons)
 
 
 def _after_a_label(content: str) -> bool:

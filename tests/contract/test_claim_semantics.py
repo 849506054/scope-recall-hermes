@@ -208,9 +208,16 @@ def test_a_transcript_s_label_outside_the_quote_s_sentence_still_names_someone_e
         ("Alice sent this.\n```\nMy preference is blue.\n```", preference),
         ("Alice sent this.\n~~~\nHi.\nMy preference is blue.\n~~~", preference),
         ("张三发来这段。\n> 你好。\n> 我不吃辣。", ("我不吃辣。", "不吃辣")),
+        ("Alice sent this.\n```\nMy preference is blue.\n```", ("```\nMy preference is blue.\n```", "blue")),
+        ("Alice sent this.\n~~~markdown\n```\nMy preference is blue.\n```\n~~~", preference),
     ):
         assert qualification(text, value=value, quote=quote).state == "proposed", text
-    for owner_text in ("My preference is blue.\nUpdate: done.", "My preference is blue.\n```\nTEST code\n```"):
+    for owner_text in (
+        "My preference is blue.\nUpdate: done.",
+        "My preference is blue.\n```\nTEST code\n```",
+        "```text\n~~~\n```\nMy preference is blue.",
+        "````\n```\n````\nMy preference is blue.",
+    ):
         owner = qualification(owner_text, value="blue", quote="My preference is blue.")
         assert owner.state == "active", owner_text
 
