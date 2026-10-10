@@ -5,46 +5,21 @@ longer text this file once held is in its history.
 
 ## [3.9.7] - 2026-10-10
 
-This repository candidate corrects the checkout version shown in the README and keeps the fixes in 3.9.6. Runtime behaviour, the database schema and the upgrade steps are unchanged.
-
-## [3.9.6] - 2026-10-10
-
-This repository candidate includes the 3.9.5 fixes for message preservation, model-endpoint credential protection, remote dsh setup and paged quote recovery. Its Windows deadline regression check now allows timestamp floating-point rounding without changing the runtime deadline or accepting an additional retry budget. There are no additional upgrade steps beyond those described for 3.9.5 below.
-
-## [3.9.5] - 2026-10-10
-
-This candidate includes the changes since the last public release, 3.9.3. It preserves user messages more reliably, prevents credentials from being placed in model-server URLs, connects remote dsh entries through their native plugin, and corrects escaped quotes during paged memory processing.
-
-### 3.9.3 — previous public release
-
-The comparison baseline. Existing memories and the database schema remain compatible.
-
-### 3.9.4 — repository candidate, not publicly released
-
-Messages sent by the owner while a Hermes agent works are retained as their words without treating delegated instructions or other people's statements as the owner's. Failed-work reporting distinguishes queued retries from failed work. Plain HTTP model endpoints work again on the same machine; other hosts require explicit opt-in (contributed by @panxuewen0101 in #227).
-
-### 3.9.5 — current repository candidate
-
-Model endpoints reject credentials embedded in URLs, including query parameters; plaintext requests still cannot carry credentials. Remote dsh setup installs and configures the dsh plugin and forwards its records through the existing shared-store connection. Paged consolidation resolves escaped text against the current page before considering a previously accepted goal, without decoding it twice or weakening quotation checks. Hermes compression retries share one deadline, and quoted third-party statements are not assigned to the owner.
-
-### Upgrading from 3.9.3
-
-Install the package, run `plan-install` and `apply-install` for each upgraded entry, then restart the affected gateways and MCP servers. The schema remains 1110. For remote dsh entries, use the dsh plugin setup described in `docs/remote-entries.md`; Codex hook installation is not a substitute.
-
-## [3.9.4] - 2026-10-09
-
-What the owner sends to a Hermes agent while it works (a steer) is stored as their words. Most were lost: they were read only at a turn's end and only after the last other row, and were gone once a compression or a turn without a reply came first. A steer is the owner's only when the gateway's origin names them; a parent agent's message to the agent it delegated to, a notice Hermes delivers the same way, and anything after another person's words in a row Hermes joined are not.
+What the owner sends to a Hermes agent while it works (a steer) is stored as their words. Most were lost: they were read only at a turn's end and only after the last other row, and were gone once a compression or a turn without a reply came first. A steer is the owner's only when the gateway's origin names them; a parent agent's message to the agent it delegated to, a notice Hermes delivers the same way, and anything after another person's words in a row Hermes joined are not. A steer a compression carries into the next session is not stored a second time, and a deleted one stays deleted.
 
 From an audit by one of the agents (yuheng):
 - The worker's status counts only failed work as failed. A queued item keeps its last attempt's error, and counted among the failures it hid as many that need a look. The queued items' errors are reported apart, as `pending_error_counts`.
-- An everyday first-person statement (我不吃辣, I do not eat spicy food) is bound to the person who said it; someone else's words around a first person are not.
+- An everyday first-person statement (我不吃辣, I do not eat spicy food) is bound to the person who said it; someone else's words around a first person (a named speaker, a quote, a pasted transcript) are not.
 - A candidate's name the evaluating model writes differently is restored only when it is the same name: 不吃辣 no longer stands for 吃辣, nonprod for prod, nor "allow delete if approved" for "allow delete".
+- Paged consolidation looks for a quote on the current page first, so escaped text it can find there is no longer refused (#230).
 
-An embedding route reaches a model server on this machine over plain HTTP again, and one on another host with the literal opt-in `allow_insecure_endpoint`, which is off by default: the text being embedded then crosses the network unencrypted. A plaintext request never carries a credential (#227, contributed by @panxuewen0101).
+A model server on this machine is reachable over plain HTTP again, and one on another host with the literal opt-in `allow_insecure_endpoint`, which is off by default: the text being embedded then crosses the network unencrypted (#226, #227, contributed by @panxuewen0101). A plaintext request never carries a credential, and no model endpoint URL may carry one, in its query or its user part, over HTTPS either.
+
+dsh on another machine can attach to the shared store as a remote entry, through its native plugin (#229).
 
 ### Upgrading from 3.9.3
 
-Install the package, run `plan-install` and `apply-install` where you upgrade, then restart the Hermes gateways and the clients' MCP servers. The schema is unchanged (1110), and so are the hook and MCP server commands the installers write.
+Install the package, run `plan-install` and `apply-install` for each upgraded entry, then restart the Hermes gateways and the clients' MCP servers. The schema is unchanged (1110). A model endpoint whose URL carries a credential (`?key=`, `?api_key=`, `user:password@`) is now refused: name the key's environment variable in `credential_env` instead. For a remote dsh entry, follow `docs/remote-entries.md`. 3.9.4 to 3.9.6 were candidates on the release branch and were never published.
 
 ## [3.9.3] - 2026-10-08
 
