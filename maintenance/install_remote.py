@@ -187,10 +187,13 @@ def _write_private(path: Path, content: str | bytes) -> None:
 
 def _keep_private(config: dict[str, Any], home: Path) -> None:
     """The native file that carries the entry's token, and every backup the installer kept, readable by this account
-    alone whether or not this install changed them: a reinstall repairs an installation an older one left open."""
+    alone whether or not this install changed them, and no temporary copy left beside it: a reinstall repairs an
+    installation an older one left open."""
     token_file = home / (dsh.PATCH_FILENAME if config["host"] == "dsh" else workbuddy.MCP_FILENAME)
     if token_file.is_file():
         token_file.chmod(0o600)
+    # A temporary file an interrupted install left behind may hold a token that is still valid.
+    token_file.with_name(token_file.name + ".tmp").unlink(missing_ok=True)
     backups = config["state_dir"] / "backups"
     if backups.is_dir():
         backups.chmod(0o700)

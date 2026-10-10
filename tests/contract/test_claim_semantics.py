@@ -198,16 +198,21 @@ def test_a_transcript_s_label_outside_the_quote_s_sentence_still_names_someone_e
     """A claim's evidence is read around its quote.  A pasted transcript's label lines above it are someone else's
     words all the same, and so is a label in Markdown emphasis or on a quoted line; the owner's own words before a
     label are theirs."""
-    for text in (
-        "Alice:\nHello.\nMy preference is blue.",
-        "**Alice:**\nMy preference is blue.",
-        "**Alice**: hi\nMy preference is blue.",
-        "> Alice: hi\nMy preference is blue.",
-        "Alice (10:32):\nHello.\nMy preference is blue.",
+    preference = ("My preference is blue.", "blue")
+    for text, (quote, value) in (
+        ("Alice:\nHello.\nMy preference is blue.", preference),
+        ("**Alice:**\nMy preference is blue.", preference),
+        ("**Alice**: hi\nMy preference is blue.", preference),
+        ("> Alice: hi\nMy preference is blue.", preference),
+        ("Alice (10:32):\nHello.\nMy preference is blue.", preference),
+        ("Alice sent this.\n```\nMy preference is blue.\n```", preference),
+        ("Alice sent this.\n~~~\nHi.\nMy preference is blue.\n~~~", preference),
+        ("张三发来这段。\n> 你好。\n> 我不吃辣。", ("我不吃辣。", "不吃辣")),
     ):
-        assert qualification(text, value="blue", quote="My preference is blue.").state == "proposed", text
-    owner = qualification("My preference is blue.\nUpdate: done.", value="blue", quote="My preference is blue.")
-    assert owner.state == "active"
+        assert qualification(text, value=value, quote=quote).state == "proposed", text
+    for owner_text in ("My preference is blue.\nUpdate: done.", "My preference is blue.\n```\nTEST code\n```"):
+        owner = qualification(owner_text, value="blue", quote="My preference is blue.")
+        assert owner.state == "active", owner_text
 
 
 def test_self_report_requires_a_verified_c1_principal():

@@ -30,8 +30,8 @@ from .source_qualification import (
     asserted_marker,
     bound_literal,
     condition_supports_value,
+    in_pasted_text,
     is_transient_request,
-    labelled_before,
     preserves_qualifiers,
     self_report_bound,
 )
@@ -190,14 +190,15 @@ def bind_claim_subject(
             if span["source_ref"] == root.ref and span["source_revision"] == root.revision
         ]
 
-    # The context around a quote can leave out the label a pasted transcript opens with: the whole message is asked.
+    # The context around a quote can leave out what marks pasted text, a speaker's label above it or the fence around
+    # it: the whole message is asked.
     if not relevant or not any(
         self_report_bound(
             "\n".join(evidence_context(root.content, span["quote"]) for span in spans_of(root)),
             proposal["value_text"],
             kind=proposal["kind"],
         )
-        and not any(labelled_before(root.content, span["quote"]) for span in spans_of(root))
+        and not any(in_pasted_text(root.content, span["quote"]) for span in spans_of(root))
         for root in relevant
     ):
         bound["subject"] = _unresolved_subject(proposal, roots)

@@ -501,9 +501,10 @@ def test_a_hook_spends_a_bounded_time_on_steers_when_the_store_is_busy(telegram,
     """On a busy store each write waits its full time.  A compression hook's retry pass and its steers share one
     budget: once it is spent the hook stops waiting, and keeps each steer it could not write to retry rather than
     drop it."""
-    real = telegram._core.record_host_event
+    real, budgets = telegram._core.record_host_event, []
 
     def held(context, event, **kwargs):
+        budgets.append(kwargs["remaining_seconds"])
         time.sleep(kwargs["remaining_seconds"])
         raise sqlite3.OperationalError("database is locked")
 
@@ -511,11 +512,14 @@ def test_a_hook_spends_a_bounded_time_on_steers_when_the_store_is_busy(telegram,
     monkeypatch.setattr(telegram._retry, "start", lambda: None)
     telegram.on_pre_compress([_row(_steer("TEST 先前没写成的", message_id="299"))])
     assert telegram._retry.captures, "a capture the busy store refused is kept to retry"
+    budgets.clear()
     rows = [_row(_steer(f"TEST 第{n}条", message_id=str(300 + n))) for n in range(8)]
     started = time.monotonic()
     telegram.on_pre_compress([dict(row) for row in rows])
-    # The retry pass waits a second, the first steer what is left of the hook's two: about two seconds in all.
-    assert time.monotonic() - started < 2.6
+    # The retry pass and the steers wait the hook's two seconds between them at most, beside the next to nothing a
+    # write is given once they are spent: a slow runner only shortens what is left.
+    assert sum(budgets) <= 2.0 + 0.001 * len(budgets) + 0.01, budgets
+    assert time.monotonic() - started < 10
     monkeypatch.setattr(telegram._core, "record_host_event", real)
     wanted = {f"TEST 第{n}条" for n in range(8)} | {"TEST 先前没写成的"}
     deadline = time.monotonic() + 10
@@ -544,7 +548,9 @@ def test_a_steer_the_retry_buffer_gave_up_is_read_again(telegram, hermes_home, m
     telegram.on_pre_compress([dict(message) for message in history])
     # The second hook's retry pass writes it once; the hook itself leaves it to the buffer.
     assert attempts.count("TEST 等了太久的话") == 2 and len(telegram._retry.captures) == 1
-    monkeypatch.setattr(capture_retry, "_RETRY_GIVE_UP_S", 0.0)
+    # Below zero: Windows' monotonic clock can read the same instant twice, and a capture is given up only once
+    # older than the limit.
+    monkeypatch.setattr(capture_retry, "_RETRY_GIVE_UP_S", -1.0)
     with telegram._lock:
         telegram._retry.give_up_expired(tuple(telegram._retry.captures.items()))
     assert not telegram._retry.captures

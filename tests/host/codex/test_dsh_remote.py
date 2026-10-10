@@ -297,7 +297,7 @@ def test_dsh_remote_install_and_mcp(remote, tmp_path, capsys):
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX file modes; on Windows the profile's ACLs keep the files private")
-def test_a_reinstall_keeps_the_token_bearing_patch_and_its_backup_private(remote, tmp_path):
+def test_a_reinstall_keeps_the_token_bearing_patch_and_its_backup_private(remote, tmp_path, monkeypatch):
     """The patch's MCP row carries the entry's token.  Written under a umask of 022 a reinstall made it readable by
     every local account, and the backup of the patch it replaced as well."""
     _root, _home, client, _bodies, _records = remote
@@ -326,11 +326,21 @@ def test_a_reinstall_keeps_the_token_bearing_patch_and_its_backup_private(remote
     stale.write_bytes(b"TEST stale")
     stale.chmod(0o644)
     assert install_remote.install(client, home)["written"] == []
-    assert patch.stat().st_mode & 0o077 == 0
+    assert patch.stat().st_mode & 0o077 == 0 and not stale.exists()
     assert old.stat().st_mode & 0o077 == 0 and old.parent.stat().st_mode & 0o077 == 0
+    # The new token is written only into a file made for it, owner-only from its creation.
+    opened, real_open = [], os.open
+
+    def recording_open(path, flags, mode=0o777, *args, **kwargs):
+        opened.append((Path(path).name, flags, mode))
+        return real_open(path, flags, mode, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", recording_open)
     client["token_file"].write_text("TEST-rotated-again", encoding="utf-8")
     assert str(patch) in install_remote.install(client, home)["written"]
-    assert not stale.exists() and patch.stat().st_mode & 0o077 == 0
+    created = [(flags, mode) for name, flags, mode in opened if name == patch.name + ".tmp"]
+    assert created and all(flags & os.O_EXCL and mode == 0o600 for flags, mode in created)
+    assert patch.stat().st_mode & 0o077 == 0
 
 
 def _plugin(home, config, scenario="turn"):

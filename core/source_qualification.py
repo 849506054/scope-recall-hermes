@@ -67,6 +67,8 @@ _SPEAKER_LABEL = re.compile(
     re.I,
 )
 _FIRST_PERSON = re.compile(r"\bI\b|\bmy\b|我", re.I)
+#: A line opening or closing a fenced block of pasted text (Markdown ``` or ~~~).
+_FENCE = re.compile(r"(?m)^[ \t]{0,3}(?:```|~~~)")
 #: A speaker's own framing at the head of a clause, after a list marker too (老实说，一般来说，我跟你说，"That said,"):
 #: what follows it is their own words.  After a name it is someone else's again: 张三跟你说，…, "a message that
 #: said, …".
@@ -167,12 +169,21 @@ def _everyday_self_report(content, left, occurrence):
     )
 
 
-def labelled_before(content: str, quote: str) -> bool:
-    """Whether a line opening with a speaker's label (``_SPEAKER_LABEL``) stands anywhere before the quoted words
-    in the whole message.  A claim's evidence is read in a context narrowed to the quote's sentence, which leaves
-    out the label a pasted transcript opens with (``Alice:`` ... ``My preference is blue.``)."""
+def in_pasted_text(content: str, quote: str) -> bool:
+    """Whether the quoted words stand in text the owner pasted rather than said, in the whole message: after a line
+    opening with a speaker's label (``_SPEAKER_LABEL``), inside a fenced block, or on a quoted line (``> ...``).  A
+    claim's evidence is read in a context narrowed to the quote's sentence, which leaves all three out (``Alice:``
+    ... ``My preference is blue.``)."""
     at = content.rfind(quote) if quote else -1
-    return at > 0 and _SPEAKER_LABEL.search(content[:at]) is not None
+    if at < 0:
+        return False
+    before = content[:at]
+    line = before[before.rfind("\n") + 1 :]
+    return (
+        _SPEAKER_LABEL.search(before) is not None
+        or len(_FENCE.findall(before)) % 2 == 1
+        or line.lstrip().startswith(">")
+    )
 
 
 def _after_a_label(content: str) -> bool:
