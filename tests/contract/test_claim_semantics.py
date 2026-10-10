@@ -203,6 +203,7 @@ def test_a_transcript_s_label_outside_the_quote_s_sentence_still_names_someone_e
         "**Alice:**\nMy preference is blue.",
         "**Alice**: hi\nMy preference is blue.",
         "> Alice: hi\nMy preference is blue.",
+        "Alice (10:32):\nHello.\nMy preference is blue.",
     ):
         assert qualification(text, value="blue", quote="My preference is blue.").state == "proposed", text
     owner = qualification("My preference is blue.\nUpdate: done.", value="blue", quote="My preference is blue.")

@@ -55,13 +55,15 @@ _REPORTED_SELF = re.compile(
     r"|(?:^|[\s:：,，])['‘][^'’\n]{0,256}(?:\bI\b|\bmy\b|我)",
     re.I,
 )
-#: A line opening with a speaker's label: ``儿子：``, ``Alice:``, a chat log's ``<alice>``, a ``[10:32]`` before
-#: either, including a list item's or a quoted line's label and one in Markdown emphasis (``**Alice:**``).  The
-#: marks change no speaker; a URL is no label.
+#: A line opening with a speaker's label: a short head ending in a colon (``儿子：``, ``Alice:``, ``Alice (10:32):``,
+#: ``From Alice on Monday:``), a chat log's ``<alice>``, a ``[10:32]`` before either, after a list marker, on a quoted
+#: line or in Markdown emphasis (``**Alice:**``).  Any such head counts, the owner's own ``Update:`` too: telling a
+#: speaker's name from a heading is not this rule's to try.  A head that begins with the first person (``我说：``,
+#: ``I think:``) is no label, nor is a URL's scheme.
 _SPEAKER_LABEL = re.compile(
-    r"(?:^|[\n。！？!?；;])[^\S\n]*(?:(?:[-*+•>]|\d+[.)、])[^\S\n]+)?"
+    r"(?:^|[\n。！？!?；;])[^\S\n]*(?:(?:[-*+•]|\d+[.)、])[^\S\n]+)?"
     r"(?:\[[^\]\n]{0,24}\][^\S\n]*)?(?:\*\*|__|\*|_)?"
-    r"(?:<[^<>\n]{1,24}>|(?!我|I\b)(?:[\u4e00-\u9fff]{1,6}|[A-Za-z][\w .'-]{0,24})(?:\*\*|__|\*|_)?[：:](?!//))",
+    r"(?:<[^<>\n]{1,24}>|(?!我|I\b)[^\s:：*_][^\n:：]{0,32}[：:](?!//))",
     re.I,
 )
 _FIRST_PERSON = re.compile(r"\bI\b|\bmy\b|我", re.I)

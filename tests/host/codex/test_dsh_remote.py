@@ -316,6 +316,21 @@ def test_a_reinstall_keeps_the_token_bearing_patch_and_its_backup_private(remote
     assert str(patch) in second["written"] and patch.stat().st_mode & 0o077 == 0
     for backup in (*first["backups"], *second["backups"]):
         assert Path(backup).stat().st_mode & 0o077 == 0 and Path(backup).parent.stat().st_mode & 0o077 == 0
+    # An installation an older install left open: a readable patch nothing changes, a readable backup, and a
+    # readable temporary file an interrupted run left behind.
+    patch.chmod(0o644)
+    old = Path(second["backups"][0])
+    old.chmod(0o644)
+    old.parent.chmod(0o755)
+    stale = patch.with_name(patch.name + ".tmp")
+    stale.write_bytes(b"TEST stale")
+    stale.chmod(0o644)
+    assert install_remote.install(client, home)["written"] == []
+    assert patch.stat().st_mode & 0o077 == 0
+    assert old.stat().st_mode & 0o077 == 0 and old.parent.stat().st_mode & 0o077 == 0
+    client["token_file"].write_text("TEST-rotated-again", encoding="utf-8")
+    assert str(patch) in install_remote.install(client, home)["written"]
+    assert not stale.exists() and patch.stat().st_mode & 0o077 == 0
 
 
 def _plugin(home, config, scenario="turn"):
@@ -364,7 +379,9 @@ def test_installed_remote_plugin_recalls_and_replays_unacknowledged_stop(remote,
     replayed = _plugin(home, config, "sweep")
     assert replayed["spool"] == [] and replayed["status"]["lastStore"]["error"] is None
     assert len([row for row in _rows(root) if "session-TEST-plugin" in row[1]]) == 3
-    successful = _plugin(home, config)
+    # A loaded CI runner can take longer than the plugin's default 9 s for a cold recall; the bound itself is not
+    # what this test measures.
+    successful = _plugin(home, {**config, "recallTimeoutMs": 30_000})
     assert successful["decisionKept"] and "Mochi" in successful["injected"]["text"]
     assert successful["spool"] == [] and successful["status"]["lastStore"]["error"] is None
     assert any(body["payload"].get("record") for body in bodies)

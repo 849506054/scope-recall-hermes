@@ -178,11 +178,24 @@ def _write_private(path: Path, content: str | bytes) -> None:
     to every local account (POSIX modes; on Windows the profile's ACLs keep the files the account's)."""
     data = content if isinstance(content, bytes) else content.encode("utf-8")
     pending = path.with_name(path.name + ".tmp")
-    handle = os.open(pending, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_BINARY", 0), 0o600)
+    pending.unlink(missing_ok=True)  # one an interrupted run left behind may be readable: never write into it
+    handle = os.open(pending, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0), 0o600)
     with os.fdopen(handle, "wb") as stream:
         stream.write(data)
-    pending.chmod(0o600)  # one an interrupted run left behind keeps its old mode through O_CREAT
     os.replace(pending, path)
+
+
+def _keep_private(config: dict[str, Any], home: Path) -> None:
+    """The native file that carries the entry's token, and every backup the installer kept, readable by this account
+    alone whether or not this install changed them: a reinstall repairs an installation an older one left open."""
+    token_file = home / (dsh.PATCH_FILENAME if config["host"] == "dsh" else workbuddy.MCP_FILENAME)
+    if token_file.is_file():
+        token_file.chmod(0o600)
+    backups = config["state_dir"] / "backups"
+    if backups.is_dir():
+        backups.chmod(0o700)
+        for path in backups.rglob("*"):
+            path.chmod(0o700 if path.is_dir() else 0o600)
 
 
 def install(config: dict[str, Any], plugin_dir: Path) -> dict[str, list[str]]:
@@ -226,6 +239,8 @@ def install(config: dict[str, Any], plugin_dir: Path) -> dict[str, list[str]]:
                 pending.write_text(content, encoding="utf-8", newline="")
             os.replace(pending, path)
         written.append(str(path))
+    if config["host"] in ("workbuddy", "dsh"):
+        _keep_private(config, plugin_dir)
     config["state_dir"].mkdir(parents=True, exist_ok=True)
     return {"written": written, "backups": [str(path) for path in backups]}
 
