@@ -192,16 +192,25 @@ def _outside_fences(before: str) -> tuple[bool, str]:
 _QUOTE_PAIRS = (("“", "”"), ("「", "」"), ("『", "』"))
 
 
+#: A single quotation opens at a ``‘``, never an apostrophe, or at a ``'`` at a line's start or after a space with text
+#: after it (``it's`` and ``students' books`` open none).
+_OPENING_SINGLE = re.compile(r"‘|(?:^|(?<=\s))'(?=\S)")
+#: It closes where a line ends in a single quote, perhaps before punctuation (``‘hi’.``): inside a line a closing
+#: quote is as often an apostrophe (``the others’ choices``).
+_CLOSING_SINGLE = re.compile(r"[’'][.,!?;:。，！？；：)）\]」』\"”]*$")
+
+
 def _single_quote_open(text: str) -> bool:
-    """Whether a quotation in single quotes (‘ or '), opened at the start of a line, is still open at the end of
-    ``text``; it closes at the end of a line ending in a single quote.  Inside a line a single quote is as often an
-    apostrophe (don’t, the others’ choices) as a mark, so only a line's two ends are read."""
+    """Whether a quotation in single quotes is still open at the end of ``text`` (``_OPENING_SINGLE``,
+    ``_CLOSING_SINGLE``)."""
     opened = False
     for line in text.split("\n"):
-        line = line.strip()
-        if not opened and line[:1] in ("‘", "'"):
-            opened, line = True, line[1:]
-        if opened and line[-1:] in ("’", "'"):
+        if not opened:
+            start = _OPENING_SINGLE.search(line)
+            if start is None:
+                continue
+            opened, line = True, line[start.end() :]
+        if _CLOSING_SINGLE.search(line.strip()):
             opened = False
     return opened
 
