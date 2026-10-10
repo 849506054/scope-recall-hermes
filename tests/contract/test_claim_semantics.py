@@ -13,7 +13,7 @@ from tests.contract.test_claims import Clock, capture, initial, revise_request
 from tests.v11_support import context
 
 
-def qualification(text, *, subject="user", value="蓝色", conditions=(), principal=None):
+def qualification(text, *, subject="user", value="蓝色", conditions=(), principal=None, quote=None):
     if principal is None:
         principal = {
             "kind": "human",
@@ -40,7 +40,7 @@ def qualification(text, *, subject="user", value="蓝色", conditions=(), princi
         statement_kind="assertion",
         valid_from=root.occurred_at,
         valid_to=None,
-        evidence_spans=[dict(source_ref=root.ref, source_revision=1, quote=text)],
+        evidence_spans=[dict(source_ref=root.ref, source_revision=1, quote=text if quote is None else quote)],
     )
     return qualify(proposal, (root,))
 
@@ -192,6 +192,21 @@ def test_an_everyday_self_report_is_the_speaker_s():
     ):
         assert not self_report_bound(text, value, kind="preference"), text
         assert qualification(text, value=value).state == "proposed", text
+
+
+def test_a_transcript_s_label_outside_the_quote_s_sentence_still_names_someone_else():
+    """A claim's evidence is read around its quote.  A pasted transcript's label lines above it are someone else's
+    words all the same, and so is a label in Markdown emphasis or on a quoted line; the owner's own words before a
+    label are theirs."""
+    for text in (
+        "Alice:\nHello.\nMy preference is blue.",
+        "**Alice:**\nMy preference is blue.",
+        "**Alice**: hi\nMy preference is blue.",
+        "> Alice: hi\nMy preference is blue.",
+    ):
+        assert qualification(text, value="blue", quote="My preference is blue.").state == "proposed", text
+    owner = qualification("My preference is blue.\nUpdate: done.", value="blue", quote="My preference is blue.")
+    assert owner.state == "active"
 
 
 def test_self_report_requires_a_verified_c1_principal():

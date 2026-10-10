@@ -56,11 +56,12 @@ _REPORTED_SELF = re.compile(
     re.I,
 )
 #: A line opening with a speaker's label: ``儿子：``, ``Alice:``, a chat log's ``<alice>``, a ``[10:32]`` before
-#: either, including a list item's label.  The list marker changes no speaker; a URL is no label.
+#: either, including a list item's or a quoted line's label and one in Markdown emphasis (``**Alice:**``).  The
+#: marks change no speaker; a URL is no label.
 _SPEAKER_LABEL = re.compile(
-    r"(?:^|[\n。！？!?；;])[^\S\n]*(?:(?:[-*+•]|\d+[.)、])[^\S\n]+)?"
-    r"(?:\[[^\]\n]{0,24}\][^\S\n]*)?"
-    r"(?:<[^<>\n]{1,24}>|(?!我|I\b)(?:[\u4e00-\u9fff]{1,6}|[A-Za-z][\w .'-]{0,24})[：:](?!//))",
+    r"(?:^|[\n。！？!?；;])[^\S\n]*(?:(?:[-*+•>]|\d+[.)、])[^\S\n]+)?"
+    r"(?:\[[^\]\n]{0,24}\][^\S\n]*)?(?:\*\*|__|\*|_)?"
+    r"(?:<[^<>\n]{1,24}>|(?!我|I\b)(?:[\u4e00-\u9fff]{1,6}|[A-Za-z][\w .'-]{0,24})(?:\*\*|__|\*|_)?[：:](?!//))",
     re.I,
 )
 _FIRST_PERSON = re.compile(r"\bI\b|\bmy\b|我", re.I)
@@ -162,6 +163,14 @@ def _everyday_self_report(content, left, occurrence):
         for pattern in _EVERYDAY_SELF_REPORT
         for match in pattern.finditer(clause)
     )
+
+
+def labelled_before(content: str, quote: str) -> bool:
+    """Whether a line opening with a speaker's label (``_SPEAKER_LABEL``) stands anywhere before the quoted words
+    in the whole message.  A claim's evidence is read in a context narrowed to the quote's sentence, which leaves
+    out the label a pasted transcript opens with (``Alice:`` ... ``My preference is blue.``)."""
+    at = content.rfind(quote) if quote else -1
+    return at > 0 and _SPEAKER_LABEL.search(content[:at]) is not None
 
 
 def _after_a_label(content: str) -> bool:

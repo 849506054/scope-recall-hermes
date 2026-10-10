@@ -296,6 +296,28 @@ def test_dsh_remote_install_and_mcp(remote, tmp_path, capsys):
     assert local_rows["mcp-scope-recall"]["config"]["transport"] == "stdio"
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX file modes; on Windows the profile's ACLs keep the files private")
+def test_a_reinstall_keeps_the_token_bearing_patch_and_its_backup_private(remote, tmp_path):
+    """The patch's MCP row carries the entry's token.  Written under a umask of 022 a reinstall made it readable by
+    every local account, and the backup of the patch it replaced as well."""
+    _root, _home, client, _bodies, _records = remote
+    home = tmp_path / "TEST-private-home"
+    home.mkdir()
+    patch = home / install_dsh.PATCH_FILENAME
+    patch.write_bytes(b"# TEST other plugin\n- id: TEST-other\n  disabled: true\n")
+    patch.chmod(0o600)
+    umask = os.umask(0o022)
+    try:
+        first = install_remote.install(client, home)
+        client["token_file"].write_text("TEST-rotated-token", encoding="utf-8")
+        second = install_remote.install(client, home)
+    finally:
+        os.umask(umask)
+    assert str(patch) in second["written"] and patch.stat().st_mode & 0o077 == 0
+    for backup in (*first["backups"], *second["backups"]):
+        assert Path(backup).stat().st_mode & 0o077 == 0 and Path(backup).parent.stat().st_mode & 0o077 == 0
+
+
 def _plugin(home, config, scenario="turn"):
     result = subprocess.run(
         [
