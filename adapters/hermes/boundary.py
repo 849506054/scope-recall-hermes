@@ -351,11 +351,15 @@ _STEER_NOTICE_HEADS = ("[Background process ", "[IMPORTANT: Background process",
 
 
 class Steer(NamedTuple):
-    """What the person sent while a turn ran: its name, their words and when they were sent."""
+    """What the person sent while a turn ran, or what no turn answered (``unanswered_messages``): its name, their
+    words, when they were sent, and which of the two it is, the event kind of its source key.  ``alike`` are the times
+    of the conversation's other messages said with the same words, answered or not (``unanswered_messages``)."""
 
     key: str
     words: str
     occurred_at: str | None
+    kind: str = "steer"
+    alike: tuple[str | None, ...] = ()
 
 
 #: The first line of a gateway's origin preamble, at the start of a line of a steer row.
@@ -438,6 +442,71 @@ def person_steers(messages: object, *, platform: str, user_id: str, local_surfac
     return tuple(found.values())
 
 
+#: The event kind of what no turn answered (``unanswered_messages``).
+UNANSWERED_KIND = "unanswered"
+#: How the user rows Hermes writes itself begin, besides a bracketed head in capitals (``_HERMES_NOTICE``): a
+#: background process's notice, a compression's to-do list, the turn it continues, a system note, an agent's
+#: message, a gateway's origin.  A gateway that restarts replays the rows it flushed at its stop as text alone
+#: (``gateway.shutdown_flush.recover_pending_to_db``), without the display kind that marks them otherwise.
+_HERMES_ROW_HEADS = (
+    *_STEER_NOTICE_HEADS,
+    _PRIOR_CONTEXT_HEADER,
+    _TODO_HEADER,
+    "Continue from the compressed",
+    "[System:",
+    "[A2A inbound",
+    "Gateway message origin",
+)
+#: A notice Hermes writes opens with a bracketed head in capitals: "[IMPORTANT: …", "[ASYNC DELEGATION COMPLETE — …",
+#: "[SYSTEM NOTICE — …", "[CONTEXT COMPACTION …", "[SILENT]".  Too many forms to list, and a person's own message
+#: seldom opens so; one that does is left out of a restarted gateway's rows, the safe side.
+_HERMES_NOTICE = re.compile(r"\[[A-Z][A-Z0-9_]+(?:[\s:\]\-]|\u2014)")
+
+
+def _typed_words(message: dict[str, Any]) -> str:
+    """A user row's own words when the person typed them: no kind Hermes gives the rows it writes, not a summary it
+    folded, and not begun the way such a row is begun."""
+    if message.get("display_kind") or message.get(_COMPRESSED_SUMMARY) is True:
+        return ""
+    words = _own_text(message)
+    if not words or words.startswith(_HERMES_ROW_HEADS) or _HERMES_NOTICE.match(words):
+        return ""
+    return "" if "Hermes is shutting down" in words else words
+
+
+def unanswered_messages(messages: object) -> tuple[Steer, ...]:
+    """The person's messages in ``messages`` that no turn answered, in order and each once.
+
+    A gateway that stops while messages wait for a busy agent keeps them, and when it starts again puts them into the
+    conversation without opening a turn for them (``gateway.shutdown_flush.recover_pending_to_db``): no hook is handed
+    them, and the person's next message opens a turn after them.  A message a turn opened on has a reply after it, or
+    the note that the turn was interrupted, before the person's next; their last is the turn now running, which
+    ``pre_llm_call`` stores.  Named by their time and words, so one read again is the same capture.  Each carries the
+    times of the conversation's other messages said with the same words (``alike``): looked up by words and moment,
+    every one of them takes its own stored copy in turn, and a second "继续" is not taken for the first.
+    """
+    if not isinstance(messages, list):
+        return ()
+    rows = [
+        message for message in messages if isinstance(message, dict) and message.get("role") in {"user", "assistant"}
+    ]
+    typed = [index for index, row in enumerate(rows) if row["role"] == "user" and _typed_words(row)]
+    unanswered: list[int] = []
+    said: dict[str, set[str | None]] = {}
+    for position, index in enumerate(typed):
+        said.setdefault(_typed_words(rows[index]), set()).add(_message_time(rows[index]))
+        following = typed[position + 1] if position + 1 < len(typed) else len(rows)
+        if following < len(rows) and not any(row["role"] == "assistant" for row in rows[index + 1 : following]):
+            unanswered.append(index)
+    found: dict[str, Steer] = {}
+    for index in unanswered:
+        words, occurred_at = _typed_words(rows[index]), _message_time(rows[index])
+        key = "text:" + hashlib.sha256(f"{occurred_at}\x00{words}".encode()).hexdigest()[:32]
+        alike = tuple(sorted(said[words] - {occurred_at}, key=lambda moment: (moment is None, moment or "")))
+        found.setdefault(key, Steer(key, words, occurred_at, UNANSWERED_KIND, alike))
+    return tuple(found.values())
+
+
 def interim_messages(history: object, *, answer: str) -> tuple[tuple[str, str | None], ...]:
     """What the assistant showed between its tool calls in the turn that ends ``history``, and when.
 
@@ -511,7 +580,7 @@ def steer_source_key(context: TrustedContext, steer: Steer) -> str:
         installation_id=context.binding.installation_id,
         entry_id=context.entry_id,
         session_id="steers",
-        event_kind="steer",
+        event_kind=steer.kind,
         event_id=steer.key,
     )
 

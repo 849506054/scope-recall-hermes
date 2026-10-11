@@ -1,6 +1,6 @@
 {
   "schema": "scope-recall.v11-module-allowlist.v1",
-  "package_version": "3.9.7.1",
+  "package_version": "3.10.0.1",
   "packages": [
     "scope_recall",
     "scope_recall.adapters",
@@ -120,6 +120,7 @@
     "core/lineage.py",
     "core/mutate.py",
     "core/operations.py",
+    "core/owner_view.py",
     "core/read_views.py",
     "core/recall.py",
     "core/recall_budget.py",

@@ -20,7 +20,7 @@ import time
 from dataclasses import asdict, dataclass, field, replace
 from functools import partial
 from itertools import islice
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Mapping, Sequence
 
 from ..contracts import ContractError, InstanceBinding, TrustedContext
 from ..core.capture_filters import redact_private_paths
@@ -61,27 +61,31 @@ QUERY_SEARCH_SHARE = 0.75
 
 
 class _QueryEmbedding:
-    """One query's embedding, asked for when its recall starts instead of after the SQLite channels.
+    """A recall's query embeddings, asked for when it starts instead of after the SQLite channels.
 
     Behind the exact, lexical, claim and recent channels the embedding had three quarters of what they left, about
     2.2 s of a prompt's 4 s window: enough on a warm connection, not for the new one a prompt more than 30 s after the
     last needs (the proxy's tunnel, TLS, then the provider): measured, a remote client's server recalled 4 of 9
     prompts by words alone that way (``AuxiliaryModelError:timeout``).  Asked for as the recall starts, it runs beside
     those channels with its share of the whole window.
+
+    ``queries`` is the question and the other ways recall reads it (``core/owner_view.py``), embedded in one request:
+    one after the other, the second waited for the first on the one persistent connection.
     """
 
-    def __init__(self, query: str, deadline: float) -> None:
-        self.query = query
+    def __init__(self, queries: tuple[str, ...], deadline: float) -> None:
+        self.queries = queries
+        self.query = queries[0]
         self.deadline = deadline
         self._done = threading.Event()
-        self._vector: Any = None
+        self._vectors: tuple[Any, ...] = ()
         self._error: BaseException | None = None
         #: When this stage started and ended, so a recall that comes back without the semantic channel can say what
         #: the embedding alone cost (``_QuerySearch.timeline``).
         self.started = time.monotonic()
         self.finished: float | None = None
 
-    def run(self, embed: Callable[[str, float], Any]) -> None:
+    def run(self, embed: Callable[[tuple[str, ...], float], Sequence[Any]]) -> None:
         try:
             deadline = RequestDeadline.from_absolute(self.deadline, now=time.monotonic())
             with using_request_deadline(deadline):
@@ -90,22 +94,35 @@ class _QueryEmbedding:
                     raise TimeoutError("query embedding stage deadline exhausted")
                 # A connection that failed in milliseconds costs the whole
                 # semantic channel otherwise; a rejected request is not retried.
-                self._vector = embed_with_one_retry(
-                    lambda seconds: embed(self.query, seconds), budget_seconds=budget, remaining=deadline.remaining
+                vectors = tuple(
+                    embed_with_one_retry(
+                        lambda seconds: embed(self.queries, seconds),
+                        budget_seconds=budget,
+                        remaining=deadline.remaining,
+                    )
                 )
+                if len(vectors) != len(self.queries):
+                    raise AuxiliaryModelError("unsupported_response_shape")
+                self._vectors = vectors
         except BaseException as exc:  # the recall that waits for it reports it
             self._error = exc
         finally:
             self.finished = time.monotonic()
             self._done.set()
 
-    def result(self, deadline: float) -> Any:
-        """The vector; the embedding's own failure; a timeout if it is still out at ``deadline``."""
+    def result(self, deadline: float, query: str | None = None) -> Any:
+        """The vector of ``query`` (the question's own by default); the embedding's own failure; a timeout if it is
+        still out at ``deadline``."""
         if not self._done.wait(max(0.0, deadline - time.monotonic())):
             raise AuxiliaryModelError("timeout")
         if self._error is not None:
             raise self._error
-        return self._vector
+        return self._vectors[self.queries.index(self.query if query is None else query)]
+
+
+def _taken(prefetched: Any, deadline: float, query: str) -> Any:
+    """The vector asked for early for ``query``; one asked for the question alone answers ``result(deadline)``."""
+    return prefetched.result(deadline) if query == prefetched.query else prefetched.result(deadline, query)
 
 
 class _OpenMark(threading.Event):
@@ -152,6 +169,11 @@ class _QuerySearch:
         self.embedding: _QueryEmbedding | None = None
         self.started = time.monotonic()
         self.finished: float | None = None
+
+    @property
+    def queries(self) -> tuple[str, ...]:
+        """The question and the other ways recall reads it, asked for early (``_QueryEmbedding.queries``)."""
+        return tuple(getattr(self.embedding, "queries", ()) or (self.query,))
 
     def run(self, search: Callable[[], Any]) -> None:
         try:
@@ -222,21 +244,29 @@ class _LazyVectorPort:
     def __init__(self, instance: "RuntimeInstance") -> None:
         self._instance = instance
 
-    def _query_embedder(self) -> Callable[[str, float], Any] | None:
+    def _embedding_adapter(self) -> LanceVectorPort | None:
         embedding = getattr(self._instance.auxiliary, "query_embedding", None)
         if embedding is None:
             return None
-        adapter = LanceVectorPort(None, embedding, expected_embedding_space=self._instance.config.embedding_space_id())
-        return adapter._embed_query
+        return LanceVectorPort(None, embedding, expected_embedding_space=self._instance.config.embedding_space_id())
 
-    def prefetch_query(self, context: SearchContext) -> _QuerySearch | None:
+    def _query_embedder(self) -> Callable[[str, float], Any] | None:
+        adapter = self._embedding_adapter()
+        return None if adapter is None else adapter._embed_query
+
+    def prefetch_query(self, context: SearchContext, *, also: tuple[str, ...] = ()) -> _QuerySearch | None:
         """Start the query's vector search now, beside the SQLite channels: the embedding in one thread, the store's
         open and the search in another, which overlaps the two as ``search`` does.  The round that asks for the same
-        query takes what it found (``search``)."""
+        query takes what it found (``search``).
+
+        ``also`` are other ways the recall reads the question, embedded in the same request where the route can send
+        several; where it cannot, each is embedded in its own search.  The search started here is the question's own;
+        another reading's search runs in the round that asks for it, with its vector from the same request.
+        """
         if not isinstance(context, SearchContext) or self._instance.config.vector is None:
             return None
-        embed = self._query_embedder()
-        if embed is None:
+        adapter = self._embedding_adapter()
+        if adapter is None:
             return None
         limit = context.limits.vector_limit
         if limit < 1:
@@ -245,13 +275,19 @@ class _LazyVectorPort:
         window = context.deadline - now
         if window <= 0.0:
             return None
-        embedding = _QueryEmbedding(context.query, now + window * QUERY_EMBEDDING_SHARE)
+        queries = tuple(dict.fromkeys((context.query, *also)))
+        many = adapter._queries_embedder() if len(queries) > 1 else None
+        if many is None:
+            queries = queries[:1]
+            one = adapter._embed_query
+            many = lambda texts, seconds: (one(texts[0], seconds),)  # noqa: E731
+        embedding = _QueryEmbedding(queries, now + window * QUERY_EMBEDDING_SHARE)
         # The most any round asks for (``SearchLimits.vector_limit``); a round's own allowance is its first ones.
         # The recall's deadline is the search's cap, and its share is measured inside the search from the moment the
         # embedding lands (``_QuerySearch.deadline_for``): a cold provider round trip is not the collection's to pay.
         pending = _QuerySearch(context.query, limit, context.deadline, share_seconds=window * QUERY_SEARCH_SHARE)
         pending.embedding = embedding
-        threading.Thread(target=embedding.run, args=(embed,), name="scope-recall-query-embedding", daemon=True).start()
+        threading.Thread(target=embedding.run, args=(many,), name="scope-recall-query-embedding", daemon=True).start()
         search = partial(
             self._search, context, limit=limit, prefetched=embedding, opened=pending.opened, search=pending
         )
@@ -272,7 +308,7 @@ class _LazyVectorPort:
             raise ValueError("limit must be between 1 and 200")
         if type(remaining_seconds) not in (int, float) or not math.isfinite(float(remaining_seconds)):
             raise ValueError("remaining_seconds must be finite")
-        if prefetched is not None and prefetched.query != context.query:
+        if prefetched is not None and context.query not in getattr(prefetched, "queries", (prefetched.query,)):
             prefetched = None
         now = time.monotonic()
         remaining = min(float(remaining_seconds), context.deadline - now)
@@ -280,8 +316,17 @@ class _LazyVectorPort:
             return ()
         effective_deadline = min(context.deadline, now + float(remaining_seconds))
         if isinstance(prefetched, _QuerySearch):
-            # Started with the recall; waited for no longer than this round's own search would have taken.
-            return prefetched.candidates(effective_deadline)[:limit]
+            if context.query == prefetched.query:
+                # Started with the recall; waited for no longer than this round's own search would have taken.
+                return prefetched.candidates(effective_deadline)[:limit]
+            # Another way the recall reads the question (``core/owner_view.py``): searched in this round, with the
+            # vector the one request that was asked for early already holds for it.
+            return self._search(
+                replace(context, deadline=effective_deadline),
+                limit=limit,
+                prefetched=prefetched.embedding,
+                search=prefetched,
+            )
         return self._search(replace(context, deadline=effective_deadline), limit=limit, prefetched=prefetched)
 
     def _search(
@@ -306,7 +351,8 @@ class _LazyVectorPort:
             # come and parked for the next request if not, so a fast failure does not wait for the table either.
             try:
                 if prefetched is not None:
-                    prepared.append((context.query, prefetched.result(_embedding_wait(prefetched, effective_deadline))))
+                    taken = _taken(prefetched, _embedding_wait(prefetched, effective_deadline), context.query)
+                    prepared.append((context.query, taken))
                     return True
                 embed = self._query_embedder()
                 if embed is None:
@@ -345,7 +391,8 @@ class _LazyVectorPort:
                 # and reported no gap; Claude Code and Codex lost their vector search this way unseen.
                 raise TimeoutError("native vector helper open deadline exhausted before the search")
             if not prepared and prefetched is not None:
-                prepared.append((context.query, prefetched.result(_embedding_wait(prefetched, effective_deadline))))
+                taken = _taken(prefetched, _embedding_wait(prefetched, effective_deadline), context.query)
+                prepared.append((context.query, taken))
             # The embedding's provider round trip is not the collection's answer to pay for: a search started with
             # the recall takes its share from the moment the embedding landed (``_QuerySearch.deadline_for``).
             run_deadline = (
