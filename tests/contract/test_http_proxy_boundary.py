@@ -117,17 +117,18 @@ def _payload(
     headers: dict[str, str] | None = None,
     timeout_seconds: float = 2.0,
     max_response_bytes: int = 1024,
+    allow_insecure: object = None,
 ) -> bytes:
-    return json.dumps(
-        {
-            "url": url,
-            "body_b64": base64.b64encode(body).decode("ascii"),
-            "headers": headers or {"X-Test": "1"},
-            "timeout_seconds": timeout_seconds,
-            "max_response_bytes": max_response_bytes,
-        },
-        separators=(",", ":"),
-    ).encode("utf-8")
+    request: dict[str, object] = {
+        "url": url,
+        "body_b64": base64.b64encode(body).decode("ascii"),
+        "headers": headers or {"X-Test": "1"},
+        "timeout_seconds": timeout_seconds,
+        "max_response_bytes": max_response_bytes,
+    }
+    if allow_insecure is not None:
+        request["allow_insecure"] = allow_insecure
+    return json.dumps(request, separators=(",", ":")).encode("utf-8")
 
 
 def _decode_result(raw: bytes) -> dict[str, object]:
@@ -243,12 +244,10 @@ def test_https_only_guard_rejects_non_https() -> None:
     [
         "http://127.0.0.1:8080/v1/chat/completions",
         "http://localhost:11434/v1/chat/completions",
-        "http://192.168.5.6:5200/v1/chat/completions",
-        "http://10.0.0.9/v1/embeddings",
         "http://[::1]:8080/api",
     ],
 )
-def test_plain_http_guard_admits_a_local_target(monkeypatch: pytest.MonkeyPatch, url: str) -> None:
+def test_plain_http_guard_admits_a_loopback_target(monkeypatch: pytest.MonkeyPatch, url: str) -> None:
     monkeypatch.setattr(http.client, "HTTPConnection", _RecordingHTTPConnection)
     monkeypatch.setattr(http.client, "HTTPSConnection", _RecordingHTTPSConnection)
     monkeypatch.setattr(worker.urllib.request, "getproxies", dict)
@@ -264,15 +263,47 @@ def test_plain_http_guard_admits_a_local_target(monkeypatch: pytest.MonkeyPatch,
 @pytest.mark.parametrize(
     "url",
     [
+        "http://192.168.5.6:5200/v1/chat/completions",
+        "http://10.0.0.9/v1/embeddings",
+    ],
+)
+def test_plain_http_guard_admits_an_opted_in_target(monkeypatch: pytest.MonkeyPatch, url: str) -> None:
+    """The fork's consolidation route reaches the gateway on this network over plain HTTP; the route's
+    ``allow_insecure_endpoint`` is what the parent states in the request line."""
+    monkeypatch.setattr(http.client, "HTTPConnection", _RecordingHTTPConnection)
+    monkeypatch.setattr(http.client, "HTTPSConnection", _RecordingHTTPSConnection)
+    monkeypatch.setattr(worker.urllib.request, "getproxies", dict)
+    monkeypatch.setattr(worker.urllib.request, "proxy_bypass", lambda _host: True)
+
+    result = _decode_result(worker._request(_payload(url=url, allow_insecure=True)))
+
+    assert result["ok"] is True
+    assert result["status"] == 200
+    assert _RecordingHTTPConnection.created, "a cleartext request must open a plain connection"
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://192.168.5.6:5200/v1/chat/completions",
+        "http://10.0.0.9/v1/embeddings",
         "http://target.example/api",
         "http://93.184.216.34/api",
         "http://[2001:db8::1]/api",
     ],
 )
-def test_plain_http_guard_rejects_a_public_target(url: str) -> None:
+def test_plain_http_guard_rejects_a_target_without_the_opt_in(url: str) -> None:
     result = _decode_result(worker._request(_payload(url=url)))
 
     assert result["error"] == "endpoint_invalid"
+    assert _RecordingHTTPConnection.created == []
+
+
+@pytest.mark.parametrize("value", ["true", 1, [], {"allow": True}])
+def test_plain_http_guard_reads_only_a_literal_boolean(value: object) -> None:
+    result = _decode_result(worker._request(_payload(url="http://192.168.5.6:5200/v1", allow_insecure=value)))
+
+    assert result["error"] == "http_protocol"
     assert _RecordingHTTPConnection.created == []
 
 
