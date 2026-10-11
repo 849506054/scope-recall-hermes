@@ -5,7 +5,6 @@ post every embedding and consolidation request goes through.  The adapters and t
 from __future__ import annotations
 
 import base64
-import ipaddress
 import json
 import math
 import os
@@ -20,6 +19,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from ..contracts import ContractError
+from ..core.endpoint_policy import endpoint_scheme_allowed
 from ..core.secret_patterns import contains_secret_like_text
 from .model_budget import AuxiliaryBudgetLedger
 
@@ -146,53 +146,6 @@ def _hidden_window() -> dict[str, Any]:
     return {"startupinfo": startupinfo, "creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0)}
 
 
-#: Cleartext HTTP is for a model or gateway served on the operator's own network,
-#: where TLS is often unavailable.  The worker repeats this list in
-#: ``runtime/_http_worker.py``; it runs isolated (``-I``) and imports nothing from
-#: the package, so the two copies cannot be shared.  Keep them equal.
-_PLAIN_HTTP_NETWORKS = (
-    ipaddress.ip_network("127.0.0.0/8"),
-    ipaddress.ip_network("::1/128"),
-    ipaddress.ip_network("10.0.0.0/8"),
-    ipaddress.ip_network("172.16.0.0/12"),
-    ipaddress.ip_network("192.168.0.0/16"),
-    ipaddress.ip_network("169.254.0.0/16"),
-    ipaddress.ip_network("fe80::/10"),
-)
-
-
-def plain_http_target_allowed(hostname: str) -> bool:
-    """Whether a cleartext ``http://`` request may address this host.
-
-    A loopback or private literal, or a name reserved for the local network.  A
-    public name is refused rather than resolved: this layer does no DNS, and a
-    name it cannot adjudicate is the one the exception must not cover.
-    """
-    if hostname == "localhost" or hostname.endswith((".localhost", ".local")):
-        return True
-    try:
-        address = ipaddress.ip_address(hostname)
-    except ValueError:
-        return False
-    return any(address in network for network in _PLAIN_HTTP_NETWORKS)
-
-
-def endpoint_scheme_allowed(endpoint: object) -> bool:
-    """Whether a configured endpoint is a URL this transport may address: TLS
-    anywhere, cleartext only to a local target."""
-    if type(endpoint) is not str:
-        return False
-    if endpoint.startswith("https://"):
-        return True
-    if not endpoint.startswith("http://"):
-        return False
-    try:
-        hostname = urllib.parse.urlparse(endpoint).hostname
-    except ValueError:
-        return False
-    return bool(hostname) and plain_http_target_allowed(hostname)
-
-
 def proxy_url_allowed(proxy_url: object) -> bool:
     """Whether a configured egress proxy is one the worker can carry TLS through.
 
@@ -211,13 +164,16 @@ def proxy_url_allowed(proxy_url: object) -> bool:
 
 
 def _worker_request(
-    url: str, *, body: bytes, headers: Mapping[str, str], budget: float, max_response_bytes: int
+    url: str,
+    *,
+    body: bytes,
+    headers: Mapping[str, str],
+    budget: float,
+    max_response_bytes: int,
+    allow_insecure: bool = False,
 ) -> bytes:
     """The one request line the worker accepts, validated before any process starts."""
-    parsed = urllib.parse.urlparse(url)
-    if parsed.scheme not in ("http", "https") or not parsed.hostname:
-        raise AuxiliaryModelError("endpoint_invalid")
-    if parsed.scheme == "http" and not plain_http_target_allowed(parsed.hostname):
+    if not endpoint_scheme_allowed(url, allow_insecure=allow_insecure):
         raise AuxiliaryModelError("endpoint_invalid")
     if not _HTTP_WORKER_PATH.is_file():
         raise AuxiliaryModelError("transport_unavailable")
@@ -232,6 +188,8 @@ def _worker_request(
         "timeout_seconds": budget,
         "max_response_bytes": max_response_bytes,
     }
+    if allow_insecure:
+        request["allow_insecure"] = True
     try:
         request_bytes = json.dumps(request, ensure_ascii=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
     except (TypeError, ValueError) as exc:
@@ -278,11 +236,18 @@ def _worker_reply(stdout: bytes, max_response_bytes: int) -> tuple[int, bytes]:
 class HttpsTransport:
     """Bounded HTTPS POST; query callers may own a persistent stdlib worker."""
 
-    def __init__(self, *, persistent: bool = False, proxy_url: str | None = None):
+    def __init__(
+        self, *, persistent: bool = False, proxy_url: str | None = None, allow_insecure_endpoint: bool = False
+    ):
         from .http_session import HttpWorkerSession
 
+        if type(allow_insecure_endpoint) is not bool:  # only the literal boolean is permission, here as in the config
+            raise ValueError("allow_insecure_endpoint")
         self._session = HttpWorkerSession() if persistent else None
         self._post_lock = threading.Lock()
+        #: Permission to send plaintext HTTP beyond this machine (loopback HTTP needs none).  Held on the transport
+        #: that sends, so the permission cannot be lost between the config and the socket.
+        self._allow_insecure_endpoint = allow_insecure_endpoint
         self._proxy_url = proxy_url
 
     def _worker_environment(self) -> dict[str, str] | None:
@@ -344,7 +309,12 @@ class HttpsTransport:
         budget = validate_timeout_seconds(timeout_seconds)
         deadline = time.monotonic() + budget
         request_bytes = _worker_request(
-            url, body=body, headers=headers, budget=budget, max_response_bytes=max_response_bytes
+            url,
+            body=body,
+            headers=headers,
+            budget=budget,
+            max_response_bytes=max_response_bytes,
+            allow_insecure=self._allow_insecure_endpoint,
         )
         command = [sys.executable, "-I", "-B", str(_HTTP_WORKER_PATH)]
         environment = self._worker_environment()

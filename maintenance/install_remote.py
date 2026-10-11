@@ -1,5 +1,5 @@
 """The remote client's installer: the plugin that sends a client's hooks and MCP calls to its entry's server, or for
-WorkBuddy those hooks and that server merged into WorkBuddy's own files (``remote_client install``).  The installed
+WorkBuddy/dsh those hooks and that server merged into the host's own files (``remote_client install``).  The installed
 entry ``scope_recall.adapters.codex.remote_client`` sends ``install`` here and every other command to the client
 (``adapters/clients/remote_client.py``)."""
 
@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from ..adapters.clients.remote_client import HOOK_TIMEOUTS, RemoteClientError, absolute_path, load_client_config
+from . import install_dsh as dsh
 from . import install_workbuddy as workbuddy
 from .install_claude_code import SHELL_WORD
 from .install_common import SKILLS, InstallError, manifest_version
@@ -36,6 +37,8 @@ def _hook_argv(config: dict[str, Any]) -> list[str]:
 def plugin_files(config: dict[str, Any], plugin_dir: Path) -> dict[Path, str]:
     """The plugin that sends this client's hooks and MCP calls to its entry's server."""
     host = config["host"]
+    if host == "dsh":
+        raise RemoteClientError("a dsh client has no plugin directory: install merges its native rows into dsh's home")
     if host == "workbuddy":
         raise RemoteClientError(
             "a WorkBuddy client has no plugin: install merges its hooks and server into "
@@ -169,35 +172,78 @@ def workbuddy_files(config: dict[str, Any], home: Path) -> dict[Path, bytes]:
     return changed
 
 
+def _write_private(path: Path, content: str | bytes) -> None:
+    """Write ``path`` through a temporary file only this account can read, so the replacement is as private.  dsh's
+    patch and WorkBuddy's MCP file carry the entry's token: written under the default umask, a reinstall handed it
+    to every local account (POSIX modes; on Windows the profile's ACLs keep the files the account's)."""
+    data = content if isinstance(content, bytes) else content.encode("utf-8")
+    pending = path.with_name(path.name + ".tmp")
+    pending.unlink(missing_ok=True)  # one an interrupted run left behind may be readable: never write into it
+    handle = os.open(pending, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0), 0o600)
+    with os.fdopen(handle, "wb") as stream:
+        stream.write(data)
+    os.replace(pending, path)
+
+
+def _keep_private(config: dict[str, Any], home: Path) -> None:
+    """The native file that carries the entry's token, and every backup the installer kept, readable by this account
+    alone whether or not this install changed them, and no temporary copy left beside it: a reinstall repairs an
+    installation an older one left open."""
+    token_file = home / (dsh.PATCH_FILENAME if config["host"] == "dsh" else workbuddy.MCP_FILENAME)
+    if token_file.is_file():
+        token_file.chmod(0o600)
+    # A temporary file an interrupted install left behind may hold a token that is still valid.
+    token_file.with_name(token_file.name + ".tmp").unlink(missing_ok=True)
+    backups = config["state_dir"] / "backups"
+    if backups.is_dir():
+        backups.chmod(0o700)
+        for path in backups.rglob("*"):
+            path.chmod(0o700 if path.is_dir() else 0o600)
+
+
 def install(config: dict[str, Any], plugin_dir: Path) -> dict[str, list[str]]:
-    """Write the plugin, or for WorkBuddy merge into its own files after a copy of each goes to ``backups``."""
+    """Write the plugin, or merge WorkBuddy/dsh's native files after copying changed files to ``backups``."""
     if not config["token_file"].exists():
         raise RemoteClientError("no token yet: run remote_client token first")
     files: dict[Path, str] | dict[Path, bytes]
     backups = []
-    if config["host"] == "workbuddy":
+    if config["host"] in ("workbuddy", "dsh"):
         if not plugin_dir.is_dir():
             raise RemoteClientError(
-                f"{plugin_dir} does not exist: name WorkBuddy's home (~/.workbuddy), or start WorkBuddy once"
+                f"{plugin_dir} does not exist: name {config['host']}'s home, or start that host once"
             )
-        files = workbuddy_files(config, plugin_dir)
+        try:
+            files = (
+                dsh.remote_files(config, plugin_dir, Path(sys.executable))
+                if config["host"] == "dsh"
+                else workbuddy_files(config, plugin_dir)
+            )
+        except InstallError as exc:
+            raise RemoteClientError(str(exc)) from None
         kept = config["state_dir"] / "backups" / datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
         for path in files:
             if path.is_file():
                 kept.mkdir(parents=True, exist_ok=True)
+                kept.chmod(0o700)
                 backups.append(shutil.copy2(path, kept / path.name))
+                Path(backups[-1]).chmod(0o600)
     else:
         files = plugin_files(config, plugin_dir)
     written = []
     for path, content in files.items():
         path.parent.mkdir(parents=True, exist_ok=True)
-        pending = path.with_name(path.name + ".tmp")
-        if isinstance(content, bytes):
-            pending.write_bytes(content)
+        if config["host"] in ("workbuddy", "dsh"):
+            _write_private(path, content)
         else:
-            pending.write_text(content, encoding="utf-8", newline="")
-        os.replace(pending, path)
+            pending = path.with_name(path.name + ".tmp")
+            if isinstance(content, bytes):
+                pending.write_bytes(content)
+            else:
+                pending.write_text(content, encoding="utf-8", newline="")
+            os.replace(pending, path)
         written.append(str(path))
+    if config["host"] in ("workbuddy", "dsh"):
+        _keep_private(config, plugin_dir)
     config["state_dir"].mkdir(parents=True, exist_ok=True)
     return {"written": written, "backups": [str(path) for path in backups]}
 

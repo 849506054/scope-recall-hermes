@@ -276,11 +276,12 @@ C:\path\to\python.exe -c "import json, pathlib; from scope_recall.runtime import
 |-----|------|---------|---------|
 | `credential_env` | string matching `^[A-Z][A-Z0-9_]{0,127}$` | required | **Name** of the environment variable holding the API key. The key itself never appears in this file. |
 | `model` | string, 1–200 chars | absent | Model name sent on the wire. |
-| `endpoint` | `https://` URL, ≤ 2048 chars | absent | Full request URL. Not a base URL: no path is appended. |
+| `endpoint` | URL, ≤ 2048 chars | absent | Full request URL. Not a base URL: no path is appended. `https://` to any host; `http://` to a loopback host (a local model server), or to a non-loopback host only with `allow_insecure_endpoint`. User-info, fragments, and credential-bearing query keys (including encoded aliases) are refused on both HTTP and HTTPS; safe parameters such as `api-version` are allowed. Configure credentials through `credential_env`, never in the URL. |
 | `dimensions` | int, 8–16384 | absent | Vector width. It is sent in the request and the response length is checked against it. |
 | `dialect` | `"gemini"` or `"openai"` | absent | Wire shape. See the next section. |
 | `dimensions_field` | string, a JSON field name | `"dimensions"` | The request field the `openai` dialect sends the width in. Voyage calls it `output_dimension` and refuses `dimensions`. A wire detail: it does not change the embedding space. |
 | `proxy_url` | `http://` URL with a host and an optional port | absent | Egress proxy for this route's requests. The helper that carries them tunnels TLS through it and opens cleartext targets directly; no other process on the host gains a proxy. Routing, not geometry: it does not change the embedding space. |
+| `allow_insecure_endpoint` | literal `true` or `false` | `false` | Permits plaintext `http://` to a host that is not loopback — a container reaching a model server on its host, over a bridge address that is not loopback. **The text being embedded, your memory, then crosses the network unencrypted: turn it on only for a server on a network you trust, and leave it off otherwise.** A local model server on a loopback host needs no opt-in. Only the literal boolean opens it: a quoted `"true"` is refused, so a string cannot grant it. On a plaintext connection the credential-bearing headers (`authorization`, `x-api-key`, `x-goog-api-key`, `cookie`, …) are stripped before the request leaves, so a server that needs a key is reachable only over HTTPS. |
 
 `model`, `endpoint`, `dimensions` and `dialect` move together. Omit all four and
 the route addresses the shipped Gemini space, so an existing installation keeps
@@ -302,7 +303,7 @@ The default kind is an OpenAI-compatible chat-completions route
 | Key | Type | Default | Meaning |
 |-----|------|---------|---------|
 | `model` | string, non-empty | required | Model name. It must also be in `budget.approved_models` and `budget.pricing`. |
-| `endpoint` | `https://` URL | required | Full chat-completions URL. |
+| `endpoint` | URL | required | Full chat-completions URL. Not a base URL: no path is appended. `https://` to any host; `http://` to a loopback host, or to a non-loopback host only with `allow_insecure_endpoint`. |
 | `credential_env` | string matching `^[A-Z][A-Z0-9_]{0,127}$` | required | Name of the environment variable holding the API key. |
 | `output_limit_field` | `"max_tokens"` or `"max_completion_tokens"` | required | Which field this provider expects the output limit in. |
 | `max_output_tokens` | int, 1–131072 | required | Value sent in that field. |
@@ -312,6 +313,7 @@ The default kind is an OpenAI-compatible chat-completions route
 | `stream` | boolean | `false` | Must stay `false`; streaming is refused. |
 | `n` | int | `1` | Must stay `1`. |
 | `headers` | mapping or absent | absent | Extra request headers, validated before use. A second `Authorization` cannot be smuggled in this way. |
+| `allow_insecure_endpoint` | literal `true` or `false` | `false` | Permits plaintext `http://` to a host that is not loopback, for a gateway served on the operator's own network without TLS. The text being consolidated then crosses that network unencrypted: state it only for a network you trust. A plaintext request carries no credential header, so a gateway reachable only over HTTPS is out of reach this way. |
 
 Setting `"kind": "openai_responses"` selects a Responses-API route instead of
 chat completions. It targets the documented contract of DeepSeek
@@ -321,13 +323,14 @@ another provider, and streaming is not implemented:
 | Key | Type | Default | Meaning |
 |-----|------|---------|---------|
 | `model` | string, non-empty | required | Model name, for example `deepseek-flash`. It must also be in `budget.approved_models` and `budget.pricing`. |
-| `endpoint` | `https://` URL | required | Full Responses URL. Not a base URL: no path is appended. |
+| `endpoint` | URL | required | Full Responses URL. Not a base URL: no path is appended. `https://` to any host; `http://` to a loopback host, or to a non-loopback host only with `allow_insecure_endpoint`. |
 | `credential_env` | string matching `^[A-Z][A-Z0-9_]{0,127}$` | required | Name of the environment variable holding the API key. It is read per request and never written to the ledger; the key travels only in the `Authorization` header, as a `Bearer` token that extra `headers` cannot override. |
 | `max_output_tokens` | int, 1–131072 | required | Sent as `max_output_tokens`. On a thinking route this bounds the visible answer **and** the reasoning tokens. |
 | `reasoning_effort` | `"none"`/`"low"`/`"high"`/`"max"`, or absent | absent | Sent as `reasoning.effort`; absent leaves the provider's own default. |
 | `text_format` | `{"type": "json_object"}` or absent | absent | Sent as `text.format`. Plain text is the default and is expressed by omitting the key; a JSON schema is refused rather than forwarded unvalidated. |
 | `stream` | boolean | `false` | Must stay `false`; streaming is refused. |
 | `kind` | `"openai_responses"` | required | Selects this route. |
+| `allow_insecure_endpoint` | literal `true` or `false` | `false` | The same plaintext opt-in as the chat route above. |
 Unknown keys in this block are rejected (`consolidation_unknown_config`) rather
 than ignored, the way the `codex_cli` block already behaves: this dialect is new
 and has no legacy key to stay compatible with.

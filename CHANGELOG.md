@@ -3,6 +3,39 @@
 A line or two per release.  Each release's full notes are on its GitHub release page (tag ``v<version>``), and the
 longer text this file once held is in its history.
 
+## [3.9.7.1] - 2026-10-11
+
+**Fork release.** Incorporates upstream v3.9.7. Endpoint policy lives in one module, and a route
+states a literal `allow_insecure_endpoint` for plaintext HTTP to a host that is not loopback: the
+consolidation route, which reaches the local gateway over plain HTTP, states it. The embedding
+route's own egress proxy (`proxy_url`), the Voyage usage fallback and the Qdrant backend keep their
+fork contracts.
+
+### Upgrading from 3.9.3.1
+
+Install the fork package, run `plan-install` and `apply-install`, then restart the hosts in the
+selected maintenance window. The store schema remains 1110. A consolidation or Responses route that
+addresses a non-loopback host over plain HTTP states `allow_insecure_endpoint: true` in its config
+block; a route without it is held to HTTPS and loopback.
+
+## [3.9.7] - 2026-10-10
+
+What the owner sends to a Hermes agent while it works (a steer) is stored as their words. Most were lost: they were read only at a turn's end and only after the last other row, and were gone once a compression or a turn without a reply came first. A steer is the owner's only when the gateway's origin names them; a parent agent's message to the agent it delegated to, a notice Hermes delivers the same way, and anything after another person's words in a row Hermes joined are not. A steer a compression carries into the next session is not stored a second time, and a deleted one stays deleted.
+
+From an audit by one of the agents (yuheng):
+- The worker's status counts only failed work as failed. A queued item keeps its last attempt's error, and counted among the failures it hid as many that need a look. The queued items' errors are reported apart, as `pending_error_counts`.
+- An everyday first-person statement (我不吃辣, I do not eat spicy food) is bound to the person who said it; someone else's words around a first person (a named speaker, a quote, a pasted transcript) are not.
+- A candidate's name the evaluating model writes differently is restored only when it is the same name: 不吃辣 no longer stands for 吃辣, nonprod for prod, nor "allow delete if approved" for "allow delete".
+- Paged consolidation looks for a quote on the current page first, so escaped text it can find there is no longer refused (#230).
+
+A model server on this machine is reachable over plain HTTP again, and one on another host with the literal opt-in `allow_insecure_endpoint`, which is off by default: the text being embedded then crosses the network unencrypted (#226, #227, contributed by @panxuewen0101). A plaintext request never carries a credential, and no model endpoint URL may carry one, in its query or its user part, over HTTPS either.
+
+dsh on another machine can attach to the shared store as a remote entry, through its native plugin (#229).
+
+### Upgrading from 3.9.3
+
+Install the package, run `plan-install` and `apply-install` for each upgraded entry, then restart the Hermes gateways and the clients' MCP servers. The schema is unchanged (1110). A model endpoint whose URL carries a credential (`?key=`, `?api_key=`, `user:password@`) is now refused: name the key's environment variable in `credential_env` instead. For a remote dsh entry, follow `docs/remote-entries.md`. 3.9.4 to 3.9.6 were candidates on the release branch and were never published.
+
 ## [3.9.3.1] - 2026-10-09
 
 **Fork release.** Incorporates upstream v3.9.2 and v3.9.3 in one merge. Upstream's split files

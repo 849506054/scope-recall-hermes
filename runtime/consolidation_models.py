@@ -14,6 +14,7 @@ from types import MappingProxyType
 from typing import Any
 
 from ..contracts import ContractError
+from ..core.endpoint_policy import endpoint_scheme_allowed
 from .model_budget import AuxiliaryBudgetLedger, BudgetPolicy
 from .models import (
     MAX_CHAT_RESPONSE_BYTES,
@@ -21,7 +22,6 @@ from .models import (
     AuxiliaryModelError,
     HttpsTransport,
     HttpTransport,
-    endpoint_scheme_allowed,
     json_bytes,
     load_credential,
     metered_post,
@@ -288,9 +288,15 @@ class ConsolidationRouteConfig:
     stream: bool = False
     n: int = 1
     headers: Mapping[str, str] | None = None
+    #: Permission for plaintext HTTP to a host that is not this machine, stated
+    #: literally in the config (loopback HTTP needs none).  A gateway served on
+    #: the operator's own network, without TLS, is reachable this way.
+    allow_insecure_endpoint: bool = False
 
     def __post_init__(self) -> None:
-        _validate_route_target(self.model, self.endpoint, self.credential_env)
+        _validate_route_target(
+            self.model, self.endpoint, self.credential_env, allow_insecure=self.allow_insecure_endpoint
+        )
         if self.output_limit_field not in {"max_tokens", "max_completion_tokens"}:
             raise ValueError("output_limit_field")
         if type(self.max_output_tokens) is not int or not 1 <= self.max_output_tokens <= 131_072:
@@ -312,12 +318,16 @@ class ConsolidationRouteConfig:
         object.__setattr__(self, "headers", _validate_consolidation_headers(self.headers))
 
 
-def _validate_route_target(model: object, endpoint: object, credential_env: object) -> None:
+def _validate_route_target(
+    model: object, endpoint: object, credential_env: object, *, allow_insecure: bool = False
+) -> None:
     """A consolidation route names a model, an endpoint this transport may address, and the environment variable
     holding its key."""
     if type(model) is not str or not model:
         raise ValueError("model")
-    if not endpoint_scheme_allowed(endpoint):
+    if type(allow_insecure) is not bool:
+        raise ValueError("allow_insecure_endpoint")
+    if type(endpoint) is not str or not endpoint_scheme_allowed(endpoint, allow_insecure=allow_insecure):
         raise ValueError("endpoint")
     validate_credential_env_name(credential_env)
 
@@ -358,9 +368,14 @@ class ResponsesRouteConfig:
     text_format: Mapping[str, str] | None = None
     stream: bool = False
     kind: str = RESPONSES_KIND
+    #: Permission for plaintext HTTP to a host that is not this machine, stated
+    #: literally in the config (loopback HTTP needs none).
+    allow_insecure_endpoint: bool = False
 
     def __post_init__(self) -> None:
-        _validate_route_target(self.model, self.endpoint, self.credential_env)
+        _validate_route_target(
+            self.model, self.endpoint, self.credential_env, allow_insecure=self.allow_insecure_endpoint
+        )
         if type(self.max_output_tokens) is not int or not 1 <= self.max_output_tokens <= 131_072:
             raise ValueError("max_output_tokens")
         if self.reasoning_effort is not None and (
@@ -388,7 +403,11 @@ class _ConsolidationAdapter:
         self._route = route
         self._ledger = ledger
         self._reserve_input = reserve_input
-        self._transport = transport if transport is not None else HttpsTransport()
+        self._transport = (
+            transport
+            if transport is not None
+            else HttpsTransport(allow_insecure_endpoint=route.allow_insecure_endpoint)
+        )
 
     def _send(self, body: bytes, deadline: float, *, headers, read_usage, read_result) -> str:
         """One proposal request, metered; refused when its time is up or the provider is holding calls.  ``headers``

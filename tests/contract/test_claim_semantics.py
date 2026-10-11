@@ -7,13 +7,13 @@ import pytest
 from scope_recall.contracts import ContractError
 from scope_recall.core import CoreConfig, MemoryCore
 from scope_recall.core.claims import RootEvidence, qualify
-from scope_recall.core.source_qualification import conditions_match
+from scope_recall.core.source_qualification import conditions_match, self_report_bound
 
 from tests.contract.test_claims import Clock, capture, initial, revise_request
 from tests.v11_support import context
 
 
-def qualification(text, *, subject="user", value="蓝色", conditions=(), principal=None):
+def qualification(text, *, subject="user", value="蓝色", conditions=(), principal=None, quote=None):
     if principal is None:
         principal = {
             "kind": "human",
@@ -40,7 +40,7 @@ def qualification(text, *, subject="user", value="蓝色", conditions=(), princi
         statement_kind="assertion",
         valid_from=root.occurred_at,
         valid_to=None,
-        evidence_spans=[dict(source_ref=root.ref, source_revision=1, quote=text)],
+        evidence_spans=[dict(source_ref=root.ref, source_revision=1, quote=text if quote is None else quote)],
     )
     return qualify(proposal, (root,))
 
@@ -96,6 +96,153 @@ def test_self_report_does_not_promote_third_party_or_team_to_user():
     ):
         assert qualification(text, value=value).state == "proposed", text
     assert qualification("我的同事喜欢蓝色。", subject="我").state == "proposed"
+
+
+def test_an_everyday_self_report_is_the_speaker_s():
+    """我不吃辣 is the speaker's own as 我喜欢蓝色 is, after their own framing too (老实说，That said, a list
+    marker).  Said of someone else, quoted, reported, or with the value away from the verb, it is not."""
+    said = "我登陆了，我不吃辣，预算40以下都可以，尽量20左右，但是超出也没事，不超过40最好，除非那菜特别好"
+    assert self_report_bound(said, "不吃辣", kind="preference")
+    assert not self_report_bound("客户说" + said, "不吃辣", kind="preference")
+    for text, value in (
+        ("我不吃辣。", "不吃辣"),
+        ("我不喝酒。", "不喝酒"),
+        ("我平时不太吃辣。", "不太吃辣"),
+        ("我从来不抽烟。", "从来不抽烟"),
+        ("我从不抽烟。", "从不抽烟"),
+        ("我爱吃辣。", "辣"),
+        ("我对花生过敏。", "对花生过敏"),
+        ("我讨厌香菜。", "讨厌香菜"),
+        ("I do not eat spicy food.", "do not eat spicy food"),
+        ("I never drink coffee.", "never drink coffee"),
+        ("I'm allergic to peanuts.", "allergic to peanuts"),
+        ("I don't eat spicy food.", "don't eat spicy food"),
+        ("我说：我不吃辣。", "不吃辣"),
+        ("我不能吃辣。", "不能吃辣"),
+        ("我只喝美式。", "只喝美式"),
+        ("Honestly, I never drink coffee.", "never drink coffee"),
+        ("I don't really eat pork.", "don't really eat pork"),
+        ("老实说，我不吃辣。", "不吃辣"),
+        ("一般来说，我不喝酒。", "不喝酒"),
+        ("跟你说，我不吃辣。", "不吃辣"),
+        ("That said, I never drink coffee.", "never drink coffee"),
+        ("- I don't eat spicy food.", "don't eat spicy food"),
+        ("- I prefer dark mode.", "dark mode"),
+        ("In general I never drink coffee.", "never drink coffee"),
+        ("嗯，老实说，我不吃辣。", "不吃辣"),
+        ("- That said, I never drink coffee.", "never drink coffee"),
+        ("In practice I never drink coffee.", "never drink coffee"),
+        ("In practice I prefer blue.", "blue"),
+        ("- My preference is blue.", "blue"),
+        ("I never drink coffee.\nUpdate: the rest is done.", "never drink coffee"),
+        ("https://example.com/menu\nI never drink coffee.", "never drink coffee"),
+    ):
+        verdict = qualification(text, value=value)
+        assert verdict.state == "active", (text, verdict.reason)
+    for text, value in (
+        ("客户说我不吃辣。", "不吃辣"),
+        ("她说：“我不吃辣。”", "不吃辣"),
+        ("我们不吃辣。", "不吃辣"),
+        ("我妈不吃辣。", "不吃辣"),
+        ("张三说：我不吃辣。", "不吃辣"),
+        ("张三说：'我不吃辣'", "不吃辣"),
+        ("Alice said: 'I eat spicy food.'", "eat spicy food"),
+        ("Alice said I do not eat spicy food.", "do not eat spicy food"),
+        ("我对象对花生过敏。", "对花生过敏"),
+        ("我对象过敏。", "对象过敏"),
+        ("我看不吃辣更健康。", "不吃辣"),
+        ("我对面的同事对花生过敏。", "对花生过敏"),
+        ("我讨厌吃香菜的人。", "讨厌吃香菜"),
+        ("儿子：我不喝牛奶。", "不喝牛奶"),
+        ("比如：我不喝酒。", "不喝酒"),
+        ("我不打算戒烟。", "戒烟"),
+        ("Everyone thinks I drink coffee.", "drink coffee"),
+        ("For example, I never smoke.", "never smoke"),
+        ("The rumor that I eat spicy food is false.", "eat spicy food"),
+        ("The rumor that I prefer blue is false.", "blue"),
+        ("张三说，我不吃辣。", "不吃辣"),
+        ("张三表示，我不喝酒。", "不喝酒"),
+        ("张三跟你说，我不吃辣。", "不吃辣"),
+        ("Alice sent a message that said, I never drink coffee.", "never drink coffee"),
+        ("Alice:\n- I eat spicy food.", "eat spicy food"),
+        ("儿子：\n- 我不喝牛奶。", "不喝牛奶"),
+        ("Alice:\nIn general I never drink coffee.", "never drink coffee"),
+        ("儿子：老实说，我不喝牛奶。", "不喝牛奶"),
+        ("Alice:\nMy preference is blue.", "blue"),
+        ("- Alice:\nMy preference is blue.", "blue"),
+        ("* Alice:\nMy preference is blue.", "blue"),
+        ("1. Alice:\nMy preference is blue.", "blue"),
+        ("- [10:32] Alice:\nMy preference is blue.", "blue"),
+        ("- 儿子：\n我不喝牛奶。", "不喝牛奶"),
+        ("Alice:\nWell,\nin general I never drink coffee.", "never drink coffee"),
+        ("[10:32] Alice: I never drink coffee.", "never drink coffee"),
+        ("[10:32] Alice:\nI never drink coffee.", "never drink coffee"),
+        ("<alice> I never drink coffee.", "never drink coffee"),
+        ("<alice>\nI never drink coffee.", "never drink coffee"),
+        ("- The rumor that I eat spicy food is false.", "eat spicy food"),
+        ("Son: I don't drink milk.", "don't drink milk"),
+        ("他和我都不吃辣。", "不吃辣"),
+        ("张三爱吃辣 我不吃。", "爱吃辣"),
+        ("我看他不吃辣。", "不吃辣"),
+        ("我看不吃辣的人更健康。", "不吃辣"),
+        ("我觉得他不喝酒。", "不喝酒"),
+        ("我用他的电脑。", "电脑"),
+        ("He does not eat spicy food.", "does not eat spicy food"),
+        ("My wife never drinks coffee.", "never drinks coffee"),
+    ):
+        assert not self_report_bound(text, value, kind="preference"), text
+        assert qualification(text, value=value).state == "proposed", text
+
+
+def test_a_transcript_s_label_outside_the_quote_s_sentence_still_names_someone_else():
+    """A claim's evidence is read around its quote.  A pasted transcript's label lines above it are someone else's
+    words all the same, and so is a label in Markdown emphasis or on a quoted line; the owner's own words before a
+    label are theirs."""
+    preference = ("My preference is blue.", "blue")
+    for text, (quote, value) in (
+        ("Alice:\nHello.\nMy preference is blue.", preference),
+        ("**Alice:**\nMy preference is blue.", preference),
+        ("**Alice**: hi\nMy preference is blue.", preference),
+        ("> Alice: hi\nMy preference is blue.", preference),
+        ("Alice (10:32):\nHello.\nMy preference is blue.", preference),
+        ("Alice sent this.\n```\nMy preference is blue.\n```", preference),
+        ("Alice sent this.\n~~~\nHi.\nMy preference is blue.\n~~~", preference),
+        ("张三发来这段。\n> 你好。\n> 我不吃辣。", ("我不吃辣。", "不吃辣")),
+        ("Alice sent this.\n```\nMy preference is blue.\n```", ("```\nMy preference is blue.\n```", "blue")),
+        ("Alice sent this.\n~~~markdown\n```\nMy preference is blue.\n```\n~~~", preference),
+        ("Alice sent this.\n“Hello.\nMy preference is blue.\n”", preference),
+        ('Alice sent this.\n"Hello.\nMy preference is blue."', preference),
+        ("张三发来这段。\n「你好。\n我不吃辣。」", ("我不吃辣。", "不吃辣")),
+        ("Alice sent this.\n‘Hello.\nMy preference is blue.\n’", preference),
+        ("Alice sent this.\n‘I don’t mind.\nMy preference is blue.\n’", preference),
+        ("Alice sent this.\n‘The others’ choices are fine.\nMy preference is blue.\n’", preference),
+        ("Alice sent this.\n'Hello.\nMy preference is blue.\n'", preference),
+        ("Alice wrote ‘Hello.\nMy preference is blue.\n’", preference),
+        ("Alice wrote 'Hello.\nMy preference is blue.\n'", preference),
+        ("Alice sent this.\n```\n```python\nMy preference is blue.\n```", preference),
+        ("[2026-10-10 Saturday] Alice Wonderland-Smith:\nMy preference is blue.", preference),
+    ):
+        assert qualification(text, value=value, quote=quote).state == "proposed", text
+    for owner_text in (
+        "My preference is blue.\nUpdate: done.",
+        "My preference is blue.\n```\nTEST code\n```",
+        "```text\n~~~\n```\nMy preference is blue.",
+        "````\n```\n````\nMy preference is blue.",
+        'He called it "fine".\nMy preference is blue.',
+        "我说“好”。\nMy preference is blue.",
+        "```python\ndelimiter = '\"'\n```\nMy preference is blue.",
+        "```python\nname: str = 'x'\n```\nMy preference is blue.",
+        "It’s settled.\nMy preference is blue.",
+        "‘Hello.’\nMy preference is blue.",
+        "The others’ choices are fine.\nMy preference is blue.",
+        "'Hi.\nBye.'\nMy preference is blue.",
+        "Alice said ‘hi’.\nMy preference is blue.",
+        "It's done, and the students' books are back.\nMy preference is blue.",
+        "```inline``` is code.\nMy preference is blue.",
+        "Here is a short summary of where things stand this week:\nMy preference is blue.",
+    ):
+        owner = qualification(owner_text, value="blue", quote="My preference is blue.")
+        assert owner.state == "active", owner_text
 
 
 def test_self_report_requires_a_verified_c1_principal():

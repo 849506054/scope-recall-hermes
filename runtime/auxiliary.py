@@ -179,21 +179,30 @@ def _embedding_route_from_mapping(raw: object) -> EmbeddingRouteConfig | None:
     # shipped Gemini space, or state all four to address another provider.
     # EmbeddingRouteConfig rejects a partial descriptor.
     # The width's field name is a wire detail of the openai dialect, optional on its own.
+    dimensions_field = (
+        None if raw.get("dimensions_field") is None else text("embedding_dimensions_field", raw.get("dimensions_field"))
+    )
     # So is the egress proxy: it routes this route's helper, and states no geometry.
-    wire: dict[str, Any] = {}
-    if raw.get("dimensions_field") is not None:
-        wire["dimensions_field"] = text("embedding_dimensions_field", raw.get("dimensions_field"))
-    if raw.get("proxy_url") is not None:
-        wire["proxy_url"] = text("embedding_proxy_url", raw.get("proxy_url"))
+    proxy_url = None if raw.get("proxy_url") is None else text("embedding_proxy_url", raw.get("proxy_url"))
     if all(raw.get(key) is None for key in ("model", "endpoint", "dimensions", "dialect")):
-        return EmbeddingRouteConfig(credential_env=credential_env, **wire)
+        return EmbeddingRouteConfig(
+            credential_env=credential_env,
+            dimensions_field=dimensions_field or "dimensions",
+            proxy_url=proxy_url,
+        )
     return EmbeddingRouteConfig(
         credential_env=credential_env,
         model=text("embedding_model", raw.get("model")),
         endpoint=text("embedding_endpoint", raw.get("endpoint")),
         dimensions=positive_int("embedding_dimensions", raw.get("dimensions")),
         dialect=text("embedding_dialect", raw.get("dialect")),
-        **wire,
+        # Permission for plaintext HTTP beyond this machine.  Only a literal boolean reads as permission
+        # (``EmbeddingRouteConfig`` refuses anything else), so a string "true" in a config file cannot open it.
+        allow_insecure_endpoint=strict_bool(
+            "embedding_allow_insecure_endpoint", raw.get("allow_insecure_endpoint", False)
+        ),
+        dimensions_field=dimensions_field or "dimensions",
+        proxy_url=proxy_url,
     )
 
 
@@ -209,6 +218,7 @@ _RESPONSES_ROUTE_KEYS = (
     "reasoning_effort",
     "text_format",
     "stream",
+    "allow_insecure_endpoint",
 )
 
 
@@ -224,6 +234,9 @@ def _responses_route_from_mapping(raw: Mapping[str, Any]) -> ResponsesRouteConfi
         text_format=raw.get("text_format"),
         stream=raw.get("stream", False),
         kind=raw.get("kind", RESPONSES_KIND),
+        allow_insecure_endpoint=strict_bool(
+            "consolidation_allow_insecure_endpoint", raw.get("allow_insecure_endpoint", False)
+        ),
     )
 
 
@@ -253,6 +266,9 @@ def _consolidation_route_from_mapping(
         stream=raw.get("stream", False),
         n=raw.get("n", 1),
         headers=raw.get("headers"),
+        allow_insecure_endpoint=strict_bool(
+            "consolidation_allow_insecure_endpoint", raw.get("allow_insecure_endpoint", False)
+        ),
     )
 
 

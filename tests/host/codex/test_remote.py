@@ -460,8 +460,8 @@ def test_a_remote_client_waits_as_long_as_a_local_one():
 @pytest.mark.parametrize("host", remote_client.HOSTS)
 def test_the_plugin_sends_hooks_and_tools_to_the_server(tmp_path, host):
     config = _client(tmp_path, host, 18765)
-    if host == "workbuddy":
-        # WorkBuddy has no plugin: install merges into its own settings (the next test), and never writes a Codex one.
+    if host in ("workbuddy", "dsh"):
+        # Native home installs must never fall through to a Codex plugin.
         with pytest.raises(remote_client.RemoteClientError, match="no plugin"):
             install_remote.plugin_files(config, tmp_path / "TEST-plugin" / "scope-recall")
         return
@@ -566,6 +566,30 @@ def test_the_hook_answers_in_ascii_whatever_the_code_page(tmp_path, monkeypatch,
     assert remote_client.main(["--config", str(config["config"])]) == 0
     out = capsys.readouterr().out
     assert out.isascii() and json.loads(out) == recalled
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX file modes; on Windows the profile's ACLs keep the files private")
+def test_a_workbuddy_client_keeps_its_token_file_private(tmp_path):
+    """mcp.json carries the entry's token: written, left unchanged, or copied into a temporary file an interrupted run
+    left behind, it is this account's alone after an install."""
+    config = _client(tmp_path, "workbuddy", 18769)
+    home = tmp_path / "TEST-private-profile" / ".workbuddy"
+    home.mkdir(parents=True)
+    mcp = home / "mcp.json"
+    mcp.write_text(json.dumps({"mcpServers": {}}), encoding="utf-8")
+    mcp.chmod(0o644)
+    stale = home / "mcp.json.tmp"
+    umask = os.umask(0o022)
+    try:
+        assert "mcp.json" in [Path(path).name for path in install_remote.install(config, home)["written"]]
+        assert mcp.stat().st_mode & 0o077 == 0
+        mcp.chmod(0o644)
+        stale.write_text("TEST stale token", encoding="utf-8")
+        stale.chmod(0o644)
+        assert install_remote.install(config, home)["written"] == []
+    finally:
+        os.umask(umask)
+    assert mcp.stat().st_mode & 0o077 == 0 and not stale.exists()
 
 
 def test_a_workbuddy_client_with_nothing_to_add_writes_nothing(tmp_path, monkeypatch, capsys):
