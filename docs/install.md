@@ -289,7 +289,11 @@ what an audience row on its route gives it.
 A gateway route (Telegram, WeChat, Feishu, a Desktop login) is granted by an
 audience row in `installation.json`, matched field by field against what the host
 sends: `platform`, `user_id`, `chat_type`, `chat_id`, `thread_id`,
-`gateway_session_key` and `agent_workspace`. A row whose `gateway_session_key` is
+`gateway_session_key` and `agent_workspace`. The command line writes such rows
+only for local surfaces and their logins; a gateway route's row is declared with
+the installation API, in the whole manifest, before anything creates the store,
+as a migration does ([AGENT_WORKFLOW.md](../maintenance/AGENT_WORKFLOW.md),
+section 2). A row whose `gateway_session_key` is
 empty does not pin the host's session key, which is built from the platform, chat
 type and chat the row already matches; a row that names one matches only that key.
 For a plain, unthreaded chat a gateway sends an empty `thread_id`, so the row needs
@@ -694,7 +698,14 @@ scope-recall retry-failures --config /path/to/instance-root/scope-recall/runtime
 ```
 
 Without `--apply` nothing is written. `--include-terminal` also re-runs failures
-that are terminal by design. The same command returns to the replay the captures
+that are terminal by design. Each release gives a failure one re-look: a row this
+release re-opened that failed again is left by a later run in the same release,
+which counts it (`already_retried`, the first eight ids in
+`already_retried_work_ids`). To re-run such a row within the release, name it:
+`python -I -X utf8 -m scope_recall.runtime.worker_entry --config <file>
+--retry-failed <work id> [...]` takes up to eight ids, at most twice for one item,
+re-queues them and runs one pass (with `--env-file` when its routes need
+credentials). `retry-failures` also returns to the replay the captures
 the inbox gave up after their tries (`inbox_given_up` in its output, and what gave
 them up in `inbox_by_kind`; without `--apply` it only counts them), each with its
 tries counted anew (one given up while it was being given a new key goes back to that

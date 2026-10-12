@@ -3,6 +3,31 @@
 A line or two per release.  Each release's full notes are on its GitHub release page (tag ``v<version>``), and the
 longer text this file once held is in its history.
 
+## [3.10.1.1] - 2026-10-12
+
+**Fork release.** Incorporates upstream v3.10.1. `retry-failures` now gives a failed item its one
+re-look per release rather than per schema, so an item re-opened before a fix that shipped without
+a schema change can run again, and the release makes `migrate prepare` name what blocks it. The
+fork's contracts are unchanged: the Qdrant backend behind the standard port, the embedding route's
+own egress proxy, the Voyage usage fallback, the literal `allow_insecure_endpoint` on the
+consolidation route, and the two readings of a question that names the store's owner.
+
+### Upgrading from 3.10.0.1
+
+Install the fork package, run `plan-install` and `apply-install` for each entry, then restart the
+Hermes gateways and the clients' MCP servers in the selected maintenance window. The store schema
+remains 1110.
+
+## [3.10.1] - 2026-10-11
+
+`retry-failures` gives a failed item its one re-look per release, not per schema. Most fixes that can cure a failure (a validation, a route, a bound) ship without a schema change, so an item re-opened before such a fix stayed failed after it: two long consolidations refused on a later page before 3.9.7, which restores escaped text on those pages, could run again on neither 3.9.7 nor 3.10.0 (#233). An item an earlier release re-opened, under the old schema stamp too, is re-opened once by this one. A second run in the same release re-opens nothing, and now counts what it skipped for that reason and names the first of them (`already_retried`, `already_retried_work_ids`); one of those can still be re-run by its id with `worker_entry --retry-failed`, at most twice for one item. The stamp now outlives the item's next failure: a failure other than an invalid result, an automatic retry, a provider refusing everyone or a lost lease used to rewrite the code without it, and the same item could then be re-opened again and again. The same rewrites no longer reset the item's other budgets either (its two explicit retries, its automatic recoveries, the single retry of an interrupted evaluation): every mark a budget is read from is read wherever it stands in the code and kept when the code is rebuilt, and a code past its length bound gives way between those marks and its failure kind.
+
+`migrate prepare` says what blocks it (#231). A destination whose store was made before its manifest was complete (`apply-install` first, the manifest rewritten after) answered only `invalid_or_unavailable_input`. Now it says that a store keeps the scopes it was created with, so the whole manifest comes first. Old scopes mapped onto one target are named (`colliding_scope_ids`), and the targets the destination does not register are no longer dropped from the answer. A contract refusal gives its code and field, and a manifest the installer would refuse is a blocked answer instead of a traceback. The migration workflow now tells how to keep a minted `srdesk_*` Desktop scope beside the CLI's: it maps to itself, while both onto `owner_private` is refused as many-to-one. It also tells how to declare a gateway route (Feishu, Telegram) with the installation API before the store exists.
+
+### Upgrading from 3.10.0
+
+Install the package, run `plan-install` and `apply-install` for each upgraded entry, then restart the Hermes gateways and the clients' MCP servers. The schema is unchanged (1110). `retry-failures --config <file>` then counts the failures this release may re-open; `--apply` re-opens them (`--include-terminal` adds the by-design ones).
+
 ## [3.10.0.1] - 2026-10-11
 
 **Fork release.** Incorporates upstream v3.10.0. A question that names the store's owner is read

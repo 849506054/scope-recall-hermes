@@ -12,16 +12,21 @@ from .delete_storage import purge_work_parts
 from .failure_retry import (
     AUTO_RECOVERABLE_ERRORS,
     DERIVATION_RETRY_MARKER,
+    RETRY_GENERATION,
+    RETRY_MARKER,
+    already_retried,
     marked,
-    selects,
     validate_page,
     validation_feedback,
+    wanted,
 )
 from .inbox_rules import deferred_path
 from .schema import SCHEMA_VERSION
 
 MAX_RECOVERABLE_ATTEMPTS = 3
 MAX_OPERATOR_RETRIES = 2
+#: Work items one explicit operator retry may name.
+MAX_OPERATOR_PAGE = 8
 #: Failed rows one pass may reopen.  Reopening a failure is not the same kind of
 #: work as claiming a ready item: each reopened row becomes a model call later,
 #: so it keeps its own page however large a pass of cheap work may be.  It was
@@ -32,10 +37,25 @@ MAX_RECOVERY_PAGE = 200
 #: group together claims as much of itself as it is allowed to process.
 MAX_CLAIM_PAGE = 1000
 INTERRUPTED_RETRY_MARKER = "interrupted_retry:1"
+#: What ``recover_oversized_consolidations`` writes on the row it repairs, its one repair.
+CHUNK_UPGRADE_MARKER = "chunk_upgrade:1106"
 OPERATOR_ORIGINS = frozenset({"human_direct", "host_generated"})
 _OPERATION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}")
-_OPERATOR_TOKEN = re.compile(r"(?:^|\|prior:)operator_retry:([A-Za-z0-9][A-Za-z0-9_.-]{0,63})(?=\||$)")
-_AUTO_TOKEN = re.compile(r"(?:^|\|(?:prior:)?)auto_retry:([0-9]+)(?=\||$)")
+#: The longest error code a row keeps, and the longest failure kind a shortened one keeps beside its marks.
+CODE_BOUND = 1024
+_KIND_BOUND = 128
+# A mark is read wherever a later step left it: at the start, after another segment, or behind an explicit retry's
+# ``prior:``, which keeps the code it found.
+_AT_A_MARK = r"(?:^|\|)(?:prior:)?"
+#: Each explicit retry's token; together they are the item's explicit budget.
+_OPERATOR_TOKEN = re.compile(rf"{_AT_A_MARK}operator_retry:([A-Za-z0-9][A-Za-z0-9_.-]{{0,63}})(?=\||$)")
+_AUTO_TOKEN = re.compile(rf"{_AT_A_MARK}auto_retry:([0-9]+)(?=\||$)")
+#: The marks a retry budget is read from, but the automatic count: a release's re-look, the extra derivation
+#: attempt, the interrupted attempt's, the one repair of an old oversized consolidation, an explicit retry.
+_BUDGET_MARK = re.compile(
+    rf"{_AT_A_MARK}({RETRY_MARKER}:[^|]+|{DERIVATION_RETRY_MARKER}|{INTERRUPTED_RETRY_MARKER}|{CHUNK_UPGRADE_MARKER}"
+    rf"|operator_retry:[A-Za-z0-9][A-Za-z0-9_.-]{{0,63}})(?=\||$)"
+)
 
 #: Failures that are never about the work item.  A provider declining to serve
 #: anyone says nothing about this payload -- unlike a timeout, which a large
@@ -158,25 +178,31 @@ def _failure_kind(error: str) -> str:
     return error.rsplit("|", 1)[-1]
 
 
+def _budget_marks(error: str, *, counted: bool = True) -> str:
+    """Every mark in ``error`` a retry budget is read from, once each in the order met, and the automatic count
+    unless ``counted`` is off: what a code that is rebuilt or shortened must keep, or a spent budget begins again."""
+    marks = "".join(f"{mark}|" for mark in dict.fromkeys(_BUDGET_MARK.findall(error)))
+    count = _auto_count(error) if counted else 0
+    return marks + (f"auto_retry:{count}|" if count else "")
+
+
+def _within(code: str) -> str:
+    """``code``, a history ending in its failure kind, within ``CODE_BOUND``.  Past it, what lies between its budget
+    marks and its kind gives way: the history is detail, the marks and the kind decide what is done next.  A kind
+    longer than any the worker writes is cut, so the marks always fit."""
+    if len(code) <= CODE_BOUND:
+        return code
+    return (_budget_marks(code) + _failure_kind(code)[-_KIND_BOUND:])[:CODE_BOUND]
+
+
 def _preserve_retry_history(error) -> bool:
-    return bool(
-        error
-        and (
-            str(error).startswith(("operator_retry:", "chunk_upgrade:1106|"))
-            or _auto_count(str(error))
-            or "derivation_retry:1" in str(error)
-        )
-    )
+    """Whether a new failure is added to ``error`` rather than replacing it: it holds a mark a budget is read from."""
+    return bool(error) and bool(_budget_marks(str(error)))
 
 
 def _auto_retry_stamp(error: str) -> str:
-    """The error code of a row granted one automatic recovery."""
-    stamp = f"auto_retry:{_auto_count(error) + 1}|{_failure_kind(error)}"
-    if "derivation_retry:1|" in error:
-        stamp = "derivation_retry:1|" + stamp
-    if error.startswith("operator_retry:"):
-        stamp = f"{error}|{stamp}"[-1024:]
-    return stamp
+    """The error code of a row granted one automatic recovery: its marks, its new count and its failure kind."""
+    return _within(f"{_budget_marks(error, counted=False)}auto_retry:{_auto_count(error) + 1}|{_failure_kind(error)}")
 
 
 def _capacity_count(error: object) -> int:
@@ -494,13 +520,19 @@ class WorkItems:
         visible, params = self._visible_filter()
         base = f"state='leased' AND {visible} AND lease_until IS NOT NULL AND lease_until < ?"
         params = (*params, now)
-        failed = conn.execute(
-            f"""UPDATE work_items SET state='failed',lease_owner=NULL,lease_until=NULL,last_error_code=CASE
-                    WHEN last_error_code LIKE 'operator_retry:%' OR last_error_code LIKE 'auto_retry:%' OR last_error_code LIKE '%derivation_retry:1|%' THEN last_error_code || '|lease_exhausted'
-                    ELSE 'lease_exhausted' END, available_at=?
-                WHERE {base} AND attempt >= ?""",
-            (now, *params, MAX_RECOVERABLE_ATTEMPTS),
-        ).rowcount
+        # A lost lease is a failure like another: a history a budget is read from is added to, anything else replaced.
+        spent = conn.execute(
+            f"SELECT work_id,last_error_code FROM work_items WHERE {base} AND attempt >= ?",
+            (*params, MAX_RECOVERABLE_ATTEMPTS),
+        ).fetchall()
+        for work_id, prior in spent:
+            code = _within(f"{prior}|lease_exhausted") if _preserve_retry_history(prior) else "lease_exhausted"
+            conn.execute(
+                """UPDATE work_items SET state='failed',lease_owner=NULL,lease_until=NULL,last_error_code=?,
+                   available_at=? WHERE work_id=? AND state='leased'""",
+                (code, now, work_id),
+            )
+        failed = len(spent)
         released = conn.execute(
             f"""UPDATE work_items SET state='pending',lease_owner=NULL,lease_until=NULL
                 WHERE {base} AND attempt < ?""",
@@ -717,10 +749,10 @@ class WorkItems:
                 continue
             recovered += conn.execute(
                 """UPDATE work_items SET state='pending',available_at=?,lease_owner=NULL,lease_until=NULL,
-                   last_error_code='chunk_upgrade:1106|INPUT_INVALID'
+                   last_error_code=?
                    WHERE work_id=? AND state='failed' AND last_error_code='INPUT_INVALID'
                    AND consolidation_offset=0""",
-                (now, row["work_id"]),
+                (now, f"{CHUNK_UPGRADE_MARKER}|INPUT_INVALID", row["work_id"]),
             ).rowcount
         return recovered
 
@@ -791,7 +823,7 @@ class WorkItems:
             recovered += conn.execute(
                 """UPDATE work_items SET state='pending',available_at=?,lease_owner=NULL,
                    lease_until=NULL,last_error_code=? WHERE work_id=? AND state='failed'""",
-                (now, f"{INTERRUPTED_RETRY_MARKER}|{row['last_error_code']}"[:1024], row["work_id"]),
+                (now, _within(f"{INTERRUPTED_RETRY_MARKER}|{row['last_error_code']}"), row["work_id"]),
             ).rowcount
         return recovered
 
@@ -836,8 +868,12 @@ class WorkItems:
         attempt as ``candidate_attempt_interrupted``.  Other work types need
         only the work item.
 
-        Idempotent: every row is stamped with the schema generation that granted
-        it, and a row already carrying this generation's stamp is skipped.
+        Idempotent: every row is stamped with the release that granted it, and
+        a row already carrying this release's stamp is skipped.  Skipped rows the
+        request covers are counted (``already_retried``, the first ids in
+        ``already_retried_work_ids``): each failed again after this release
+        re-opened it, and a run that re-opens nothing says so rather than
+        nothing.
         """
         validate_page(limit)
         if type(include_terminal) is not bool or type(dry_run) is not bool:
@@ -852,13 +888,26 @@ class WorkItems:
             (*params, max(limit * 8, limit)),
         ).fetchall()
 
-        report = {"examined": 0, "retried": 0, "by_kind": {}, "applied": not dry_run}
+        report = {
+            "examined": 0,
+            "retried": 0,
+            "by_kind": {},
+            "applied": not dry_run,
+            "already_retried": 0,
+            "already_retried_work_ids": [],
+        }
         for row in rows:
             if report["retried"] >= limit:
                 break
             report["examined"] += 1
             code = row["last_error_code"]
-            if not selects(code, include_terminal=include_terminal, generation=SCHEMA_VERSION):
+            if not wanted(code, include_terminal=include_terminal):
+                continue
+            if already_retried(code, generation=RETRY_GENERATION):
+                report["already_retried"] += 1
+                # As many as one explicit retry by work id takes (``worker_entry --retry-failed``).
+                if len(report["already_retried_work_ids"]) < MAX_OPERATOR_PAGE:
+                    report["already_retried_work_ids"].append(int(row["work_id"]))
                 continue
             if not dry_run and not self._reopen_failed(row["work_id"], row["work_type"], code, now=now):
                 continue
@@ -879,7 +928,7 @@ class WorkItems:
                     conn.execute(
                         """UPDATE work_items SET state='pending',available_at=?,lease_owner=NULL,
                                     lease_until=NULL,last_error_code=? WHERE work_id=? AND state='obsolete'""",
-                        (now, marked("authority_revoked", generation=SCHEMA_VERSION), work_id),
+                        (now, marked("authority_revoked", generation=RETRY_GENERATION), work_id),
                     )
         # Captures a replay gave up after its tries (``inbox_rules.GAVE_UP``) go back to it, their tries counted
         # anew: whatever kept them out has been fixed, or they are given up again, visibly.  Only the partition this
@@ -1120,7 +1169,9 @@ class WorkItems:
                lease_until=NULL,last_error_code=? WHERE work_id=? AND state='failed'""",
                 (
                     now,
-                    f"{DERIVATION_RETRY_MARKER}|{code}" if automatic else marked(code, generation=SCHEMA_VERSION),
+                    _within(
+                        f"{DERIVATION_RETRY_MARKER}|{code}" if automatic else marked(code, generation=RETRY_GENERATION)
+                    ),
                     work_id,
                 ),
             ).rowcount
@@ -1136,7 +1187,7 @@ class WorkItems:
             return WorkMutation(work_id, "stale", self.read_state(work_id) or "stale", lease_token)
         prior = conn.execute("SELECT last_error_code FROM work_items WHERE work_id=?", (work_id,)).fetchone()[0]
         if _preserve_retry_history(prior):
-            error_code = f"{prior}|{error_code}"[:1024]
+            error_code = _within(f"{prior}|{error_code}")
         conn.execute(
             f"""UPDATE work_items SET state='pending',attempt=MAX(0,attempt-1),
                        lease_owner=NULL,lease_until=NULL,last_error_code=?,available_at=?
@@ -1193,7 +1244,7 @@ class WorkItems:
             raise ContractError("ACCESS_DENIED", "operator_origin")
         if not isinstance(work_ids, (tuple, list)) or not work_ids:
             raise ContractError("INPUT_INVALID", "retry_work_ids")
-        if type(max_items) is not int or not 1 <= max_items <= 8 or len(work_ids) > max_items:
+        if type(max_items) is not int or not 1 <= max_items <= MAX_OPERATOR_PAGE or len(work_ids) > max_items:
             raise ContractError("INPUT_INVALID", "retry_budget")
         if any(type(value) is not int or value < 1 for value in work_ids) or len(set(work_ids)) != len(work_ids):
             raise ContractError("INPUT_INVALID", "retry_work_ids")
@@ -1239,7 +1290,7 @@ class WorkItems:
         # existing bounded error field for audit/idempotence.
         marker = f"operator_retry:{operation_id}"
         prior_error = row["last_error_code"] or ""
-        stamped = marker if not prior_error else f"{marker}|prior:{prior_error}"[:1024]
+        stamped = marker if not prior_error else _within(f"{marker}|prior:{prior_error}")
         conn.execute(
             """UPDATE work_items SET state='pending',available_at=?,lease_owner=NULL,
                lease_until=NULL,last_error_code=?
@@ -1384,17 +1435,16 @@ class WorkItems:
             # ordinary 60s ceiling in place and 197 items retried without pause
             # for an entire provider outage, which is the silent loop this
             # whole design exists to prevent.
+            # Rebuilt from its count, the code keeps every budget mark it had, so an outage spends no budget.
             refusals = _capacity_count(prior) + 1
-            retry_error = f"capacity:{refusals}|{error_code}"[:1024]
-            if "derivation_retry:1|" in str(prior or ""):
-                retry_error = "derivation_retry:1|" + retry_error
+            retry_error = _within(f"{_budget_marks(str(prior or ''))}capacity:{refusals}|{error_code}")
             conn.execute(
                 f"""UPDATE work_items SET state='pending',lease_owner=NULL,lease_until=NULL,
                    last_error_code=?,available_at=?,attempt=MAX(attempt-1,0) WHERE {_LEASED_ROW}""",
                 (retry_error, _after(now, _capacity_backoff_seconds(refusals)), work_id, lease_token, owner),
             )
             return WorkMutation(work_id, "retry", "pending", lease_token)
-        history = f"{prior}|{error_code}"[:1024] if _preserve_retry_history(prior) else error_code
+        history = _within(f"{prior}|{error_code}") if _preserve_retry_history(prior) else error_code
         if recoverable and (invalid or attempt < MAX_RECOVERABLE_ATTEMPTS):
             conn.execute(
                 f"""UPDATE work_items SET state='pending',lease_owner=NULL,lease_until=NULL,last_error_code=?,available_at=?
