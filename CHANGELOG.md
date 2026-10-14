@@ -3,6 +3,59 @@
 A line or two per release.  Each release's full notes are on its GitHub release page (tag ``v<version>``), and the
 longer text this file once held is in its history.
 
+## [3.10.3.1] - 2026-10-14
+
+**Fork release.** Incorporates upstream v3.10.2 and v3.10.3. From v3.10.2 it takes the page whose
+summary did not use the page's own words being dropped on its own, instead of the whole message
+being refused and the page's claims lost with it. From v3.10.3 it takes the consolidation model's
+own request ceiling (`model_request_seconds`, for a model that reasons past the 45-second
+`request_seconds`), a request refused for size reported as `request_too_large` instead of waiting
+an hour as `budget_unavailable`, and a `ref@1` source beside `source_revision` 1 read as that
+source. The fork's contracts are unchanged: the Qdrant backend behind the standard port, the
+embedding route's own egress proxy, the Voyage usage fallback, the literal
+`allow_insecure_endpoint` on the consolidation route, and the two readings of a question that names
+the store's owner.
+
+### Upgrading from 3.10.1.1
+
+Install the fork package, run `plan-install` and `apply-install` for each entry, then restart the
+Hermes gateways and the clients' MCP servers in the selected maintenance window. The store schema
+remains 1110. Results refused for a `ref@revision` source can be re-opened once with
+`retry-failures --include-terminal --apply`.
+
+## [3.10.3] - 2026-10-14
+
+A claim whose value none of the sources it cites carries, such as a value the model translated, was stored and could then never be promoted (#236). Consolidation now leaves such a claim out and keeps the rest of the result: on a copy of the shared store, 57 of a week's 3,083 claims were of this kind, in 51 results that held 119 other claims. The work item's error details name each claim left out (stage `claim`, field `evidence_value`), and the message's outcome is `partial`; a candidate evaluation whose verdict carries such a value waits for evidence. A proposal a host makes directly is still refused whole. A span that names its source as `ref@1` beside `source_revision` 1 is read as that source: it was read as `ref@1@1`, and the whole result refused as citing a source the model never declared (#236).
+
+The spend ledger's default `max_request_bytes` is 128,000 (was 32,000). The old cap refused, before sending, candidate evaluations the package had built within their own 64,000-byte bound, and each waited an hour, again and again, as `budget_unavailable` (#237). A body over a cap set by hand now fails its item as `request_too_large`, which `retry-failures` re-opens once the cap is raised. A model the configuration does not approve (`unsupported_model`) keeps its work waiting, spending no attempt, until it is approved; the doctor names it (`model_not_approved`).
+
+A consolidation model that reasons before it answers needs longer than `request_seconds` allows, at most 45 seconds (#240 measured 18 to 90). `model_request_seconds`, up to 600, bounds the worker's consolidation and candidate-evaluation requests instead; recall, capture, embedding and every other boundary keep `request_seconds`. A pass claims such work only while that long is left, so `drain_seconds` may go above 120, up to 900, when `model_request_seconds` needs it, and `lease_seconds` must cover it.
+
+An auxiliary budget may count by calendar month: `"period": "monthly"`, with an optional `time_zone`, applies its spend, call and token caps to the current month, and the doctor's `ledger_headroom` reports that month (#239, contributed by @JohnYinl).
+
+A Hermes with its own package manager builds the environment it runs plugins in from each plugin's declaration in `<home>/plugins/`, and reads a `pyproject.toml` there before `plugin.yaml`. One written there by hand without the vector extra left every recall of one installation without vectors for two days, while the venv every check read had them. `apply-install` with `--target-plugin-dir <home>/plugins/scope-recall` now writes that `pyproject.toml` itself, declaring this release with its vector dependencies; it moves a wrapper its receipt put elsewhere, and backs up and replaces one put there by hand. The doctor reads the environment Hermes really runs (`hermes_runtime`) and names a core missing there or of another version, and missing vector dependencies. A recall whose vector helper lacks them says so (`vector_error:RuntimeError:lance_not_installed`, where it said `RuntimeError:RuntimeError`).
+
+On Windows, `package-upgrade` accepts an external uv reached through a directory junction, and a refusal names a stable reason (#236). A scheduled wake no longer flashes a console window where a venv's `pythonw.exe` is a console redirector: the task starts a verified windowless interpreter with the venv's packages (#238).
+
+### Upgrading from 3.10.2
+
+Install the package, run `plan-install` and `apply-install` for each upgraded entry, then restart the Hermes gateways and the clients' MCP servers. The schema is unchanged (1110).
+- On Windows, run `autostart enable` again with the same config, interpreter and environment-file arguments, so the scheduled task starts the windowless interpreter.
+- A Hermes with its own package manager (its home has `installs/<id>/facts.json`): run `plan-install` and `apply-install` with `--target-plugin-dir <home>/plugins/scope-recall` once this release is on PyPI, let Hermes sync its environment, restart the gateway and read `hermes_runtime` in `doctor` (`docs/install.md`, section 4).
+- Results refused for a `ref@revision` source can be re-opened with `retry-failures --config <file> --include-terminal --apply` (one re-look per release), or by id with `worker_entry --retry-failed`.
+
+## [3.10.2] - 2026-10-11
+
+A long message is consolidated a page at a time. A page whose summary of the task did not use the page's own words was refused whole: its goal, decisions, progress, open items, blockers or next step had to be quoted from the page. The claims found on that page were lost with it, and no later page of the message was read. Now such a summary is dropped, as a short message's summary already is when it does not qualify. The page's claims, still checked against the page on their own, are kept, and the message is read to its end. What a page dropped is named in the work item's error details (stage `summary`) and makes the message's outcome `partial`; it is not fed back to the model as a failure.
+
+Measured on two copies of the shared store, the 24 long messages that had failed this way were re-run by 3.10.1 and by this release with the production model:
+- 3.10.1 refused 14 of them on a summary again;
+- this release consolidated 19,148 of their characters against 5,367 and kept about 40 more claims;
+- both completed 3; the rest stopped on other refusals (a model's claims that do not decode, evidence off the page) or on a timeout, once their attempts were spent.
+
+### Upgrading from 3.10.1
+
+Install the package, run `plan-install` and `apply-install` for each upgraded entry, then restart the Hermes gateways and the clients' MCP servers. The schema is unchanged (1110). Messages that failed this way can be re-opened with `retry-failures --include-terminal --apply` (one re-look per release), or by id with `worker_entry --retry-failed`.
 ## [3.10.1.1] - 2026-10-12
 
 **Fork release.** Incorporates upstream v3.10.1. `retry-failures` now gives a failed item its one

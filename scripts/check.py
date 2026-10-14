@@ -149,6 +149,7 @@ SUITES = {
         "tests/contract/test_qdrant_store.py",
         "tests/contract/test_vector_candidate_authority.py",
         "tests/contract/test_vector_migration.py",
+        "tests/contract/test_monthly_auxiliary_budget.py",
     ],
     "storage": [
         "tests/contract/test_storage.py",
@@ -237,6 +238,7 @@ SUITES = {
         "tests/contract/test_worker_incremental_batch.py",
         "tests/integration/test_guard_git.py",
         "tests/contract/test_runtime_auxiliary.py",
+        "tests/contract/test_monthly_auxiliary_budget.py",
         "tests/contract/test_codex_cli_consolidation.py",
         "tests/contract/test_runtime_worker_entry.py",
         "tests/contract/test_running_code.py",
@@ -442,6 +444,7 @@ CORE_RELEASE_CONTRACTS += [
     "tests/contract/test_runtime_cross_component.py",
     "tests/contract/test_claim_acceptance_semantics.py",
     "tests/contract/test_runtime_audit.py",
+    "tests/contract/test_runtime_request_limits.py",
     "tests/contract/test_claim_semantics.py",
     "tests/contract/test_consolidation_chunks.py",
     "tests/contract/test_recall_selection.py",

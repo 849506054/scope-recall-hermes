@@ -10,10 +10,12 @@ import time
 from collections import Counter
 from contextlib import closing
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from decimal import ROUND_CEILING, Decimal
 from pathlib import Path
 from types import MappingProxyType
 from typing import Mapping
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .validation import nonneg_decimal, nonneg_int, positive_int, text
 
@@ -71,7 +73,7 @@ class ModelPricing:
         return int(amount.to_integral_value(rounding=ROUND_CEILING))
 
 
-#: Lifetime totals across the whole ledger that may be switched off with
+#: Selected-period totals that may be switched off with
 #: ``None``.  They bound how much the instance is *used*; runaway loops are
 #: already bounded per item, and anomalous metering is caught by the separate
 #: ``meter_breach`` check.  ``None`` means "not capped" and is deliberately
@@ -80,6 +82,12 @@ class ModelPricing:
 #: instance is fail-closed.
 _OPTIONAL_CUMULATIVE_CAPS = ("cap_micro_usd", "total_input_cap", "total_output_cap", "total_call_cap")
 _REQUIRED_NONNEG = ("max_request_bytes", "default_reserve_input", "default_reserve_output")
+
+
+def _zone(name: str):
+    """The calendar zone a policy names.  UTC is built in: every policy names a zone, and a host with no time-zone
+    database (a slim Linux image, a Windows Python without ``tzdata``) must still load the default one."""
+    return UTC if name == "UTC" else ZoneInfo(name)
 
 
 @dataclass(frozen=True)
@@ -96,9 +104,20 @@ class BudgetPolicy:
     model_token_caps: Mapping[str, tuple[int | None, int | None]]
     pricing: Mapping[str, ModelPricing]
     approved_models: frozenset[str]
+    period: str = "lifetime"
+    time_zone: str = "UTC"
 
     def __post_init__(self) -> None:
         text("batch", self.batch)
+        if self.period not in ("lifetime", "monthly"):
+            raise ValueError("budget_period")
+        try:
+            zone = text("budget_time_zone", self.time_zone)
+            # Only a monthly budget reads its zone; a lifetime one must load where no zone can be looked up.
+            if self.period == "monthly":
+                _zone(zone)
+        except (ZoneInfoNotFoundError, ValueError) as exc:
+            raise ValueError("budget_time_zone") from exc
         for name in _OPTIONAL_CUMULATIVE_CAPS:
             if getattr(self, name) is not None:
                 nonneg_int(name, getattr(self, name))
@@ -119,8 +138,19 @@ class BudgetPolicy:
         object.__setattr__(self, "approved_models", approved)
 
 
+def budget_window(policy: BudgetPolicy, now_ns: int) -> tuple[int, int] | None:
+    """UTC nanosecond bounds of the policy's local calendar month, end exclusive."""
+    if policy.period == "lifetime":
+        return None
+    zone = _zone(policy.time_zone)
+    now = datetime.fromtimestamp(now_ns // 1_000_000_000, UTC).astimezone(zone)
+    start = datetime(now.year, now.month, 1, tzinfo=zone)
+    end = datetime(now.year + (now.month == 12), now.month % 12 + 1, 1, tzinfo=zone)
+    return int(start.timestamp()) * 1_000_000_000, int(end.timestamp()) * 1_000_000_000
+
+
 def _model_cap_pair(caps: object) -> tuple[int | None, int | None]:
-    """Per-model totals are cumulative like the policy caps: ``None`` is uncapped, ``0`` is no spend."""
+    """Per-model totals share the policy period: ``None`` is uncapped, ``0`` is no spend."""
     if not isinstance(caps, tuple) or len(caps) != 2:
         raise ValueError("model_token_caps")
     return (
@@ -138,7 +168,10 @@ def default_budget_policy(*, batch: str = "auxiliary") -> BudgetPolicy:
         total_input_cap=0,
         total_output_cap=0,
         total_call_cap=0,
-        max_request_bytes=32_000,
+        # Candidate contents may occupy 64 KB before the transport serializes
+        # the messages again. Allow the JSON escaping and envelope as well;
+        # monetary/token caps remain fail-closed and explicit byte caps win.
+        max_request_bytes=128_000,
         default_reserve_input=32_768,
         default_reserve_output=4_096,
         model_reserve_output={"mimo-v2.5": 131_072},
@@ -161,23 +194,55 @@ def initialize_auxiliary_budget_ledger(path: Path, policy: BudgetPolicy) -> None
         db.execute(REQUESTS_TABLE)
 
 
-def read_auxiliary_budget_status(path: Path) -> dict:
+def budget_totals(
+    db: sqlite3.Connection, window: tuple[int, int] | None = None, *, model: str | None = None
+) -> dict[str, int]:
+    """Settled usage or outstanding reservations within one window; no ledger writes."""
+    clauses = []
+    parameters: list[object] = []
+    if window is not None:
+        clauses.append("started_ns >= ? AND started_ns < ?")
+        parameters.extend(window)
+    if model is not None:
+        clauses.append("model=?")
+        parameters.append(model)
+    where = " WHERE " + " AND ".join(clauses) if clauses else ""
+    row = db.execute(
+        "SELECT COUNT(*), COALESCE(SUM(charge_micro_usd),0), "
+        "COALESCE(SUM(COALESCE(actual_input,reserved_input)),0), "
+        "COALESCE(SUM(COALESCE(actual_output,reserved_output)),0) FROM requests" + where,
+        parameters,
+    ).fetchone()
+    return dict(
+        zip(("requests", "charge_micro_usd", "input_tokens", "output_tokens"), (int(v or 0) for v in row), strict=True)
+    )
+
+
+def read_auxiliary_budget_status(path: Path, *, policy: BudgetPolicy | None = None, now_ns: int | None = None) -> dict:
     """Read-only ledger inspection; never creates the database."""
 
     target = Path(path)
     if not target.is_file():
         return {"ledger_exists": False, "requests": 0, "charge_micro_usd": 0, "meter_breach": False}
+    window = budget_window(policy, time.time_ns() if now_ns is None else now_ns) if policy is not None else None
     with closing(sqlite3.connect(_readonly_uri(target), uri=True, timeout=2)) as db:
-        row = db.execute(
-            "SELECT COUNT(*) AS requests, COALESCE(SUM(charge_micro_usd),0) AS charge, "
-            "MAX(CASE WHEN status='meter_breach' THEN 1 ELSE 0 END) AS meter_breach FROM requests"
-        ).fetchone()
-    return {
+        db.execute("BEGIN")
+        totals = budget_totals(db, window)
+        breach = db.execute("SELECT 1 FROM requests WHERE status='meter_breach' LIMIT 1").fetchone()
+    result = {
         "ledger_exists": True,
-        "requests": int(row[0]),
-        "charge_micro_usd": int(row[1] or 0),
-        "meter_breach": bool(row[2]),
+        "requests": totals["requests"],
+        "charge_micro_usd": totals["charge_micro_usd"],
+        "meter_breach": bool(breach),
     }
+    if policy is not None:
+        result.update(
+            period=policy.period,
+            time_zone=policy.time_zone,
+            window_start_ns=window[0] if window else None,
+            window_end_ns=window[1] if window else None,
+        )
+    return result
 
 
 def load_hermes_attempt_authorization() -> dict | None:
@@ -269,7 +334,8 @@ class AuxiliaryBudgetLedger:
         with closing(self._connect_rw(deadline=deadline)) as db, db:
             db.execute("BEGIN IMMEDIATE")
             db.row_factory = sqlite3.Row
-            self._assert_headroom(db, model, amount, reserved_input, reserved_output)
+            started_ns = time.time_ns()
+            self._assert_headroom(db, model, amount, reserved_input, reserved_output, started_ns)
             request_id = db.execute(
                 "INSERT INTO requests(batch,model,body_sha256,request_bytes,reserved_input,"
                 "reserved_output,charge_micro_usd,status,started_ns) VALUES (?,?,?,?,?,?,?,?,?)",
@@ -282,7 +348,7 @@ class AuxiliaryBudgetLedger:
                     reserved_output,
                     amount,
                     _RESERVED,
-                    time.time_ns(),
+                    started_ns,
                 ),
             ).lastrowid
             if request_id is None:
@@ -292,8 +358,10 @@ class AuxiliaryBudgetLedger:
     def _pricing_for_request(self, model: str, body: bytes, reserved_input: int, reserved_output: int) -> ModelPricing:
         if model not in self.policy.approved_models:
             raise ValueError("unsupported_model")
-        if not 0 < len(body) <= self.policy.max_request_bytes:
-            raise ValueError("unsupported_model_or_size")
+        if not body:
+            raise ValueError("request_empty")
+        if len(body) > self.policy.max_request_bytes:
+            raise ValueError("request_too_large")
         if any(type(value) is not int or value < 0 for value in (reserved_input, reserved_output)):
             raise ValueError("invalid_reservation")
         pricing = self.policy.pricing.get(model)
@@ -302,32 +370,31 @@ class AuxiliaryBudgetLedger:
         return pricing
 
     def _assert_headroom(
-        self, db: sqlite3.Connection, model: str, amount: int, reserved_input: int, reserved_output: int
+        self,
+        db: sqlite3.Connection,
+        model: str,
+        amount: int,
+        reserved_input: int,
+        reserved_output: int,
+        started_ns: int,
     ) -> None:
-        """Every comparison is against a lifetime total; a cap of ``None`` is not enforced."""
+        """Caps use the selected window; historical meter breaches always fail closed."""
         for breach in db.execute("SELECT * FROM requests WHERE status='meter_breach'"):
             if not _historical_breach_row_authorized(breach, self.covered_historical_breaches):
                 raise ValueError("budget_exhausted_or_meter_breach")
         policy = self.policy
-        used = int(db.execute("SELECT COALESCE(SUM(charge_micro_usd),0) FROM requests").fetchone()[0])
-        calls, inputs, outputs = db.execute(
-            "SELECT COUNT(*), COALESCE(SUM(COALESCE(actual_input,reserved_input)),0), "
-            "COALESCE(SUM(COALESCE(actual_output,reserved_output)),0) FROM requests"
-        ).fetchone()
-        model_inputs, model_outputs = db.execute(
-            "SELECT COALESCE(SUM(COALESCE(actual_input,reserved_input)),0), "
-            "COALESCE(SUM(COALESCE(actual_output,reserved_output)),0) FROM requests WHERE model=?",
-            (model,),
-        ).fetchone()
+        window = budget_window(policy, started_ns)
+        totals = budget_totals(db, window)
+        model_totals = budget_totals(db, window, model=model)
         model_input_cap, model_output_cap = policy.model_token_caps.get(model, (None, None))
         checks = (
-            (policy.cap_micro_usd, used + amount),
-            (policy.total_input_cap, inputs + reserved_input),
-            (policy.total_output_cap, outputs + reserved_output),
-            (model_input_cap, model_inputs + reserved_input),
-            (model_output_cap, model_outputs + reserved_output),
+            (policy.cap_micro_usd, totals["charge_micro_usd"] + amount),
+            (policy.total_input_cap, totals["input_tokens"] + reserved_input),
+            (policy.total_output_cap, totals["output_tokens"] + reserved_output),
+            (model_input_cap, model_totals["input_tokens"] + reserved_input),
+            (model_output_cap, model_totals["output_tokens"] + reserved_output),
         )
-        exceeded = (policy.total_call_cap is not None and calls >= policy.total_call_cap) or any(
+        exceeded = (policy.total_call_cap is not None and totals["requests"] >= policy.total_call_cap) or any(
             cap is not None and total > cap for cap, total in checks
         )
         if exceeded:
@@ -638,12 +705,11 @@ def pre_request_refusals(auxiliary) -> list[str]:
 
     ``reserve`` raises before the request leaves the process, so a refused
     reservation writes no row and every ledger-based measurement, including
-    ``provider_refusals``, is blind to it.  ``runtime.models`` folds the
-    refusal into ``budget_unavailable``, the worker defers the item for an hour
-    without burning an attempt, and a deterministic fault (a model missing
-    from ``approved_models``, a ledger file that was moved) therefore stalls
-    forever, spending nothing and saying nothing.  Checking the configuration
-    names the fault, even on an installation that has queued nothing yet.
+    ``provider_refusals``, is blind to it. An unapproved model
+    (``unsupported_model``) and an unavailable ledger park work without
+    burning an attempt, until the configuration is fixed. Checking the
+    configuration names either fault even on an installation that has queued
+    nothing yet, without depending on a reservation row having been recorded.
 
     An approved model with no price is not checked: ``BudgetPolicy`` refuses
     to exist in that state (``approved_model_pricing``).

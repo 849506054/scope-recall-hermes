@@ -12,6 +12,7 @@ import json
 import os
 import sqlite3
 import subprocess
+import time
 from contextlib import closing
 from pathlib import Path
 from typing import Any
@@ -21,7 +22,7 @@ from scope_recall._version import __version__
 from scope_recall.adapters.clients.config import load_codex_config, load_shared_client
 from scope_recall.adapters.hermes.shared_entries import read_attachment
 from scope_recall.runtime.instance_config import RuntimeInstanceConfig
-from scope_recall.runtime.model_budget import pre_request_refusals, provider_refusals
+from scope_recall.runtime.model_budget import budget_totals, budget_window, pre_request_refusals, provider_refusals
 from scope_recall.runtime.running_code import live_records, stale_records
 
 from . import package_health
@@ -71,6 +72,85 @@ def _hermes_config_path(instance_root: Path) -> Path:
     """What a Hermes home binds with: a shared store's pointer, or its own manifest."""
     pointer = _hermes_data_dir(instance_root) / "attachment.json"
     return pointer if pointer.is_file() else _hermes_data_dir(instance_root) / "installation.json"
+
+
+def _hermes_runtime_environment(instance_root: Path) -> Path | None:
+    """The environment a Hermes that builds its own runs its plugins in, as its package manager records it
+    (``installs/<id>/facts.json``); None for a Hermes that runs them in its own venv.  Read, never run: the
+    environment's interpreter may be one only an elevated process can start."""
+    for facts in sorted((instance_root / "installs").glob("*/facts.json")):
+        try:
+            if facts.stat().st_size > _CONTROL_FILE_LIMIT:
+                continue
+            environment = json.loads(facts.read_text(encoding="utf-8"))["packages"]["venv"]["environment"]
+        except (OSError, ValueError, KeyError, TypeError):
+            continue
+        if isinstance(environment, str) and Path(environment).is_absolute():
+            return Path(environment)
+    return None
+
+
+def _listed(folder: Path) -> list[str]:
+    """The names in ``folder``; none when it does not exist.  One that exists and cannot be listed raises: its
+    contents are unknown, not absent (``Path.glob`` would have read it as empty)."""
+    try:
+        with os.scandir(folder) as entries:
+            return [entry.name for entry in entries]
+    except (FileNotFoundError, NotADirectoryError):
+        return []
+
+
+def _site_packages(environment: Path) -> list[str]:
+    """The names in the environment's site-packages, in the Windows layout or the POSIX one."""
+    names = _listed(environment / "Lib" / "site-packages")
+    for version in _listed(environment / "lib"):
+        if version.startswith("python3"):
+            names += _listed(environment / "lib" / version / "site-packages")
+    return names
+
+
+def _installed_version(names: list[str], distribution: str) -> str | None:
+    """A distribution's version from its metadata folder among ``names``, or None when it is not installed."""
+    stem = distribution.replace("-", "_").lower() + "-"
+    for name in names:
+        if name.lower().startswith(stem) and name.lower().endswith(".dist-info"):
+            return name[len(stem) : -len(".dist-info")]
+    return None
+
+
+def _check_hermes_runtime(report: DoctorReport, instance: Path, config: RuntimeInstanceConfig | None) -> None:
+    """What a Hermes that builds its own environment really runs: the core there, and the vector dependencies
+    there.  After the official Hermes update of 2026-10-11 every recall of one installation ran without vectors for
+    two days, on a core two releases old, while the venv every check read held the right ones."""
+    if report.host != "hermes":
+        return
+    environment = _hermes_runtime_environment(instance)
+    if environment is None:
+        return
+    try:
+        names = _site_packages(environment)
+    except OSError:
+        # Not readable to this account: unknown, which is no finding either way.
+        report.hermes_runtime = {"environment": str(environment), "readable": False}
+        record_check(report, "hermes_runtime", "unreadable")
+        return
+    version = _installed_version(names, "hermes-scope-recall")
+    vectors = all(_installed_version(names, name) is not None for name in ("lancedb", "pyarrow"))
+    vector = config.vector if config is not None else None
+    needs_vectors = vector is not None and vector.backend == "lancedb"
+    report.hermes_runtime = {
+        "environment": str(environment),
+        "package_version": version,
+        "vector_dependencies": vectors,
+    }
+    if version is None:
+        report.capability_gaps.append("hermes_runtime_package_missing")
+    elif version != report.expected_package_version:
+        report.capability_gaps.append("hermes_runtime_package_mismatch")
+    if needs_vectors and not vectors:
+        report.capability_gaps.append("hermes_runtime_vector_dependencies_missing")
+    healthy = version == report.expected_package_version and (vectors or not needs_vectors)
+    record_check(report, "hermes_runtime", "ok" if healthy else "mismatch", version or "")
 
 
 def _require_absolute(path: Path, name: str) -> Path:
@@ -129,7 +209,7 @@ def load_binding(host: HostChoice, instance_root: Path):
 
 
 def _ledger_headroom(ledger_path: Path | None, policy: Any) -> dict[str, Any]:
-    """Lifetime usage of each auxiliary-ledger cap, as used/cap plus a ratio.
+    """Selected-period usage of each auxiliary-ledger cap, as used/cap plus a ratio.
 
     Read-only and best-effort: a missing ledger, an unreadable file or a policy
     without caps reports nothing rather than failing the whole doctor run.
@@ -140,25 +220,22 @@ def _ledger_headroom(ledger_path: Path | None, policy: Any) -> dict[str, Any]:
         if not Path(ledger_path).is_file():
             return {}
         uri = f"file:{Path(ledger_path).as_posix()}?mode=ro"
+        period = getattr(policy, "period", "lifetime")
+        window = budget_window(policy, time.time_ns()) if period == "monthly" else None
         with closing(sqlite3.connect(uri, uri=True, timeout=5)) as db:
-            row = db.execute(
-                "SELECT COUNT(*), COALESCE(SUM(charge_micro_usd),0),"
-                " COALESCE(SUM(COALESCE(actual_input,reserved_input)),0),"
-                " COALESCE(SUM(COALESCE(actual_output,reserved_output)),0) FROM requests"
-            ).fetchone()
+            db.execute("BEGIN")
+            totals = budget_totals(db, window)
+            lifetime = budget_totals(db) if window is not None else totals
     except (sqlite3.Error, OSError, ValueError):
         return {}
-    calls, _charge, inputs, outputs = (int(value or 0) for value in row)
-    # Deliberately no money figure. What an instance spent depends on that
-    # operator's own contract, so a currency amount means something different
-    # for every reader, while calls and tokens are the same unit for everybody.
-    # The ledger still meters charges internally for ``meter_breach``, which is
-    # an anomaly check rather than a usage report.
+    calls, inputs, outputs = totals["requests"], totals["input_tokens"], totals["output_tokens"]
     caps = (
         ("calls", calls, getattr(policy, "total_call_cap", 0)),
         ("input_tokens", inputs, getattr(policy, "total_input_cap", 0)),
         ("output_tokens", outputs, getattr(policy, "total_output_cap", 0)),
     )
+    if period == "monthly":
+        caps += (("charge_micro_usd", totals["charge_micro_usd"], policy.cap_micro_usd),)
     headroom: dict[str, Any] = {}
     worst = 0.0
     for name, used, cap in caps:
@@ -172,7 +249,11 @@ def _ledger_headroom(ledger_path: Path | None, policy: Any) -> dict[str, Any]:
             worst = max(worst, ratio)
         headroom[name] = entry
     headroom["worst_used_ratio"] = round(worst, 4)
-    headroom["scope"] = "lifetime"
+    headroom["scope"] = period
+    if window is not None:
+        headroom.update(
+            time_zone=policy.time_zone, window_start_ns=window[0], window_end_ns=window[1], lifetime_usage=lifetime
+        )
     return headroom
 
 
@@ -651,6 +732,7 @@ def run_doctor(
 
     readable = check_storage(report, binding, data_directory)
     config = _runtime_config(data_directory)
+    _check_hermes_runtime(report, instance, config)
     check_footprint(report, data_directory, config)
     if readable:
         _check_worker_status(report, binding, data_directory)

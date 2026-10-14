@@ -1,6 +1,7 @@
 """Real SQLite diagnostic and durable replay boundaries; no models or production data."""
 
 import json
+import os
 import sqlite3
 import subprocess
 import sys
@@ -186,6 +187,81 @@ def _write_runtime_config(ctx, **changes):
         **changes,
     }
     (binding.data_directory / "runtime-config.json").write_text(json.dumps(raw), encoding="utf-8")
+
+
+def _pm_environment(home, tmp_path, packages):
+    """``home`` made a Hermes whose package manager runs plugins in its own environment, holding ``packages``."""
+    environment = tmp_path / "TEST-pm" / "environments" / "TEST-env" / "venv"
+    site = environment / "Lib" / "site-packages"
+    site.mkdir(parents=True)
+    for name, version in packages.items():
+        (site / f"{name}-{version}.dist-info").mkdir()
+    facts = home / "installs" / "TEST-install" / "facts.json"
+    facts.parent.mkdir(parents=True)
+    facts.write_text(json.dumps({"packages": {"venv": {"environment": str(environment)}}, "schema": 1}))
+    return environment
+
+
+def _runtime_gaps(report):
+    return {gap for gap in report.capability_gaps if gap.startswith("hermes_runtime")}
+
+
+@pytest.mark.parametrize(
+    ("packages", "gaps"),
+    [
+        # As found on 2026-10-13: a core two releases old and no vector dependencies.
+        (
+            {"hermes_scope_recall": "3.10.0"},
+            {"hermes_runtime_package_mismatch", "hermes_runtime_vector_dependencies_missing"},
+        ),
+        ({}, {"hermes_runtime_package_missing", "hermes_runtime_vector_dependencies_missing"}),
+        ({"hermes_scope_recall": __version__, "lancedb": "0.37.1", "pyarrow": "24.0.0"}, set()),
+    ],
+)
+def test_doctor_reads_the_environment_a_hermes_really_runs_plugins_in(tmp_path, monkeypatch, packages, gaps):
+    _app, ctx = _doctor_app(tmp_path, monkeypatch)
+    home = ctx.binding.data_directory
+    environment = _pm_environment(home, tmp_path, packages)
+    _write_runtime_config(ctx)
+    report = doctor.run_doctor(host="hermes", instance_root=home)
+    assert _runtime_gaps(report) == gaps
+    assert report.hermes_runtime["environment"] == str(environment)
+    assert report.hermes_runtime["vector_dependencies"] is (not any("vector" in gap for gap in gaps))
+    # Lexical recall needs no vector dependencies.
+    _write_runtime_config(ctx, vector=None, auxiliary={"external_embedding": False, "external_consolidation": False})
+    assert doctor._runtime_config(home) is not None
+    lexical = doctor.run_doctor(host="hermes", instance_root=home)
+    assert "hermes_runtime_vector_dependencies_missing" not in lexical.capability_gaps
+
+
+def test_a_hermes_that_runs_plugins_in_its_venv_has_no_environment_to_read(tmp_path, monkeypatch):
+    _app, ctx = _doctor_app(tmp_path, monkeypatch)
+    _write_runtime_config(ctx)
+    report = doctor.run_doctor(host="hermes", instance_root=ctx.binding.data_directory)
+    assert _runtime_gaps(report) == set() and report.hermes_runtime is None
+
+
+def test_an_environment_this_account_cannot_read_is_unknown_not_missing(tmp_path, monkeypatch):
+    _app, ctx = _doctor_app(tmp_path, monkeypatch)
+    home = ctx.binding.data_directory
+    environment = _pm_environment(home, tmp_path, {})
+    _write_runtime_config(ctx)
+
+    site = environment / "Lib" / "site-packages"
+    scandir = os.scandir
+
+    def denied(path=".", *args):
+        # The listing itself is refused, as for a folder only an elevated process may read; Path.glob would read
+        # that as empty, and the doctor would report a core and vectors missing that may well be there.
+        if isinstance(path, (str, os.PathLike)) and os.path.normcase(os.fspath(path)) == os.path.normcase(str(site)):
+            raise PermissionError(13, "TEST-access-denied", str(site))
+        return scandir(path, *args)
+
+    monkeypatch.setattr(os, "scandir", denied)
+    report = doctor.run_doctor(host="hermes", instance_root=home)
+    assert _runtime_gaps(report) == set()
+    assert report.hermes_runtime == {"environment": str(environment), "readable": False}
+    assert {"name": "hermes_runtime", "result": "unreadable"} in report.checks
 
 
 def test_doctor_names_vector_recall_configured_without_a_threshold(tmp_path, monkeypatch):
