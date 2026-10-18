@@ -178,15 +178,19 @@ def _write_runtime_config(ctx, **changes):
             "external_consolidation": False,
             "embedding": {"credential_env": "TEST_EMBED_KEY"},
         },
-        "vector": {
-            "backend": "lancedb",
-            "storage_dir": str(binding.data_directory / "vectors" / SPACE_ID),
-            "table_name": "TEST_vectors",
-            "dimensions": 3072,
-        },
+        "vector": _vector_block(ctx),
         **changes,
     }
     (binding.data_directory / "runtime-config.json").write_text(json.dumps(raw), encoding="utf-8")
+
+
+def _vector_block(ctx):
+    return {
+        "backend": "lancedb",
+        "storage_dir": str(ctx.binding.data_directory / "vectors" / SPACE_ID),
+        "table_name": "TEST_vectors",
+        "dimensions": 3072,
+    }
 
 
 def _pm_environment(home, tmp_path, packages):
@@ -209,7 +213,7 @@ def _runtime_gaps(report):
 @pytest.mark.parametrize(
     ("packages", "gaps"),
     [
-        # As found on 2026-10-13: a core two releases old and no vector dependencies.
+        # A core two releases old and no vector dependencies.
         (
             {"hermes_scope_recall": "3.10.0"},
             {"hermes_runtime_package_mismatch", "hermes_runtime_vector_dependencies_missing"},
@@ -225,6 +229,8 @@ def test_doctor_reads_the_environment_a_hermes_really_runs_plugins_in(tmp_path, 
     _write_runtime_config(ctx)
     report = doctor.run_doctor(host="hermes", instance_root=home)
     assert _runtime_gaps(report) == gaps
+    # The environment the gateway runs is the one read; the venv --python names would answer for nothing.
+    assert "vector_dependencies_missing" not in report.capability_gaps
     assert report.hermes_runtime["environment"] == str(environment)
     assert report.hermes_runtime["vector_dependencies"] is (not any("vector" in gap for gap in gaps))
     # Lexical recall needs no vector dependencies.
@@ -239,6 +245,67 @@ def test_a_hermes_that_runs_plugins_in_its_venv_has_no_environment_to_read(tmp_p
     _write_runtime_config(ctx)
     report = doctor.run_doctor(host="hermes", instance_root=ctx.binding.data_directory)
     assert _runtime_gaps(report) == set() and report.hermes_runtime is None
+
+
+@pytest.mark.parametrize(
+    ("installed", "missing"),
+    [
+        ({"lancedb": None, "pyarrow": None}, "lancedb,pyarrow"),
+        ({"lancedb": "0.37.1", "pyarrow": None}, "pyarrow"),
+        ({"lancedb": "0.37.1", "pyarrow": "24.0.0"}, ""),
+    ],
+)
+def test_doctor_names_a_lancedb_store_the_interpreter_cannot_open(tmp_path, monkeypatch, installed, missing):
+    """Installed without the ``lancedb`` extra, with a LanceDB store configured, every recall runs by words alone,
+    and the doctor names that, not only the threshold."""
+    _app, ctx = _doctor_app(tmp_path, monkeypatch)
+    home = ctx.binding.data_directory
+    _write_runtime_config(ctx)
+    probe = {**doctor.package_health.package_probe(), "vector_dependencies": installed}
+    monkeypatch.setattr(doctor.package_health, "package_probe", lambda: probe)
+    report = doctor.run_doctor(host="hermes", instance_root=home)
+    assert ("vector_dependencies_missing" in report.capability_gaps) is bool(missing)
+    assert {
+        "name": "vector_dependencies",
+        "result": "missing" if missing else "ok",
+        **({"detail": missing} if missing else {}),
+    } in report.checks
+    # A store that needs neither, and no store at all, are no finding.
+    _write_runtime_config(ctx, vector={**_vector_block(ctx), "backend": "sqlite-bruteforce"})
+    assert "vector_dependencies_missing" not in doctor.run_doctor(host="hermes", instance_root=home).capability_gaps
+    _write_runtime_config(ctx, vector=None, auxiliary={"external_embedding": False, "external_consolidation": False})
+    assert "vector_dependencies_missing" not in doctor.run_doctor(host="hermes", instance_root=home).capability_gaps
+
+
+def test_an_attached_entry_is_read_against_its_own_runtime_config(tmp_path, monkeypatch):
+    """An entry of a shared store loads the runtime config beside its pointer; the store's directory holds the
+    shared worker's.  An entry with no routes of its own needs no vector extra, whatever the worker uses."""
+    _app, ctx = _doctor_app(tmp_path, monkeypatch)
+    store = ctx.binding.data_directory
+    _write_runtime_config(ctx)  # the shared worker's: a LanceDB store
+    entry = tmp_path / "TEST-entry-home" / "scope-recall"
+    entry.mkdir(parents=True)
+    (entry / "attachment.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(doctor, "_hermes_data_dir", lambda root: root / "scope-recall")
+    without = {"vector_dependencies": {"lancedb": None, "pyarrow": None}}
+    lexical = doctor.DoctorReport(host="claude-code", status="degraded")
+    doctor._check_vector_dependencies(lexical, without, doctor._entry_runtime_config(entry.parent, store))
+    assert lexical.capability_gaps == []
+    (entry / "runtime-config.json").write_text((store / "runtime-config.json").read_text(encoding="utf-8"), "utf-8")
+    own = doctor.DoctorReport(host="claude-code", status="degraded")
+    doctor._check_vector_dependencies(own, without, doctor._entry_runtime_config(entry.parent, store))
+    assert own.capability_gaps == ["vector_dependencies_missing"]
+    (entry / "attachment.json").unlink()
+    assert doctor._entry_runtime_config(entry.parent, store).vector is not None  # a local install: beside its store
+
+
+def test_the_probe_reads_the_vector_extra_without_importing_it():
+    from scope_recall.maintenance import package_health
+
+    found = package_health.package_probe()["vector_dependencies"]
+    assert set(found) == {"lancedb", "pyarrow"}
+    assert all(version is None or isinstance(version, str) for version in found.values())
+    assert package_health.installed_version("TEST-not-a-distribution") is None
 
 
 def test_an_environment_this_account_cannot_read_is_unknown_not_missing(tmp_path, monkeypatch):
@@ -308,8 +375,8 @@ def test_doctor_names_vector_recall_configured_without_a_threshold(tmp_path, mon
 
 
 def test_doctor_names_answers_cut_off_at_the_output_limit(tmp_path, monkeypatch):
-    """beta's consolidation model reasoned into its max_tokens and most answers
-    were cut off; only recent_work_errors showed it, sixteen rows at a time."""
+    """A consolidation model that reasons into its max_tokens has most answers cut
+    off, and only recent_work_errors would show it, sixteen rows at a time."""
     from datetime import datetime, timedelta, timezone
 
     app, ctx = _doctor_app(tmp_path, monkeypatch)
@@ -421,9 +488,9 @@ def test_doctor_reports_the_footprint_the_growth_and_a_budget(tmp_path, monkeypa
 
 
 def test_doctor_reads_a_shared_worker_config_past_64_kb(tmp_path, monkeypatch):
-    """A shared worker's runtime config lists every scope of the store twice; the pilot's passed 85 KB.
-    The doctor read it as a 64 KB control file: every entry reported ``vector_threshold: invalid`` and
-    the storage budget was never checked.  It is bounded where the shared commands write it."""
+    """A shared worker's runtime config lists every scope of the store twice, so it can pass 85 KB.
+    Read as a 64 KB control file, every entry would report ``vector_threshold: invalid`` and
+    the storage budget would never be checked.  It is bounded where the shared commands write it."""
     app, ctx = _doctor_app(tmp_path, monkeypatch)
     scopes = sorted({*ctx.binding.scope_ids, *(f"conversation:TEST-{index:03d}-{'x' * 64}" for index in range(450))})
     binding = {
@@ -461,9 +528,9 @@ def test_doctor_reports_a_pending_schema_upgrade_without_applying_it(tmp_path, m
     ordinary open brings it forward.  The doctor is read-only, so it names the
     pending step instead of failing on a store it will not touch.  Both what the
     store holds and its bytes are compared: the schema facts say no step was
-    applied, the bytes that nothing was written.  (The bytes failed at random on
-    CI while the step's own connection was left to the garbage collector, which
-    moved its pages from the WAL into the file when it pleased, 3.4.0rc10.)"""
+    applied, the bytes that nothing was written.  (The step closes its own
+    connection; left to the garbage collector, it would move its pages from the
+    WAL into the file when it pleased, and the bytes would change at random.)"""
     app, ctx = _doctor_app(tmp_path, monkeypatch)
     capture(app, ctx, "TEST-upgrade/1", "TEST pending upgrade")
     downgrade_store(app.storage.path, 1108)
@@ -492,8 +559,8 @@ def test_a_secret_refusal_is_a_terminal_failure_not_a_degraded_instance(tmp_path
 
 
 def test_doctor_names_a_runtime_config_that_was_there_and_is_gone(tmp_path, monkeypatch):
-    """#118: with runtime-config.json deleted the hosts ran in basic mode -- no worker, no
-    model routes -- while the doctor reported ok with no gap.  A fresh install has no config
+    """With runtime-config.json deleted the hosts run in basic mode -- no worker, no
+    model routes -- so the doctor must not report ok with no gap.  A fresh install has no config
     either, so the evidence is work only a config's routes could have run."""
     app, ctx = _doctor_app(tmp_path, monkeypatch)
     result = doctor.run_doctor(host="hermes", instance_root=ctx.binding.data_directory)
@@ -589,8 +656,8 @@ def test_remote_coverage_compares_the_sqlite_expectation(tmp_path, monkeypatch):
 
 
 def test_the_downgrade_leaves_nothing_for_the_garbage_collector(tmp_path, monkeypatch):
-    """The schema test's byte comparison passed without the downgrade closing its connection unless the collector
-    ran at the wrong moment (review of rc10); with collection held back, a connection left to it shows."""
+    """The schema test's byte comparison passes without the downgrade closing its connection unless the collector
+    runs at the wrong moment; with collection held back, a connection left to it shows."""
     import gc
 
     app, ctx = _doctor_app(tmp_path, monkeypatch)

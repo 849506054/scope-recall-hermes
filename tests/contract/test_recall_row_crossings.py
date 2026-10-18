@@ -1,9 +1,8 @@
 """A read transaction keeps what it loaded, and hydration loads its candidates' sources, visibility and versions together:
-the same answers, in a count of statements and rows that does not grow with the evidence (3.7.7).
+the same answers, in a count of statements and rows that does not grow with the evidence.
 
-A recall loaded each evidence source up to five times, three statements each: 16,222 statements and 7,087 rows for one of
-yuheng's questions on a copy of the shared store.  In a busy Hermes gateway every statement and every row waited for the
-GIL (``test_capture_row_crossings``).  Now 469 statements and 755 rows.
+A recall that loaded each evidence source up to five times, three statements each, would take thousands of statements and rows for one question.
+In a busy Hermes gateway every statement and every row waits for the GIL (``test_capture_row_crossings``).
 """
 
 import json
@@ -186,7 +185,7 @@ def test_a_recall_answers_alike_whether_or_not_it_keeps_what_it_loads(app, monke
     core, ctx = app
     item, source = initial(core, ctx)
     sources = _sources(core, ctx, 12)
-    silver = capture(core, ctx, "TEST-project 外壳 银色。")  # the value's own source (#236)
+    silver = capture(core, ctx, "TEST-project 外壳 银色。")  # the value's own source
     accept(
         core,
         ctx,
@@ -250,7 +249,61 @@ def test_hydrating_a_claim_does_not_grow_with_its_evidence(app, monkeypatch):
     assert lots[0] - few[0] <= 4 and lots[1] - few[1] <= 4, (few, lots)
 
 
-# --- what is loaded together keeps the reader's audience (review of 3.7.7) -------------------------------------------
+def _proposals(core, ctx, subject: str, attribute: str, count: int) -> None:
+    """``count`` proposals of ``subject``'s ``attribute``, each drawn from a message of its own and queued for its
+    first judgement."""
+    from scope_recall.core.claims import Qualification
+
+    unproved = Qualification("proposed", "inferred_suggestion", "fact_entailment_unproved")
+    for index in range(count):
+        said = capture(core, ctx, f"{subject} 的第{index}个{attribute}是 {6500 + index}。")
+        proposal = draft(
+            said,
+            str(6500 + index),
+            kind="fact",
+            subject=subject,
+            predicate=f"第{index}个{attribute}",
+            statement_kind="assertion",
+        )
+        with core.storage.write(ctx) as tx:
+            saved = tx.claims.append("TEST-scope", proposal, unproved, recorded_at=core.clock.utc_now())
+            tx.candidates.register(saved.ref, saved.revision, observed_at=core.clock.utc_now())
+
+
+def test_a_packet_reads_its_claims_judgements_together_however_many_it_holds(app, monkeypatch):
+    """Each read that hydrates a packet's claims, the retrieval's and the compiler's verification and release fence
+    alike, reads whether they wait for their first judgement (``retrieval_hydration._judgements``) in one statement,
+    not one a claim."""
+    core, ctx = app
+    _proposals(core, ctx, "Alder", "网关地址", 2)
+    _proposals(core, ctx, "Birch", "节点编号", 10)
+    statements: list[str] = []
+    opened = SQLiteStorage._open
+
+    def _open(storage, *args, **kwargs):
+        conn = opened(storage, *args, **kwargs)
+        conn.set_trace_callback(statements.append)
+        return conn
+
+    monkeypatch.setattr(SQLiteStorage, "_open", _open)
+
+    def judgements(query: str) -> tuple[int, int]:
+        statements.clear()
+        request = recall_request(
+            query=query, mode="current", max_items=30, budget_tokens=8000, request_id="TEST-judged"
+        )
+        packet = core.recall_packet(ctx, request, current_source_refs=(), deadline_seconds=30.0)
+        claims = sum(item["kind"] == "claim" for item in packet["items"])
+        read = "FROM candidate_lifecycle WHERE (candidate_ref,candidate_revision) IN"
+        return claims, sum(read in sql for sql in statements)
+
+    few, few_reads = judgements("Alder 网关地址")
+    many, many_reads = judgements("Birch 节点编号")
+    assert (few, many) == (2, 10)
+    assert many_reads == few_reads <= 4, (few_reads, many_reads)
+
+
+# --- what is loaded together keeps the reader's audience -------------------------------------------------------------
 
 
 def _both(core, ctx, pairs):

@@ -19,9 +19,13 @@ from ..contracts import (
     verified_human_principal_ref,
 )
 from .aliases import validate_alias_source, validate_alias_target
+from .candidate_lifecycle import SELF_SUBJECTS
 from .claim_normalization import expand_frames, human_owner, name_frame, normalize_frame, source_order
 from .claim_storage import parse_source_ref
 from .claims import (
+    DENIAL_REASON,
+    DENIED_REASON,
+    NOT_A_VALUE_REASON,
     ClaimVersion,
     Qualification,
     bind_claim_subject,
@@ -30,7 +34,9 @@ from .claims import (
     evidence_context,
     evidence_refs,
     grounded_time,
+    negates,
     qualify,
+    read_denial,
     same_assertion,
     select_effective,
 )
@@ -38,7 +44,15 @@ from .confirmation import CONFIRMED_REASON, confirmation_targets, is_confirmatio
 from .corroboration import CORROBORATED_REASON, corroboration_promotes
 from .evidence_quote import resolve_evidence_quotes
 from .secret_patterns import contains_secret_like_text
-from .source_qualification import AUTHORITY_QUESTION, RELATIVE_SCOPE, bound_literal, first_person_reference
+from .source_qualification import (
+    AUTHORITY_QUESTION,
+    CONDITIONAL,
+    RELATIVE_SCOPE,
+    attributed_to_another,
+    bound_literal,
+    first_person_reference,
+    quoted_at,
+)
 
 
 @dataclass(frozen=True)
@@ -89,7 +103,7 @@ def validate_claims(tx, value, scope_id: str, *, ungrounded_values: list[int] | 
     # path that accepts a proposal: consolidation, candidate re-evaluation and
     # the host-facing proposal surface all come through here.  Spans naming
     # anything outside this map are left untouched and the strict checks that
-    # follow reject them exactly as before.
+    # follow reject them.
     resolve_evidence_quotes(result, {(s.ref, s.revision): s.content for s in snapshots})
     return validate_proposal_references(result, tuple(snapshots), tx.context, ungrounded_values=ungrounded_values)
 
@@ -125,18 +139,24 @@ def _alias_verified(tx, proposal: ClaimProposal, roots, scope_id: str, now: str)
         return False
 
 
-def _corroborated(tx, proposal, roots, identical, previous, qualification) -> bool:
+def _corroborated(tx, proposal, roots, identical, previous, qualification, denial_reason) -> bool:
     """The same assertion from a second independent first-hand source is not a
     duplicate but corroboration; see core/corroboration.py.  Only when the slot's
     head is this assertion, so corroboration can never bypass ordering,
-    principal or disputed-state handling below."""
+    principal or disputed-state handling below; and never for a denial the
+    denial rule keeps a proposal (``denial_reason``), which no witness makes its
+    slot's value."""
     head_is_this_assertion = previous is None or same_assertion(previous.payload, proposal)
-    return head_is_this_assertion and corroboration_promotes(
-        existing=identical,
-        existing_reason=identical.reason,
-        incoming_reason=qualification.reason,
-        incoming_roots=roots,
-        existing_roots=tx.claims.roots(evidence_refs(identical.payload)),
+    return (
+        denial_reason is None
+        and head_is_this_assertion
+        and corroboration_promotes(
+            existing=identical,
+            existing_reason=identical.reason,
+            incoming_reason=qualification.reason,
+            incoming_roots=roots,
+            existing_roots=tx.claims.roots(evidence_refs(identical.payload)),
+        )
     )
 
 
@@ -204,6 +224,50 @@ def _order_against_head(tx, proposal, roots, previous, qualification, scope_id):
     return qualification, True, ()
 
 
+def denial_verdict(proposal, held, roots, versions=()) -> tuple[str | None, bool]:
+    """Why a denial's own version is a proposal, if it is, and whether the value its slot holds (``held``) ends.
+
+    A denial of another value than the one held ("not CircleCI" while Jenkins is, ``claims.negates``) leaves the slot
+    as it is.  In the person's own slot, a preference or a fact about the person whose words it cites (its subject
+    the principal their 我 was bound to, or the self label 用户, user or 我 a converted 2.0 store keeps, having
+    bound none), a denial that names a value and only denies it is their answer where the slot holds nothing
+    ("我不吃辣") and replaces the value it denies.  Any other denial says what its slot is not and is never its
+    value: one in a fact about anything else and one that goes on to say what holds instead (不用 X 了，而是用 Y,
+    "not X but Y"); when it denies the value held,
+    that value ends.  Writing (``apply_claim``) and re-judging the store (``requalify``) read a denial by this alone;
+    writing binds a self label to a principal before it asks. Slot versions supply target evidence to ``read_denial``.
+    """
+    values = tuple(v.payload for v in versions if v.state != "proposed")
+    denial = read_denial(proposal, values + (() if held is None else (held.payload,)))
+    if denial is None:
+        return None, False
+    denies_held = held is not None and negates(proposal, held.payload)
+    if held is not None and not denies_held:
+        return DENIAL_REASON, False
+    subject = proposal["subject"]
+    owned = proposal["kind"] == "preference" or subject == human_owner(roots) or subject.casefold() in SELF_SUBJECTS
+    if owned and not denial.contrast:
+        return None, False
+    return NOT_A_VALUE_REASON, denies_held
+
+
+def _end_denied_value(tx, proposal, roots, previous, held, qualification, scope_id, now) -> Mutation | None:
+    """End the value a denial says no longer holds where a value of the denial's would replace it
+    (``_order_against_head``): a retraction of it from the denial's time, on the denial's evidence, becomes the slot's
+    head, and the denial is kept beside it as a proposal.  None where it would not replace it."""
+    if previous.state != "proposed":
+        ordered, advance, _conflicts = _order_against_head(tx, proposal, roots, previous, qualification, scope_id)
+        if not advance or ordered.state != "active":
+            return None
+    ended = deepcopy(held.payload)
+    ended.update(valid_from=proposal["valid_from"], evidence_spans=deepcopy(proposal["evidence_spans"]))
+    retraction = Qualification("retracted", qualification.basis, DENIED_REASON)
+    retracted = tx.claims.append(scope_id, ended, retraction, recorded_at=now, previous=previous)
+    beside = Qualification("proposed", "inferred_suggestion", NOT_A_VALUE_REASON)
+    tx.claims.append(scope_id, proposal, beside, recorded_at=now, previous=retracted, advance_head=False)
+    return Mutation(retracted.ref, retracted.revision, "retracted", retracted.state)
+
+
 def apply_claim(tx, proposal: ClaimProposal, scope_id: str, now: str, *, _subject_bound: bool = False) -> Mutation:
     roots = tx.claims.roots(evidence_refs(proposal))
 
@@ -220,6 +284,11 @@ def apply_claim(tx, proposal: ClaimProposal, scope_id: str, now: str, *, _subjec
         qualification = Qualification("proposed", "inferred_suggestion", "alias_target_or_relation_unverified")
     history = tx.claims.slot(scope_id, proposal)
     previous = next((v for v in history if v.revision == v.current_revision), None)
+    held = select_effective(history, now) if history else None
+    denial_reason, ends_held = denial_verdict(proposal, held, roots, history)
+    gated = qualification
+    if denial_reason is not None and qualification.state != "proposed":
+        qualification = Qualification("proposed", "inferred_suggestion", denial_reason)
     # Repeated extraction cannot alter the live identity, validity, head,
     # lifecycle, epoch or work queue of the same assertion.
     identical = next(
@@ -231,7 +300,7 @@ def apply_claim(tx, proposal: ClaimProposal, scope_id: str, now: str, *, _subjec
         None,
     )
     if identical is not None:
-        if _corroborated(tx, proposal, roots, identical, previous, qualification):
+        if _corroborated(tx, proposal, roots, identical, previous, qualification, denial_reason):
             promoted = Qualification("active", "direct_report", CORROBORATED_REASON)
             saved = tx.claims.append(
                 scope_id,
@@ -243,8 +312,14 @@ def apply_claim(tx, proposal: ClaimProposal, scope_id: str, now: str, *, _subjec
             )
             return Mutation(saved.ref, saved.revision, "inserted", saved.state)
         return Mutation(identical.ref, identical.revision, "duplicate", identical.state)
+    if ends_held and gated.state == "active":
+        ended = _end_denied_value(tx, proposal, roots, previous, held, gated, scope_id, now)
+        if ended is not None:
+            return ended
     advance, conflicts = True, ()
-    if previous is not None and previous.state != "proposed":
+    if denial_reason is not None and previous is not None:
+        advance = False
+    elif previous is not None and previous.state != "proposed":
         if qualification.state == "proposed":
             advance = False
         else:
@@ -312,19 +387,45 @@ _AMBIGUOUS = re.compile(
     r"\b(?:change that|that is wrong|replace it|remove it)\b",
     re.I,
 )
+#: What the fast path cannot date to its message: a limit in time, a change said for later ("下周换成 X", "会改成 X",
+#: "will switch to X"), or an instruction to leave the value alone.
 _NO_FAST_PATH = re.compile(
-    r"假设|假如|如果|除非|仅限|只限|今天|明天|以后|日起|将停止|将不再|将弃用|不要改|别改|\b(?:suppose|unless|only today|tomorrow|do not change|will stop|will discontinue)\b",
+    r"仅限|只限|今天|明天|以后|日起|下周|下个?月|明年|将来|将要|将会|会改|会换|将停止|将不再|将弃用|不要改|别改|"
+    r"\b(?:only today|tomorrow|next (?:week|month|year)|do not change|will (?:change|switch|move|stop|discontinue))\b",
     re.I,
 )
 _NEGATED_ACTION = re.compile(
     r"(?:不要|别|不能|不必|暂不)[^。！？!?;；\n]{0,4096}(?:改|换成|换为|调整为|调整成|替换|更换|更正|撤回|撤销|作废|停止|不再|弃用)|\b(?:do not|don't|never)\s+(?:change|correct|retract|withdraw|replace|stop|discontinue|switch)\b",
     re.I,
 )
-_QUESTION = AUTHORITY_QUESTION
-_REPORTED_ACTION = re.compile(
-    r"举例|示例|客户原文|引用|他说|她说|他们说|文档写|\b(?:for example|example:|quoted|customer said|he said|she said)\b",
+#: A question asked without a question mark ("换成 X 怎么样", "为什么改成 X 了", "Did it change to X"), beside those
+#: ``AUTHORITY_QUESTION`` knows.
+_ASKED = re.compile(
+    r"为什么|为何|怎么样|好不好|行不行|可不可以|能不能|难道|\b(?:why|how\s+about|what\s+about)\b"
+    r"|(?:^|[.!?。！？\n]\s*)(?:do|does|did|is|are|was|were)\s+(?!not\b)\w",
     re.I,
 )
+
+
+def _not_asserted(raw: str) -> bool:
+    """Whether a message's change is not the person making it: negated, asked, said under a condition or a
+    supposition, someone else's words or an example, or a correction word inside quoted text."""
+    return bool(
+        _NEGATED_ACTION.search(raw)
+        or AUTHORITY_QUESTION.search(raw)
+        or _ASKED.search(raw)
+        or CONDITIONAL.search(raw)
+        or _reported(raw)
+    )
+
+
+def _reported(raw: str) -> bool:
+    """Whether a message reports someone else's change: words it gives to anyone but the person, an example included
+    (``attributed_to_another``, as claims are read), or a correction or retraction word standing in quoted text."""
+    if attributed_to_another(raw):
+        return True
+    markers = (*_CORRECTION.finditer(raw), *_RETRACT.finditer(raw))
+    return any(quoted_at(raw, marker.start()) for marker in markers)
 
 
 def _source_principal_ref(source) -> str | None:
@@ -364,7 +465,7 @@ def _names_target(text: str, head, first_person_target: bool) -> bool:
 
 def _revision_authority(tx, head, request) -> _Authority:
     """The person's current message the request cites, checked to assert this revision of this claim: not older
-    than the claim's version, not negated, asked or reported, a correction or a plain retraction, naming the claim."""
+    than the claim's version, asserted (``_not_asserted``), a correction or a plain retraction, naming the claim."""
     source = tx.claims.current_human(tuple(request["source_evidence_refs"]), head.scope_id)
     raw = source.event["content"]
     principal_matches = _source_principal_ref(source) == head.payload["subject"]
@@ -373,7 +474,7 @@ def _revision_authority(tx, head, request) -> _Authority:
     head_time = canonical_time(head.valid_from)
     if source_time is not None and head_time is not None and source_time < head_time:
         raise ContractError("DERIVATION_INVALID", "late_historical_correction")
-    if _NEGATED_ACTION.search(raw) or _QUESTION.search(raw) or _REPORTED_ACTION.search(raw):
+    if _not_asserted(raw):
         raise ContractError("ACCESS_DENIED", "revision_not_asserted")
     new_value = request["new_value"]
     retraction = new_value is None or new_value == {"state": "retracted"}
@@ -440,8 +541,14 @@ def _revision_proof(head, updated, authority: _Authority) -> str:
     return proof
 
 
-def _revision_qualification(tx, updated, proof: str, authority: _Authority) -> Qualification:
-    """The revised claim's qualification: a retraction is the person's report; a correction must qualify active."""
+#: What a correction refused because its value is a denial that is no value of its slot can do instead.
+_DENIAL_REVISION_HINT = "give the value that holds instead, or withdraw the claim with new_value null"
+
+
+def _revision_qualification(tx, updated, proof: str, authority: _Authority, held, versions) -> Qualification:
+    """The revised claim's qualification: a retraction is the person's report; a correction must qualify active and
+    be a value of its slot, given ``held``, the value the slot holds: a denial the denial rule keeps a proposal
+    (``denial_verdict``) is none."""
     roots = tx.claims.roots(evidence_refs(updated))
     roots = tuple(replace(root, content=evidence_context(root.content, proof)) for root in roots)
     if not all(grounded_time(updated[field], roots) for field in ("valid_from", "valid_to")):
@@ -463,6 +570,9 @@ def _revision_qualification(tx, updated, proof: str, authority: _Authority) -> Q
     # polarity, conditions, source identity or temporal checks.
     if qualification.state != "active":
         raise ContractError("DERIVATION_INVALID", qualification.reason)
+    denial_reason, _ends_held = denial_verdict(updated, held, roots, versions)
+    if denial_reason is not None:
+        raise ContractError("DERIVATION_INVALID", denial_reason, hint=_DENIAL_REVISION_HINT)
     return qualification
 
 
@@ -492,8 +602,8 @@ def _record_revision(tx, clock, head, updated, qualification, request, authority
     mutation = Mutation(saved.ref, saved.revision, "retracted" if authority.retraction else "revised", saved.state)
     register_applied_candidate(tx, mutation, now)
     # The ambiguity this claim was a candidate for has now been answered by an
-    # authorized revision of it.  Without this, ``unresolved_updates`` only ever
-    # grew: ``resolved`` had no writer anywhere in the codebase.
+    # authorized revision of it.  Without this, ``unresolved_updates`` would only
+    # ever grow: nothing else writes ``resolved``.
     tx.claims.resolve_updates(mutation.ref, resolved_at=now)
     return mutation
 
@@ -515,7 +625,9 @@ def _revise_in_transaction(tx, clock, request) -> Mutation:
         reference_proposals=[],
     )
     validate_claims(tx, result, head.scope_id)
-    qualification = _revision_qualification(tx, updated, proof, authority)
+    history = tx.claims.slot(head.scope_id, updated)
+    held = select_effective(history, clock.utc_now()) if history else None
+    qualification = _revision_qualification(tx, updated, proof, authority, held, history)
     return _record_revision(tx, clock, head, updated, qualification, request, authority)
 
 
@@ -527,15 +639,26 @@ def revise(storage, clock, context: TrustedContext, value, *, remaining_seconds:
     return MutationReceipt((item,), epoch)
 
 
-#: Words a message puts in a value's place: "改为 X", "用 X", "是 X", "change to X".
-_REPLACEMENT_WORD = re.compile(
-    r"(?:改为|改成|改用|换成|换为|调整为|调整成|替换为|更换为|用|是|change to|switch to)\s*([A-Za-z0-9\u4e00-\u9fff_.-]{1,120})(?=[。！？；，,;.!?\s]|$)",
-    re.I,
+#: A value said as one word: letters, digits, CJK and the marks identifiers carry ("#ops-pager", "@owner", "v3.1").
+_WORD_VALUE = r"[#@]?[\w./+-]{1,120}"
+#: Where such a word ends: a space, a clause's punctuation, a full stop before a space or the end, or the end.
+_WORD_END = r"(?=[\s。！？；，,;!?]|\.(?:\s|$)|$)"
+#: The value a replacement names: the rest of its clause, spaces included, without a closing particle ("改成 90 天了"
+#: names "90 天", "switch to Jenkins for CI" names "Jenkins for CI").
+_CLAUSE_VALUE = (
+    r"([^\s。！？；，,;!?][^。！？；，,;!?\n]{0,119}?)\s*(?:了|啦|吧|呢)?(?=[。！？；，,;!?\n]|\.(?:\s|$)|$)"
 )
-#: Only the explicit replacements among them ("改为 X", "change to X"; not "用 X" or "是 X").
 _EXPLICIT_REPLACEMENT = re.compile(
-    r"(?:改为|改成|改用|换成|换为|调整为|调整成|替换为|更换为|change to|switch to)\s*([A-Za-z0-9\u4e00-\u9fff_.-]{1,120})(?=[。！？；，,;.!?\s]|$)",
-    re.I,
+    r"(?:改为|改成|改用|换成|换为|调整为|调整成|替换为|更换为|\b(?:change|switch)\s+to\b)[\s:：]*" + _CLAUSE_VALUE, re.I
+)
+#: The looser words that put a value in place too: "用 X", "是 X".
+_LOOSE_REPLACEMENT = re.compile(rf"(?:用|是)\s*({_WORD_VALUE}){_WORD_END}")
+#: A value the fast path applies as it is said: one word (an identifier, a #mark or an @name, or CJK text alone) or
+#: a number with its unit ("90 天", "2 GB", "30 分钟").  Anything longer may hold more than the value ("Jenkins 来跑
+#: CI"), and is left for the person or the worker to settle.
+_UNAMBIGUOUS_VALUE = re.compile(
+    r"[#@]?(?:[^\W\u3400-\u9fff]|[./+-])+|[\u3400-\u9fff]+"
+    r"|\d+(?:\.\d+)?\s*(?:%|[^\W\d_\u3400-\u9fff]{1,8}|[\u3400-\u9fff]{1,3})"
 )
 
 
@@ -544,7 +667,7 @@ def _may_correct(source, raw: str) -> bool:
     correction, a retraction or an ambiguous change."""
     if source.event["origin"] != "human_direct" or source.capture_gaps or source.event["capture_state"] != "complete":
         return False
-    if _REPORTED_ACTION.search(raw):
+    if _reported(raw):
         return False
     return bool(_CORRECTION.search(raw) or _RETRACT.search(raw) or _AMBIGUOUS.search(raw))
 
@@ -592,34 +715,26 @@ def _correction_targets(tx, source, raw: str):
 def _replacement_words(raw: str, matches) -> tuple[list[str], list[str]]:
     """The words a message puts in a value's place, and the explicit replacements among them; with one claim matched,
     "replace OLD with NEW" counts as both.  A sentence-final ASCII full stop is punctuation, not part of the value."""
-    tokens = _REPLACEMENT_WORD.findall(raw)
     replacements = _EXPLICIT_REPLACEMENT.findall(raw)
+    tokens = [*replacements, *_LOOSE_REPLACEMENT.findall(raw)]
     if len(matches) == 1:
         old = re.escape(matches[0].payload["value_text"])
-        english = re.findall(
-            r"(?i:\breplace)\s+"
-            + old
-            + r"\s+(?i:with)\s+([A-Za-z0-9\u4e00-\u9fff_.-]{1,120})(?=[。！？；，,;.!?\s]|$)",
-            raw,
-        )
+        english = re.findall(r"(?i:\breplace)\s+" + old + r"\s+(?i:with)\s+" + _CLAUSE_VALUE, raw)
         tokens.extend(english)
         replacements.extend(english)
     return [token.rstrip(".") for token in tokens], [token.rstrip(".") for token in replacements]
 
 
-def _plain_correction(raw: str, matches, tokens, replacements) -> bool:
+def _plain_correction(raw: str, matches, tokens, replacements, new_value) -> bool:
     """Whether the message corrects or retracts one claim plainly enough to apply at once: one claim, at most one
-    explicit replacement, a value or a retraction, and nothing conditional, relative, negated or asked."""
+    explicit replacement, a value or a retraction, the value unambiguous (``_UNAMBIGUOUS_VALUE``), nothing limited to
+    a time or relative to the moment, and asserted (``_not_asserted``)."""
     return (
         len(matches) == 1
         and len(replacements) <= 1
         and bool(tokens or _RETRACT.search(raw))
-        and not (
-            _NO_FAST_PATH.search(raw)
-            or RELATIVE_SCOPE.search(raw)
-            or _NEGATED_ACTION.search(raw)
-            or _QUESTION.search(raw)
-        )
+        and (new_value is None or _UNAMBIGUOUS_VALUE.fullmatch(new_value) is not None)
+        and not (_NO_FAST_PATH.search(raw) or RELATIVE_SCOPE.search(raw) or _not_asserted(raw))
     )
 
 
@@ -630,7 +745,11 @@ def capture_correction(tx, source, clock) -> Mutation | None:
         return None
     heads, matches, fallback_context = _correction_targets(tx, source, raw)
     tokens, replacements = _replacement_words(raw, matches)
-    if not fallback_context and _plain_correction(raw, matches, tokens, replacements):
+    # An explicit replacement ("改成 X") names the value; a looser word ("是", "用") can stand inside another word
+    # ("还是改成 X" yields "改成").
+    replacement = replacements[-1] if replacements else None
+    new_value = replacement if _RETRACT.search(raw) else (replacement or (tokens[-1] if tokens else None))
+    if not fallback_context and _plain_correction(raw, matches, tokens, replacements, new_value):
         target = matches[0]
         source_time = canonical_time(source.event["occurred_at"])
         target_time = canonical_time(target.valid_from)
@@ -641,7 +760,7 @@ def capture_correction(tx, source, clock) -> Mutation | None:
             protocol_version="1.1",
             target_ref=target.ref,
             expected_revision=target.current_revision,
-            new_value=(replacements[-1] if replacements else None) if _RETRACT.search(raw) else tokens[-1],
+            new_value=new_value,
             conditions=target.payload["conditions"],
             source_evidence_refs=[f"{source.ref}@{source.revision}"],
             valid_from=source.event["occurred_at"],
@@ -654,8 +773,8 @@ def capture_correction(tx, source, clock) -> Mutation | None:
             pass
     candidates = tuple(v.ref for v in (matches or heads))
     # With no claim to place it against there is no ambiguity to keep: a row naming none could never be closed
-    # (``resolve_updates`` needs one of its candidates revised), and 36 such rows on the pilot were handed to every
-    # read for good.  The message itself is stored and consolidated as any other.
+    # (``resolve_updates`` needs one of its candidates revised), and each such row would be handed to every read for
+    # good.  The message itself is stored and consolidated as any other.
     if candidates:
         tx.claims.unresolved(source.ref, source.revision, candidates, recorded_at=clock.utc_now())
     return None
@@ -671,7 +790,9 @@ def capture_confirmation(tx, source, clock) -> Mutation | None:
 
     Everything that makes it safe is in the targeting: the text must literally
     name the claim, and it must name exactly one.  A bare "记住" resolves to
-    nothing and is recorded as unresolved rather than guessed at.
+    nothing and is recorded as unresolved rather than guessed at.  So is a
+    denial the denial rule keeps a proposal (``denial_verdict``): adopted or
+    not, it is no value of its slot.
     """
     raw = source.event["content"]
     if source.event["origin"] != "human_direct" or source.capture_gaps or source.event["capture_state"] != "complete":
@@ -694,6 +815,11 @@ def capture_confirmation(tx, source, clock) -> Mutation | None:
             tx.claims.unresolved(source.ref, source.revision, tuple(v.ref for v in heads), recorded_at=clock.utc_now())
         return None
     target = matches[0]
+    versions = tx.claims.versions(target.ref)
+    held = select_effective(versions, clock.utc_now())
+    if denial_verdict(target.payload, held, tx.claims.roots(evidence_refs(target.payload)), versions)[0] is not None:
+        tx.claims.unresolved(source.ref, source.revision, (target.ref,), recorded_at=clock.utc_now())
+        return None
     payload = deepcopy(target.payload)
     spans = list(payload.get("evidence_spans") or ())
     # The confirmation is itself evidence: it is the record of who vouched.

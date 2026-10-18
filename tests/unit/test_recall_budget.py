@@ -1,14 +1,15 @@
 """The packet's size estimate, counted without a Python step per character.
 
-The per-character loop cost 180 ms of a 2.5 s automatic recall on the shared store: the packet weighs every
-candidate it considers, 1.9 million characters in that recall.  The estimate itself must not move, so the
-rewrite is checked against the loop it replaced.
+A per-character loop would cost a visible share of an automatic recall: the packet weighs every candidate it
+considers, millions of characters in a recall on a large store.  The estimate itself must not move, so the count
+is checked against the per-character loop.
 """
 
 import random
 import unicodedata
 
 from scope_recall.core.recall_budget import estimate_tokens
+from v11_support import slowdown
 
 
 def _reference(text: str) -> int:
@@ -72,12 +73,13 @@ def test_the_estimate_is_unchanged_for_random_mixed_text():
 
 
 def test_a_text_of_many_different_symbols_is_counted_in_linear_time():
-    """Counting each distinct symbol over the whole text again was quadratic in the number of different ones: a
-    glyph table of 65,536 private-use characters took 1.2 s, and every candidate is weighed at least twice."""
-    import time
+    """Each distinct symbol is counted once, not over the whole text again, which takes time quadratic in how many
+    different ones there are: a glyph table holds tens of thousands, and every candidate is weighed at least twice.
+    Four times the symbols take about four times as long (``slowdown``)."""
 
-    text = "".join(chr(0xF0000 + index) for index in range(65000))
-    started = time.monotonic()
-    counted = estimate_tokens(text)
-    assert time.monotonic() - started < 0.3
-    assert counted == _reference(text)
+    def symbols(count):
+        return "".join(chr(0xF0000 + index) for index in range(count))
+
+    text = symbols(64_000)
+    assert slowdown(estimate_tokens, symbols(16_000), text) < 8
+    assert estimate_tokens(text) == _reference(text)

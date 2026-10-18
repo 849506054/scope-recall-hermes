@@ -216,7 +216,7 @@ def _accept_relation_claim(core: MemoryCore, ctx: TrustedContext, root: Any, pee
         "kind": "fact",
         "subject": f"TEST-relation-{index}",
         "predicate": "connected_to",
-        # In the peer's own words: a value no cited source carries is refused (#236).
+        # In the peer's own words: a value no cited source carries is refused.
         "value_text": peer.event["content"].rstrip("."),
         "conditions": [],
         "statement_kind": "assertion",
@@ -900,7 +900,7 @@ def test_automatic_packet_budget_keeps_later_constraint_and_stays_closed(tmp_pat
     assert all(item["evidence_refs"] for item in default["items"])
     assert "budget_token_cap" not in default["gaps"]
 
-    # 1200 estimated units now fit these short CJK records. This measured
+    # 1200 estimated units fit these short CJK records. This measured
     # 500-unit boundary fits two event envelopes, not three, including gaps.
     cap = 500
     capped = core.recall_packet(
@@ -912,10 +912,10 @@ def test_automatic_packet_budget_keeps_later_constraint_and_stays_closed(tmp_pat
     assert "budget_token_cap" in capped["gaps"]
     # A budget cut comes off the bottom of the ranking, and what is cut is named.
     #
-    # This used to assert that "今晚不能恢复" was dropped, on the assumption that
-    # the ranking followed the vector scores above. It does not: that source is
-    # the property's definitive answer and it carries "今晚" straight out of the
-    # query, so the ranker puts it second. The source ranked below it is the
+    # "今晚不能恢复" is not the one dropped: the ranking does not follow the vector
+    # scores above. That source is the property's definitive answer and it
+    # carries "今晚" straight out of the query, so the ranker puts it second.
+    # The source ranked below it is the
     # assistant_visible echo — "助手说会跟踪进度" — which carries no information
     # at all. Dropping the answer to keep the echo would be strictly worse
     # memory, and the packet is kept honest by the gap naming what went, not by
@@ -977,13 +977,18 @@ def test_a_query_with_more_than_128_distinct_terms_keeps_the_first_ones():
     assert {"白鹭", "项目", "负责"} <= set(terms), "the terms it reaches first are kept"
 
 
-def test_a_query_s_terms_are_worked_out_once_however_often_a_recall_asks():
-    """A recall asks for its query's terms 150 to 190 times; for a long varied prompt each time cost 22 ms, 4.3 s of
-    a 4.6 s recall."""
-    import time
+def test_a_query_s_terms_are_worked_out_once_however_often_a_recall_asks(monkeypatch):
+    """A recall asks for its query's terms 150 to 190 times, and working them out for a long varied prompt takes tens
+    of milliseconds each time: most of a recall's seconds, were they worked out again."""
+    from scope_recall.core import events
 
+    worked = []
+
+    def counted(text):
+        worked.append(text)
+        return lexical_terms(text)
+
+    monkeypatch.setattr(events, "lexical_terms", counted)
     varied = "".join(chr(0x4E00 + (index * 7919) % 20000) for index in range(8000))
-    started = time.perf_counter()
-    for _ in range(200):
-        query_terms(varied)
-    assert time.perf_counter() - started < 0.5
+    assert len({query_terms(varied) for _ in range(200)}) == 1
+    assert len(worked) <= 1

@@ -34,8 +34,7 @@
    "reportOptionalMemberAccess": 1
   },
   "adapters/clients/remote_client.py": {
-   "reportArgumentType": 5,
-   "reportAttributeAccessIssue": 2
+   "reportArgumentType": 1
   },
   "adapters/clients/remote_server.py": {
    "reportAttributeAccessIssue": 2,
@@ -187,7 +186,7 @@
   },
   "maintenance/legacy_sources.py": {
    "reportArgumentType": 1,
-   "reportOptionalSubscript": 4
+   "reportOptionalSubscript": 2
   },
   "maintenance/legacy_v2_compat.py": {
    "reportArgumentType": 1
@@ -207,9 +206,6 @@
   },
   "maintenance/package_upgrade.py": {
    "reportArgumentType": 6
-  },
-  "maintenance/rollback.py": {
-   "reportArgumentType": 8
   },
   "maintenance/shared.py": {
    "reportOptionalMemberAccess": 1
@@ -349,7 +345,6 @@
    "C901": {
     "ensure_resident": 16
    },
-   "E501": 1,
    "PLR0911": {
     "Recaller._exchange": 11,
     "ensure_resident": 12
@@ -557,9 +552,6 @@
   "core/fact_temporal_semantics.py": {
    "E501": 1
   },
-  "core/failure_retry.py": {
-   "E501": 2
-  },
   "core/file_lock.py": {
    "B009": 3,
    "PLR0912": {
@@ -595,7 +587,7 @@
    }
   },
   "core/mutate.py": {
-   "E501": 7
+   "E501": 3
   },
   "core/read_views.py": {
    "UP035": 1
@@ -606,7 +598,7 @@
     "RetrievalPipeline._expand": 26
    },
    "PLR0911": {
-    "RetrievalPipeline._expand": 10
+    "RetrievalPipeline._expand": 9
    },
    "PLR0912": {
     "RetrievalPipeline._expand": 24
@@ -632,13 +624,7 @@
    "UP035": 1
   },
   "core/recall_scope.py": {
-   "B905": 2,
-   "C901": {
-    "_named_days": 20
-   },
-   "PLR0912": {
-    "_named_days": 16
-   },
+   "B905": 1,
    "UP017": 1,
    "UP035": 1
   },
@@ -680,7 +666,7 @@
    "E501": 2
   },
   "core/source_storage.py": {
-   "E501": 9
+   "E501": 8
   },
   "core/storage.py": {
    "B010": 1,
@@ -794,7 +780,7 @@
   "maintenance/doctor_store.py": {
    "E501": 1,
    "PLR0915": {
-    "check_storage": 75
+    "check_storage": 66
    },
    "UP017": 7
   },
@@ -817,9 +803,6 @@
     "plan_install": 61
    }
   },
-  "maintenance/install_purge.py": {
-   "UP035": 1
-  },
   "maintenance/install_receipt.py": {
    "UP035": 1
   },
@@ -839,10 +822,10 @@
    }
   },
   "maintenance/legacy_conversion.py": {
-   "E501": 10,
+   "E501": 9,
    "PLR0913": {
-    "_prepare": 15,
-    "migrate_legacy": 15
+    "_prepare": 14,
+    "migrate_legacy": 14
    },
    "UP017": 1,
    "UP035": 1
@@ -889,12 +872,6 @@
    }
   },
   "maintenance/shared.py": {
-   "C901": {
-    "attach": 17
-   },
-   "PLR0912": {
-    "attach": 19
-   },
    "PLR0913": {
     "attach": 11
    },
@@ -903,14 +880,13 @@
   "maintenance/shared_import.py": {
    "C901": {
     "_import_rows": 19,
-    "import_entry": 16
+    "_imported": 16
    },
    "PLR0912": {
-    "import_entry": 18
+    "_imported": 18
    },
    "PLR0915": {
-    "_import_rows": 100,
-    "import_entry": 61
+    "_import_rows": 100
    },
    "UP017": 1,
    "UP035": 1
@@ -929,9 +905,6 @@
    "B905": 1
   },
   "runtime/consolidation_models.py": {
-   "C901": {
-    "_responses_output_text": 16
-   },
    "UP037": 1
   },
   "runtime/embedding_retry.py": {
@@ -1189,7 +1162,7 @@
   "tests/host/codex/test_shared_client.py": {
    "B023": 2,
    "E501": 5,
-   "UP017": 9
+   "UP017": 7
   },
   "tests/host/hermes/test_a2a_prepare.py": {
    "E402": 7,
@@ -1200,9 +1173,6 @@
   },
   "tests/host/hermes/test_runtime_bounds.py": {
    "BLE001": 1
-  },
-  "tests/host/test_eval_model_runtime.py": {
-   "E501": 1
   },
   "tests/host/test_runtime_wiring_common.py": {
    "E501": 1,

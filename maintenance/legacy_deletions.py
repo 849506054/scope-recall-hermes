@@ -133,11 +133,16 @@ def plan_deletions(cv: Conversion) -> None:
         ]
         default_scope = sorted(cv.requested)[0]
         scopes = sorted({str(scope_by_journal.get(x, default_scope)) for x in journal_ids})
+        refs = _closure(cv, journal_ids, links, groups)
+        # A deleted source takes its whole group, as Core's own closure takes siblings: a record's later parts and a
+        # memory's digest rows.  The purge scrubs only the members it is given.
+        deleted = {item["source_group_key"] for item in cv.sources if item["event_id"] in refs}
+        refs |= {item["event_id"] for item in cv.sources if item["source_group_key"] in deleted}
         cv.deletion_specs.append(
             {
                 "operation_id": stable_legacy_id("deletion", op),
                 "legacy_operation_id": op,
-                "refs": sorted(_closure(cv, journal_ids, links, groups)),
+                "refs": sorted(refs),
                 "scopes": scopes or [default_scope],
                 "created_at": recorded_time(row.get("created_at")),
             }

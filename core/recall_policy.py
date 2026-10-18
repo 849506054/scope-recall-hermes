@@ -56,13 +56,12 @@ def canonical_embedding_space(value: dict) -> dict:
 
     if type(value) is not dict or set(value) != set(EMBEDDING_SPACE):
         raise ContractError("INPUT_INVALID", "embedding_space")
-    # Shape and bounds, not identity. This used to require every field to equal
-    # the module default, which made the embedding model unconfigurable: a
-    # deployment could not choose its own provider even though the vector store
-    # keys everything on the space digest and would have rebuilt cleanly.
-    # Identity is still enforced, one layer out and where it belongs — a vector
-    # whose space digest differs from the one its `RecallPolicy` is bound to
-    # (`embedding_space_id`, the configured route's space in a runtime
+    # Shape and bounds, not identity: requiring every field to equal the module
+    # default would make the embedding model unconfigurable, though the vector
+    # store keys everything on the space digest and rebuilds cleanly for
+    # another provider.  Identity is enforced one layer out, where it belongs —
+    # a vector whose space digest differs from the one its `RecallPolicy` is
+    # bound to (`embedding_space_id`, the configured route's space in a runtime
     # instance) is refused admission in `RecallPolicy.vector_admission`.
     if type(value.get("model")) is not str or not 1 <= len(value["model"]) <= 200:
         raise ContractError("INPUT_INVALID", "embedding_space")
@@ -149,8 +148,7 @@ def build_embedding_space(*, model: str, dimensions: int, endpoint: str, dialect
     dimensionality or the request shape and the digest changes, the store moves
     to a new directory, and vectors from the old space are refused admission
     instead of being silently compared across incompatible geometries. That
-    property is what makes swapping embedding models safe; it was already here,
-    and only the hardcoded descriptor stopped anyone from using it.
+    property is what makes swapping embedding models safe.
     """
     if dialect not in EMBEDDING_DIALECTS:
         raise ContractError("INPUT_INVALID", "embedding_dialect")
@@ -350,9 +348,16 @@ def query_is_relevant(query: str, content: str) -> bool:
     overlap = len(q.intersection(lexical_terms(content)))
     if hard_identifiers(query).intersection(hard_identifiers(content)):
         return True
-    if len(q) == 1:
+    return shares_enough(overlap, len(q))
+
+
+def shares_enough(overlap: int, terms: int) -> bool:
+    """Whether ``overlap`` of a query's ``terms`` meaningful terms is enough for a source something else already
+    narrowed down, as the session for its recent messages or the time a question names: one of one, else two and
+    three in ten."""
+    if terms == 1:
         return overlap == 1
-    return overlap >= max(2, math.ceil(len(q) * 0.30))
+    return overlap >= max(2, math.ceil(terms * 0.30))
 
 
 def _specificity_required(term_count: int) -> int:
@@ -400,16 +405,16 @@ def query_is_specific(
 
 #: Characters that only ask: 什么, 怎么, 哪个, 谁, 多少 and the sentence-final
 #: particles.  The index holds overlapping bigrams, so "这个实例当前是什么模型"
-#: searched 是什, 什么 and 么模 too -- terms every earlier question shares and
-#: no answer does -- so "你现在是什么模型呀" came back as the best match.
+#: would search 是什, 什么 and 么模 too -- terms every earlier question shares
+#: and no answer does -- and "你现在是什么模型呀" would come back as the best match.
 #: A bigram holding one of these asks rather than names, so it proves nothing.
 #: The few nouns built on them (酒吧, 哪吒) are the price of that rule.
-_ASKING_CHARACTERS = frozenset("什么吗呢呀吧嘛哪啥谁")
+_RETRIEVAL_ASKING_CHARACTERS = frozenset("什么吗呢呀吧嘛哪啥谁")
 #: Asking words whose characters also appear in naming words (怎 in 怎样 only,
 #: but 多 in 多少 and 多个, 是 in 是否 and 于是).
-_ASKING_WORDS = frozenset({"怎样", "如何", "为何", "多少", "是否", "何时", "几时"})
+_RETRIEVAL_ASKING_WORDS = frozenset({"怎样", "如何", "为何", "多少", "是否", "何时", "几时"})
 #: English asking and helper words: in a question they carry no subject matter.
-_ASKING_ENGLISH = frozenset(
+_RETRIEVAL_ASKING_ENGLISH = frozenset(
     {
         "what",
         "which",
@@ -447,9 +452,90 @@ _ASKING_ENGLISH = frozenset(
 
 
 def _asks_only(term: str) -> bool:
-    if term in _ASKING_WORDS or term in _ASKING_ENGLISH:
+    if term in _RETRIEVAL_ASKING_WORDS or term in _RETRIEVAL_ASKING_ENGLISH:
         return True
-    return _CJK_TEXT.search(term) is not None and any(char in _ASKING_CHARACTERS for char in term)
+    return _CJK_TEXT.search(term) is not None and any(char in _RETRIEVAL_ASKING_CHARACTERS for char in term)
+
+
+#: English words that only frame a request to be told about what a question names ("Describe Orchard", "Any updates
+#: on Orchard?"), which an answer need not say: it names what it answers.  Read by ``asked_terms`` alone: recall
+#: searches them as it searches any word (``meaningful_query_terms``), since a message that says one may be what was
+#: asked for ("show me the summary" finds "Summary: the deployment ended at noon.").  status names something itself
+#: (a status page, a status code) and is none of them.
+_FRAMING_ENGLISH = frozenset(
+    {
+        "please",
+        "tell",
+        "show",
+        "give",
+        "you",
+        "know",
+        "remember",
+        "remind",
+        "say",
+        "said",
+        "describe",
+        "explain",
+        "summarize",
+        "summarise",
+        "any",
+        "anything",
+        "something",
+        "everything",
+        "update",
+        "updates",
+        "latest",
+        "news",
+        "progress",
+        "situation",
+        "overview",
+        "summary",
+        "info",
+        "information",
+        "details",
+    }
+)
+#: What ``asked_terms`` reads a question without, whole, so that the bigrams joining a Chinese one to its neighbours go
+#: with it (是多 in 端口是多少, 绍一 and 一下 in 介绍一下): the Chinese words that ask
+#: (``_RETRIEVAL_ASKING_WORDS``); the Chinese
+#: words that only frame a request (介绍一下, 说说, 告诉, 关于, 知道, 怎么样, 进展, 消息 ...), where 情况 frames
+#: "X 的情况" but not 情况下, a condition an answer says too; and the person a request to be told is addressed to:
+#: tell me, 给我讲讲, and me or us closing a request ("Explain Orchard to me").  Elsewhere me and 我 name whom a
+#: request is about (contact me, 给我订), and an answer says them.  Recall reads the question with all of them.
+_FRAMING_PHRASES = re.compile(
+    "|".join(
+        (
+            *sorted(_RETRIEVAL_ASKING_WORDS),
+            "怎么样",
+            "(?:给我|跟我|帮我)?(?:介绍|说说|讲讲|谈谈|聊聊|看看)",
+            "告诉我?",
+            "一下",
+            "关于",
+            "知道",
+            "还记得",
+            "记得",
+            "情况(?!下)",
+            "进展",
+            "消息",
+            "最新",
+            "动态",
+            r"\b(?:tell|show|give|remind) (?:me|us)\b",
+            r"\b(?:let (?:me|us) know|fill (?:me|us) in|catch (?:me|us) up|walk (?:me|us) through)\b",
+            r"\b(?:to|for) (?:me|us)\b(?=\W*$)",
+        )
+    ),
+    re.I,
+)
+
+
+def asked_terms(question: str) -> tuple[str, ...]:
+    """The terms a question asks an answer to say (``recall_needs.answering``): its meaningful terms
+    (``meaningful_query_terms``) read without what asks or only frames a request (``_FRAMING_PHRASES``,
+    ``_FRAMING_ENGLISH``).  "Tell me about Orchard" asks nothing past its name, as "What is Orchard?" does; "What do you
+    know about Orchard's port?" asks for its port."""
+    return tuple(
+        term for term in meaningful_query_terms(_FRAMING_PHRASES.sub(" ", question)) if term not in _FRAMING_ENGLISH
+    )
 
 
 #: Longest text still read as a bare question rather than a message that also
@@ -477,8 +563,8 @@ def _without_closing(text: str, marks: frozenset[str] = _CLOSING_MARKS) -> str:
 def asks_without_answering(text: str) -> bool:
     """Whether a message only asks.
 
-    Asking again, one instance returned five earlier questions like the query and
-    not the reply that answered one: a question shares every content word with
+    Asked again, a question can return five earlier questions like it and not
+    the reply that answered one: a question shares every content word with
     a later one and is short, so it outranks its own answer.  A short message
     with a question mark, or ending on an asking particle, is such a question.
     "去看下那台机器怎么了" is a request, and "不管什么情况都要先备份" a rule.
@@ -504,7 +590,8 @@ def same_message(text: str, other: str) -> bool:
 
     The automatic recall sets an older copy of the current message aside (``RetrievalPipeline._hydrate_admit``):
     the message already says it.  Compared character for character, "我家窗外有什么" and "我家窗外有什么？" (both ask)
-    were two messages, and the copy without the question mark took a packet slot as if it answered the one with it.
+    would be two messages, and the copy without the question mark would take a packet slot as if it answered the one
+    with it.
     "我的航班改到周五早上八点了。" asked back as "……八点了？" is not a copy: the person's statement stays found, at
     any length.  Letter case still tells two messages apart ("Release-2" is not "release-2").  A
     message of closing marks alone is compared as it is.
@@ -608,8 +695,8 @@ def _spelled_out_forms(text: str) -> frozenset[str]:
     """The same names, also as they read with a space or dash between letters and their digits.
 
     A reply writes "DLSS 5" and "glm-5.3-flash" where the question wrote DLSS5
-    and glm5.3-flash; compared as written, the reply was refused as naming a
-    different thing.  Only the text being offered is read both ways: read that
+    and glm5.3-flash; compared as written, the reply would be refused as naming
+    a different thing.  Only the text being offered is read both ways: read that
     way, a query asking for "the top 5 options" would start demanding that an
     answer contain "top5", and a query about H100 would ask for "H100as".
     """

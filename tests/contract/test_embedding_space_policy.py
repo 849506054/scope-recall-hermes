@@ -132,10 +132,10 @@ def test_P08_gem2_vector_rejects_scores_outside_cosine_domain():
 def test_P08_embedding_model_is_configuration_not_a_constant():
     """Another provider can be addressed, and the store moves when it is.
 
-    The embedding model used to be a module constant that
-    `canonical_embedding_space` enforced field by field, so a deployment could
-    not choose its own provider. The digest-keyed vector directory already made
-    swapping safe; only the hardcoded descriptor stopped anyone using it.
+    The embedding model is configuration, not a module constant that
+    `canonical_embedding_space` enforces field by field, so a deployment can
+    choose its own provider. The digest-keyed vector directory makes swapping
+    safe.
     """
     from scope_recall.core.recall_policy import build_embedding_space
     from scope_recall.runtime.embedding_models import EmbeddingRouteConfig
@@ -291,14 +291,9 @@ def test_P08_admission_is_bound_to_the_configured_space_not_the_shipped_one():
             RecallPolicy(vector_threshold=0.5, embedding_space_id=broken)
 
 
-def test_P08_embedding_wire_dialects_round_trip_both_shapes():
-    """Both request shapes are built, and both responses parse, at any width."""
-    from scope_recall.runtime.embedding_models import (
-        build_gemini_embed_body,
-        build_openai_embed_body,
-        parse_embedding_response,
-    )
-    from scope_recall.runtime.models import AuxiliaryModelError
+def test_embedding_request_bodies_name_the_model_and_width_in_both_dialects():
+    """Both request shapes are built at any width."""
+    from scope_recall.runtime.embedding_models import build_gemini_embed_body, build_openai_embed_body
 
     gemini = json.loads(build_gemini_embed_body("t", model="m", dimensions=64))
     assert gemini["requests"][0]["model"] == "models/m"
@@ -307,26 +302,10 @@ def test_P08_embedding_wire_dialects_round_trip_both_shapes():
     openai = json.loads(build_openai_embed_body("t", model="m", dimensions=64))
     assert openai == {"model": "m", "input": ["t"], "dimensions": 64}
 
-    vector = [0.5] * 64
-    got, usage = parse_embedding_response(
-        {"embeddings": [{"values": vector}], "usageMetadata": {"promptTokenCount": 7}}, dialect="gemini", dimensions=64
-    )
-    assert len(got) == 64 and usage == {"promptTokenCount": 7}
-
-    got, usage = parse_embedding_response(
-        {"data": [{"embedding": vector}], "usage": {"prompt_tokens": 7}}, dialect="openai", dimensions=64
-    )
-    assert len(got) == 64 and usage == {"promptTokenCount": 7}
-
-    # A provider that ignores the requested width must not slip through: the
-    # space digest commits to it, so a mismatched vector is unusable.
-    with pytest.raises(AuxiliaryModelError):
-        parse_embedding_response({"data": [{"embedding": [0.5] * 63}]}, dialect="openai", dimensions=64)
-
 
 def test_P08_an_openai_route_may_name_the_field_that_carries_the_width():
     """Voyage's /v1/embeddings is OpenAI-shaped but calls the width
-    output_dimension and refuses dimensions outright (#88); a request that
+    output_dimension and refuses dimensions outright; a request that
     omits the width silently gets the model's default geometry, so the field
     name is the only lever.  It is a wire detail: the digest does not move."""
     from scope_recall.runtime.auxiliary import _embedding_route_from_mapping

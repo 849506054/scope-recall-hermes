@@ -13,8 +13,9 @@ import os
 import sqlite3
 import subprocess
 import sys
+import time
 from contextlib import closing
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -159,7 +160,7 @@ def test_a_prompt_is_the_owner_s_under_the_client_s_entry_and_a_hermes_entry_rec
     )
 
 
-def test_what_a_hermes_entry_was_told_reaches_the_client_s_prompt_marked_as_theirs(store):
+def test_what_a_hermes_entry_was_told_reaches_the_client_s_prompt_marked_as_theirs(store, still_clocks):
     root, homes, client, _capture = store
     told = _hermes(homes["tianquan"])
     try:
@@ -279,19 +280,21 @@ def test_a_client_s_prompt_runs_the_entry_s_budget(store, tmp_path):
         hook.close()
 
 
-def test_a_prompt_answers_when_its_work_is_done_not_at_its_ceiling(store, tmp_path):
+def test_a_prompt_answers_when_its_work_is_done_not_at_its_ceiling(store, tmp_path, metered_store):
     """The budget bounds a prompt's capture and recall; it is not a wait.  A small store answers in well under
-    the 6 s a hook may take, and the client's prompt goes on as soon as it does."""
+    the 6 s a hook may take, and the client's prompt goes on as soon as it does.  Each store transaction counts 0.05 s
+    on the hook's clock, however long the runner's store takes, and everything else as long as it takes."""
     root, _homes, _client, _capture = store
     codex = _codex_client(root, tmp_path)
     # What attach writes: the routes, and no hook budget of its own.
     (codex / "scope-recall" / "runtime-config.json").write_text(
         json.dumps({"auto_recall_seconds": 5.0}), encoding="utf-8"
     )
+    clock = metered_store(0.05)
     hook = CodexHookHandler.from_home(str(codex), "codex")
     try:
         assert hook._hook_budget() == 6.0
-        started = datetime.now(timezone.utc)
+        started = clock()
         hook.handle_payload(
             {
                 "hook_event_name": "UserPromptSubmit",
@@ -301,7 +304,7 @@ def test_a_prompt_answers_when_its_work_is_done_not_at_its_ceiling(store, tmp_pa
                 "cwd": "C:/anywhere",
             }
         )
-        elapsed = (datetime.now(timezone.utc) - started).total_seconds()
+        elapsed = clock() - started
     finally:
         hook.close()
     assert hook.diagnostics.last_reason is None, hook.diagnostics.last_reason
@@ -364,6 +367,43 @@ def test_the_client_s_tools_read_the_store_and_refuse_to_change_it(store):
     assert _rows(root, "SELECT count(*) FROM source_events WHERE entry_id='claude-code'") == [(0,)]
 
 
+READ_TOOLS = ["recall", "inspect", "profile", "trace", "entity", "status"]
+
+
+@pytest.mark.parametrize("host", ["claude-code", "workbuddy", "dsh", "codex"])
+def test_only_a_client_that_names_its_conversation_is_offered_the_tools_that_change_the_store(store, tmp_path, host):
+    """#245: the store takes a change only on the word of the person's latest message in the same conversation, and
+    Claude Code, WorkBuddy and dsh name no conversation with a tool call: offered there, propose_memory, revise and
+    forget were refused on every call (ACCESS_DENIED codex_thread_id).  Codex names its thread and keeps all nine."""
+    root, _homes, client, _capture = store
+    if host != "claude-code":
+        owner = next(
+            row for row in read_shared_payload(root)["entries"][0]["audiences"] if row["kind"] == "owner_private"
+        )
+        client = tmp_path / f"TEST-{host}-home"
+        attach_shared_record(
+            root,
+            client_entry_record(
+                host=host,
+                home=client,
+                entry_id=host,
+                display_name=f"TEST {host}",
+                attached_at=NOW,
+                allowed_scope_ids=owner["allowed_scope_ids"],
+                writable_scope_ids=owner["writable_scope_ids"],
+                capture_scope_id=owner["capture_scope_id"],
+            ),
+            now=NOW,
+        )
+    server = build_server(load_shared_client(client, host), workspace=None)
+    offered = [tool.name for tool in server.server._tool_manager.list_tools()]
+    if host == "codex":
+        writes = ["propose_memory", "revise", "forget"]
+        assert offered == [*READ_TOOLS[:5], *writes, "status"]
+    else:
+        assert offered == READ_TOOLS
+
+
 # -- the session record ------------------------------------------------------
 # Claude Code's hooks carry a turn's prompt and last message; what the model says while it works, and
 # anything a hook could not write, is read from the session record at the end of the turn.
@@ -420,7 +460,7 @@ def _said_in_store(root):
     return sorted(_rows(root, "SELECT role, origin, content FROM source_events WHERE entry_id='claude-code'"))
 
 
-def test_a_stop_records_what_the_session_record_shows_was_said_and_nothing_else(store, tmp_path):
+def test_a_stop_records_what_the_session_record_shows_was_said_and_nothing_else(store, tmp_path, still_clocks):
     root, _homes, client, _capture = store
     at = _moments()
     record = _record(
@@ -749,7 +789,7 @@ def test_a_prompt_still_in_the_inbox_is_not_stored_again_from_the_record(store, 
     assert _rows(root, "SELECT count(*) FROM source_events WHERE source_event_key LIKE '%:record:u1@1'") == [(0,)]
 
 
-def test_what_could_not_be_written_is_recorded_at_the_next_stop_once(store, tmp_path, monkeypatch):
+def test_what_could_not_be_written_is_recorded_at_the_next_stop_once(store, tmp_path, monkeypatch, still_clocks):
     root, _homes, client, _capture = store
     at = _moments()
     record = _record(
@@ -875,6 +915,161 @@ def test_a_task_notification_is_not_the_owner_s_prompt(store):
     assert [content for _role, _origin, content in _said_in_store(root)] == ["TEST 一句真话。"]
 
 
+#: What Claude's desktop app puts in the person's first message when a session starts without a project folder,
+#: shortened (#248).  Synthetic.
+APP_REMINDER = (
+    "<system-reminder>\nTEST The user started this session without choosing a project folder, so your working "
+    "directory is a scratch workspace the app created for it.\n</system-reminder>"
+)
+
+
+def test_a_reminder_the_desktop_app_puts_in_a_prompt_is_not_the_owner_s_words(store, monkeypatch):
+    """#248: Claude's desktop app puts a <system-reminder> ahead of what the person typed; it was stored as their words,
+    claims were drawn from it, and it was recalled for.  A prompt that is only reminders stores and recalls nothing,
+    here and on the entry's server; the person's own words about such a block stay."""
+    root, _homes, client, _capture = store
+    asked = []
+    monkeypatch.setattr(
+        "scope_recall.adapters.clients.prompt_recall.PromptRecall.own",
+        lambda self, context, text, *rest, **_kw: asked.append(text) or {},
+    )
+    mention = "TEST 为什么 <system-reminder>…</system-reminder> 会被存下来？"
+    hook = _hook(client)
+    try:
+        hook.handle_payload(_prompt(f"{APP_REMINDER}\n\nTEST 帮我看看这个仓库。", prompt_id="TEST-prompt-1"))
+        assert hook.handle_payload(_prompt(APP_REMINDER, prompt_id="TEST-prompt-2")) == {}
+        hook.handle_payload(_prompt(mention, prompt_id="TEST-prompt-3"))
+    finally:
+        hook.close()
+    assert asked == ["TEST 帮我看看这个仓库。", mention]
+    assert [content for _role, _origin, content in _said_in_store(root)] == sorted(["TEST 帮我看看这个仓库。", mention])
+    server = _hook(client)
+    try:
+        asked_there = _prompt(f"{APP_REMINDER}\nTEST 服务这边的问题。", prompt_id="TEST-prompt-4")
+        server.resident_recall_for(asked_there, (), (), 5.0)
+        assert server.resident_recall_for(_prompt(APP_REMINDER, prompt_id="TEST-prompt-5"), (), (), 5.0) == {}
+    finally:
+        server.close()
+    assert asked[2:] == ["TEST 服务这边的问题。"]
+
+
+def test_a_reminder_the_desktop_app_puts_in_the_record_is_not_the_owner_s_words(store, tmp_path, still_clocks):
+    """#248, the session record: the reminder is a text block of its own, or ahead of the typed text in one string, in
+    a message the record marks as the person's.  A message that is only reminders is not theirs."""
+    root, _homes, client, _capture = store
+    at = _moments()
+    record = _record(
+        tmp_path / "TEST-projects" / "TEST-cc-session.jsonl",
+        _person("u1", at(0), [_said(APP_REMINDER), _said("TEST 第一句。")], prompt_id="TEST-prompt-1"),
+        _person("u2", at(1), f"{APP_REMINDER}\n\nTEST 第二句。", prompt_id="TEST-prompt-2"),
+        _person("u3", at(2), [_said(APP_REMINDER)], prompt_id="TEST-prompt-3"),
+        _line(
+            "attachment",
+            "q1",
+            at(3),
+            attachment={
+                "type": "queued_command",
+                "commandMode": "prompt",
+                "origin": {"kind": "human"},
+                "prompt": f"{APP_REMINDER}\nTEST 顺便一句。",
+            },
+        ),
+        _model("a1", at(4), _said("TEST 好的。")),
+    )
+    hook = _hook(client)
+    try:
+        hook.handle_payload(_stop(record, last="TEST 好的。"))
+    finally:
+        hook.close()
+    assert _said_in_store(root) == sorted(
+        [
+            ("user", "human_direct", "TEST 第一句。"),
+            ("user", "human_direct", "TEST 第二句。"),
+            ("user", "human_direct", "TEST 顺便一句。"),
+            ("assistant", "assistant_visible", "TEST 好的。"),
+        ]
+    )
+
+
+def _compaction(stamp):
+    """A compaction as Claude Code records it: its boundary, then the summary that replaces what came before."""
+    return [
+        _line("system", "c0", stamp, subtype="compact_boundary", compactMetadata={"trigger": "auto"}),
+        _line("user", "c1", stamp, isCompactSummary=True, message={"role": "user", "content": "TEST summary"}),
+    ]
+
+
+def test_a_prompt_s_recall_leaves_out_what_claude_code_s_model_still_holds(store, tmp_path, still_clocks):
+    """#249: a message of this session the model still has (said since its last compaction, or in a session that has
+    had none) came back in a later prompt's recall, a second copy in the context.  One said before the compaction
+    reaches the model only as the compaction's summary, and is still recalled."""
+    root, _homes, client, _capture = store
+    record = tmp_path / "TEST-projects" / "TEST-cc-session.jsonl"
+    record.parent.mkdir(parents=True)
+    _record(record, _person("u0", _moments()(0), "TEST 开始。"))
+    hook = _hook(client)
+
+    def ask(text, prompt_id):
+        answer = hook.handle_payload({**_prompt(text, prompt_id=prompt_id), "transcript_path": str(record)})
+        return answer.get("hookSpecificOutput", {}).get("additionalContext", "")
+
+    try:
+        ask("TEST 机器清单：构建机是 QX-17。", "TEST-p1")
+        ask("TEST 机器清单：部署机是 KZ-42。", "TEST-p2")
+        whole = ask("TEST 机器清单", "TEST-p3")
+        time.sleep(0.05)
+        _record(record, *_compaction(datetime.now(UTC).isoformat()))
+        time.sleep(0.05)
+        ask("TEST 机器清单：备份机是 VX-9。", "TEST-p4")
+        compacted = ask("TEST 机器清单", "TEST-p5")
+    finally:
+        hook.close()
+    assert "QX-17。" not in whole and "KZ-42。" not in whole, f"no compaction yet: the model has it all: {whole}"
+    assert "QX-17。" in compacted and "KZ-42。" in compacted, "said before the compaction: recalled"
+    assert "VX-9。" not in compacted, "said since the compaction: the model has it"
+    assert len(_said_in_store(root)) == 5, "every prompt was stored"
+
+
+def test_the_doctor_names_owner_words_stored_with_a_reminder(store, monkeypatch):
+    """What an earlier release stored with the app's reminder is counted for the entry and named by ref, never by its
+    text, until the owner forgets it.  The owner's own words about such a block are no finding."""
+    from scope_recall.adapters.clients import hook_events
+    from scope_recall.maintenance.doctor_report import DoctorReport
+    from scope_recall.maintenance.doctor_store import check_owner_words
+
+    root, _homes, client, _capture = store
+    hook = _hook(client)
+    try:
+        mention = "TEST 为什么 <system-reminder>…</system-reminder> 会被存下来？"
+        hook.handle_payload(_prompt(mention, prompt_id="TEST-p1"))
+        hook.handle_payload(_prompt(f"{APP_REMINDER}\n\nTEST 现在的版本。", prompt_id="TEST-p2"))
+        monkeypatch.setattr(hook_events, "claude_code_person_text", lambda text: text)  # as 3.10.4 stored it
+        hook.handle_payload(_prompt(f"{APP_REMINDER}\n\nTEST 以前的版本。", prompt_id="TEST-p3"))
+    finally:
+        hook.close()
+    [(event, revision)] = _rows(
+        root, "SELECT event_id,source_revision FROM source_events WHERE content LIKE '%以前的版本%'"
+    )
+    report = DoctorReport(host="claude-code", status="ok")
+    check_owner_words(report, "claude-code", root, "claude-code")
+    assert report.capability_gaps == ["owner_words_with_client_reminder"]
+    assert report.checks == [{"name": "owner_words", "result": "client_reminders", "detail": f"1: {event}@{revision}"}]
+    for entry in ("tianshu", None):
+        other = DoctorReport(host="claude-code", status="ok")
+        check_owner_words(other, "claude-code", root, entry)
+        assert other.capability_gaps == [] and other.checks == [], "another entry's, or another store's"
+    with closing(sqlite3.connect(root / "memory.sqlite3")) as connection, connection:
+        connection.execute("UPDATE source_events SET read_blocked=1 WHERE event_id=?", (event,))
+    forgotten = DoctorReport(host="claude-code", status="ok")
+    check_owner_words(forgotten, "claude-code", root, "claude-code")
+    assert forgotten.capability_gaps == []
+    monkeypatch.setattr("scope_recall.maintenance.doctor_store._OWNER_WORDS_SCAN_S", -1.0)  # already over
+    stopped = DoctorReport(host="claude-code", status="ok")
+    check_owner_words(stopped, "claude-code", root, "claude-code")
+    assert [check["result"] for check in stopped.checks] == ["unfinished"], "a read cut short never reads as clean"
+    assert stopped.capability_gaps == ["owner_words_unchecked"], "and the report says to look"
+
+
 SUGGESTIONS_PROMPT = (
     "# Overview\n\nGenerate 0 to 3 hyperpersonalized suggestions for what this user can do with "
     "Codex in this local project: C:\\TEST\n\nGet an understanding of the user's intent and goals "
@@ -905,10 +1100,42 @@ def test_codex_s_request_for_suggestions_is_told_from_the_owner_s_words():
     assert len(note) >= 8000 and not is_codex_suggestions_prompt(note)
 
 
-def test_codex_s_request_for_suggestions_is_neither_stored_nor_recalled(store, tmp_path):
-    """Codex sends its request for suggestions of what to do next through the prompt hook.  On the pilot four were
-    stored as the owner's words, 11,000 to 15,000 characters each, claims were drawn from them as if the owner had
-    said them, and nine of the model's JSON answers were stored as replies."""
+SUGGESTED_MESSAGE_PROMPT = (
+    "This is an app-generated request for a suggested next user message. The user did not write this message.\n\n"
+    "TEST Read the conversation so far and write the one message the user is most likely to send next.\n"
+    + "- TEST rule about what the suggested message must and must not be.\n" * 16
+    + '\nAnswer with a JSON object of one key: {"suggestion": "<message>"}.'
+)
+
+
+def test_codex_s_request_for_a_suggested_message_is_told_from_the_owner_s_words():
+    """The desktop app's request for one next message opens with Codex saying the user did not write it; that opening
+    tells it, short as it is, and its answer is told by its one key.  The owner quoting it, or answering in JSON of
+    their own, stays theirs."""
+    from scope_recall.adapters.clients.boundary import is_codex_suggestions_prompt, is_codex_suggestions_reply
+
+    assert len(SUGGESTED_MESSAGE_PROMPT) < 8000 and is_codex_suggestions_prompt(SUGGESTED_MESSAGE_PROMPT)
+    assert is_codex_suggestions_prompt("\n  " + SUGGESTED_MESSAGE_PROMPT.replace("message. The", "message.\nThe"))
+    assert not is_codex_suggestions_prompt(f"TEST 为什么这段会被存成我说的话？\n\n{SUGGESTED_MESSAGE_PROMPT}")
+    assert not is_codex_suggestions_prompt("This is an app-generated request for a suggested next user message.")
+    assert is_codex_suggestions_reply('{"suggestion": "TEST 我的测试暗号是什么？"}')
+    assert is_codex_suggestions_reply(' {"suggestions": [{"title": "TEST 建议"}]}\n')
+    for answer in ('{"suggestion": ["TEST"]}', '{"suggestion": "TEST", "why": "TEST"}', '"TEST"', "TEST 收到"):
+        assert not is_codex_suggestions_reply(answer), answer
+
+
+@pytest.mark.parametrize(
+    ("host_request", "answer"),
+    [
+        (SUGGESTIONS_PROMPT, '{"suggestions":[{"title":"TEST 建议"}]}'),
+        (SUGGESTED_MESSAGE_PROMPT, '{"suggestion":"TEST 我的测试暗号是什么？"}'),
+    ],
+    ids=["suggestions", "suggested-message"],
+)
+def test_codex_s_request_for_suggestions_is_neither_stored_nor_recalled(store, tmp_path, host_request, answer):
+    """Codex sends its requests for what the owner might do next through the prompt hook, in a thread of their own.
+    Stored as the owner's words, claims would be drawn from them as if the owner had said them, and the model's JSON
+    answers, stored as replies, would come back in recall."""
     root, _homes, _client, _capture = store
     codex = _codex_client(root, tmp_path)
     hook = CodexHookHandler.from_home(str(codex), "codex")
@@ -919,7 +1146,7 @@ def test_codex_s_request_for_suggestions_is_neither_stored_nor_recalled(store, t
                     "hook_event_name": "UserPromptSubmit",
                     "session_id": "TEST-codex-session",
                     "turn_id": "TEST-turn-1",
-                    "prompt": SUGGESTIONS_PROMPT,
+                    "prompt": host_request,
                     "cwd": "C:/TEST",
                 }
             )
@@ -933,7 +1160,7 @@ def test_codex_s_request_for_suggestions_is_neither_stored_nor_recalled(store, t
                     "session_id": "TEST-codex-session",
                     "turn_id": "TEST-turn-1",
                     "cwd": "C:/TEST",
-                    "last_assistant_message": '{"suggestions":[{"title":"TEST 建议"}]}',
+                    "last_assistant_message": answer,
                 }
             )
             == {}
@@ -947,7 +1174,7 @@ def test_codex_s_request_for_suggestions_is_neither_stored_nor_recalled(store, t
                     "session_id": "TEST-unmarked-session",
                     "turn_id": "TEST-turn-1",
                     "cwd": "C:/TEST",
-                    "last_assistant_message": '{"suggestions":[{"title":"TEST 建议"}]}',
+                    "last_assistant_message": answer,
                 }
             )
             == {}
@@ -1018,7 +1245,50 @@ def test_the_rest_of_codex_s_suggestions_thread_is_not_stored_either(store, tmp_
     assert stored == [("tool",)]
 
 
-def test_a_prompt_longer_than_a_recall_query_is_still_recalled_for(store):
+def test_the_doctor_names_codex_s_requests_stored_as_the_owner_s_words(store, tmp_path, monkeypatch):
+    """What an earlier release stored of Codex's requests for suggestions, and of the model's answers, is counted for
+    the Codex entry and named by ref, never by its text.  The owner's own words that mention such an answer are no
+    finding, and neither is another entry's."""
+    from scope_recall.adapters.clients import hook_events
+    from scope_recall.maintenance.doctor_report import DoctorReport
+    from scope_recall.maintenance.doctor_store import check_owner_words
+
+    root, _homes, _client, _capture = store
+    codex = _codex_client(root, tmp_path)
+    # As an earlier release stored them: neither the request nor its answer was told apart.
+    monkeypatch.setattr(hook_events, "is_codex_suggestions_prompt", lambda prompt: False)
+    monkeypatch.setattr(hook_events, "is_codex_suggestions_reply", lambda message: False)
+    turns = (
+        (SUGGESTED_MESSAGE_PROMPT, '{"suggestion":"TEST 我的测试暗号是什么？"}'),
+        ('TEST 我自己的话：上次的回答是 {"suggestion": "TEST"}。', "TEST 好的。"),
+        # A key written with an escape is still the answer's one key.
+        (SUGGESTED_MESSAGE_PROMPT, '{"\\u0073uggestion":"TEST 下一句"}'),
+    )
+    hook = CodexHookHandler.from_home(str(codex), "codex")
+    try:
+        for number, (prompt, reply) in enumerate(turns, start=1):
+            thread = {"session_id": f"TEST-thread-{number}", "turn_id": "TEST-turn-1", "cwd": "C:/TEST"}
+            hook.handle_payload({"hook_event_name": "UserPromptSubmit", **thread, "prompt": prompt})
+            hook.handle_payload({"hook_event_name": "Stop", **thread, "last_assistant_message": reply})
+    finally:
+        hook.close()
+    written_by_codex = _rows(
+        root,
+        """SELECT event_id,source_revision FROM source_events WHERE entry_id='codex'
+        AND (content LIKE 'This is an app-generated request%' OR content LIKE '{"%uggestion":%') ORDER BY rowid""",
+    )
+    assert len(written_by_codex) == 4
+    report = DoctorReport(host="codex", status="ok")
+    check_owner_words(report, "codex", root, "codex")
+    assert report.capability_gaps == ["owner_words_from_host_request"]
+    refs = ",".join(f"{event}@{revision}" for event, revision in written_by_codex)
+    assert report.checks == [{"name": "owner_words", "result": "host_requests", "detail": f"4: {refs}"}]
+    other = DoctorReport(host="codex", status="ok")
+    check_owner_words(other, "codex", root, "tianshu")
+    assert other.capability_gaps == [] and other.checks == [], "another entry's"
+
+
+def test_a_prompt_longer_than_a_recall_query_is_still_recalled_for(store, still_clocks):
     """A recall request carries at most 8,192 characters of query.  A longer prompt went whole, the request was
     refused, and the turn had no recall at all: three of the work computer's Codex prompts in one morning."""
     _root, homes, client, _capture = store
@@ -1103,6 +1373,54 @@ def test_a_prompt_the_store_could_not_take_is_still_recalled_by_meaning(store, m
         assert not refused._runtime_attach_attempted, "a credential never reaches the embedding provider"
     finally:
         refused.close()
+
+
+#: Another process of the store's: it holds the store's writer lease until a line comes on its stdin.
+_LEASE_HOLDER = """
+import sys
+
+from scope_recall.core.writer_lease import TruthWriterLease
+
+lease = TruthWriterLease(sys.argv[1], role="provider")
+assert lease.acquire()["status"] == "acquired"
+print("holding", flush=True)
+sys.stdin.readline()
+lease.release()
+"""
+
+
+def test_the_owner_s_prompt_waits_out_a_writer_lease_another_process_holds_past_a_second(store):
+    """Another agent's long reply can hold the writer lease 1-2 s, so the owner's prompt waits up to 2 s for it on a
+    6 s budget, where every other capture waits 1 s.  The store's own 1 s ended that wait first: a prompt that met a
+    lease held 1.3 s was not stored."""
+    import threading
+
+    root, _homes, client, _capture = store
+    # A runtime config that names no budget: the entry's 6 s, as a real entry's hooks run.
+    (client / "scope-recall" / "runtime-config.json").write_text(json.dumps({"resident_recall_minutes": 0}), "utf-8")
+    holder = subprocess.Popen(
+        [sys.executable, "-c", _LEASE_HOLDER, str(root)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True
+    )
+
+    def release():
+        holder.stdin.write("release\n")
+        holder.stdin.flush()
+
+    try:
+        assert holder.stdout.readline().strip() == "holding"
+        hook = _hook(client)
+        # Let go 1.3 s after the hook starts: past the 1 s, within the prompt's 2 s, however late its capture begins.
+        timer = threading.Timer(1.3, release)
+        timer.start()
+        try:
+            hook.handle_payload(_prompt("TEST 等写锁让开的一句。", prompt_id="TEST-prompt-lease"))
+        finally:
+            timer.join()
+            hook.close()
+    finally:
+        holder.communicate(timeout=30)
+    assert (hook.diagnostics.capture_stage, hook.diagnostics.capture_error_type) == ("source_committed", None)
+    assert _user_rows(root) == [("TEST 等写锁让开的一句。",)]
 
 
 def test_a_prompt_whose_capture_failed_before_the_secret_screen_still_keeps_a_credential_from_the_vectors(
@@ -1298,16 +1616,14 @@ def test_the_server_answers_a_prompt_s_recall_and_the_hook_stores_the_prompt(
     assert not endpoint.path.exists()
 
 
-def test_a_late_answer_leaves_the_prompt_stored_once(resident, small_reserve, monkeypatch, capsys):
+def test_a_late_answer_leaves_the_prompt_stored_once(
+    resident, small_reserve, storing_takes_no_hook_time, monkeypatch, capsys
+):
     """The first version had the server store the prompt too: one that answered after its hook stopped waiting left
     the prompt stored twice.  The server now only recalls, and the hook recalls itself; while its late recall runs, the
     server tells the next prompt at once that it is busy."""
     import threading
 
-    from scope_recall.adapters.clients import handler as handler_module
-
-    # A real entry's 6 s: on the 2 s default, a slow runner's write of the prompt left no time to ask the server.
-    monkeypatch.setattr(handler_module, "_TOTAL_BUDGET_S", 6.0)
     root, client, endpoint = resident
     release, finished = threading.Event(), []
     calls = _counted(endpoint, monkeypatch, hold=release, finished=finished)
@@ -1653,7 +1969,9 @@ def test_the_mcp_server_starts_whatever_its_endpoint_does(store, monkeypatch):
     assert local_endpoint.serve(client, "claude-code") is None
 
 
-def test_a_slow_server_s_answer_is_taken_while_the_hook_recalls_alongside(resident, monkeypatch, capsys):
+def test_a_slow_server_s_answer_is_taken_while_the_hook_recalls_alongside(
+    resident, storing_takes_no_hook_time, monkeypatch, capsys
+):
     """Given only what the hook kept back, a server's recall that needed most of the time had none, and neither had
     the hook's (review of rc11).  The server has all of it now: the hook recalls alongside once little is left, and
     takes the server's answer when it comes."""
@@ -3209,7 +3527,7 @@ def _wb_turns(root, kind):
     return [key[len(prefix) : -len("@1")] for (key,) in keys if key.startswith(prefix)]
 
 
-def test_workbuddy_stores_the_person_s_last_query_and_recalls_for_it(workbuddy, store):
+def test_workbuddy_stores_the_person_s_last_query_and_recalls_for_it(workbuddy, store, still_clocks):
     """WorkBuddy hands its prompt hook every user message of the input, joined.  The person's words are the last
     ``<user_query>`` block; the reminders around it are WorkBuddy's, never stored and never searched for."""
     root, home, _projects = workbuddy
@@ -3385,7 +3703,7 @@ def test_the_entry_s_server_recalls_a_workbuddy_prompt_for_the_person_s_words_un
     asked = []
     monkeypatch.setattr(
         "scope_recall.adapters.clients.prompt_recall.PromptRecall.own",
-        lambda self, context, text, request_id, *rest: asked.append((text, request_id)) or {},
+        lambda self, context, text, request_id, *rest, **_kw: asked.append((text, request_id)) or {},
     )
     server = CodexHookHandler.from_home(str(home), "workbuddy")
     try:
@@ -3650,11 +3968,22 @@ def test_a_workbuddy_prompt_runs_the_entry_s_budget(workbuddy):
         hook.close()
 
 
-def test_a_workbuddy_prompt_hook_answers_within_its_budget(workbuddy, small_reserve, monkeypatch, capsys):
-    """A WorkBuddy prompt hook that runs past its wait blocks the prompt.  With the entry's server slower than the
-    hook's whole budget, the hook still answers inside the budget, with the prompt stored."""
+def _wb_hook_reads(monkeypatch, text):
+    """The prompt hook's stdin for the next ``hook_entry.main``: WorkBuddy sending ``text``."""
     import io
-    import time
+
+    from scope_recall.adapters.clients import hook_entry
+
+    raw = json.dumps({"session_id": WB_SESSION, "cwd": "C:/TEST/work", **_wb_prompt(text)}).encode()
+    monkeypatch.setattr(hook_entry.sys, "stdin", type("Stdin", (), {"buffer": io.BytesIO(raw)})())
+
+
+def test_a_workbuddy_prompt_whose_server_answers_too_late_is_stored_once(
+    workbuddy, small_reserve, storing_takes_no_hook_time, monkeypatch, capsys
+):
+    """With the entry's server slower than the hook's whole budget, the hook answers without it, says it came late,
+    and has stored the prompt, once: the server's late recall writes nothing."""
+    import threading
 
     from scope_recall.adapters.clients import hook_entry, local_endpoint
     from scope_recall.vector import process_store
@@ -3663,30 +3992,96 @@ def test_a_workbuddy_prompt_hook_answers_within_its_budget(workbuddy, small_rese
     root, home, _projects = workbuddy
     endpoint = local_endpoint.serve(home, "workbuddy", warm=False)
     assert endpoint is not None
+    release, finished = threading.Event(), []
     try:
-        calls = _counted(endpoint, monkeypatch, delay=3.0)
-        raw = json.dumps(
-            {
-                "session_id": WB_SESSION,
-                "cwd": "C:/TEST/work",
-                **_wb_prompt("<user_query>TEST 服务答得太慢。</user_query>"),
-            }
-        ).encode()
-        monkeypatch.setattr(hook_entry.sys, "stdin", type("Stdin", (), {"buffer": io.BytesIO(raw)})())
-        started = time.monotonic()
+        calls = _counted(endpoint, monkeypatch, hold=release, finished=finished)
+        _wb_hook_reads(monkeypatch, "<user_query>TEST 服务答得太慢。</user_query>")
         assert hook_entry.main(["--home", str(home), "--host", "workbuddy"]) == 0
-        elapsed = time.monotonic() - started
         captured = capsys.readouterr()
-        # No runtime config names a budget here: the hook's own 2 s (``_TOTAL_BUDGET_S``).
-        assert elapsed < 2.0 + 1.0, f"the hook took {elapsed:.1f} s of its 2 s"
         assert not captured.out or "additionalContext" in json.loads(captured.out)["hookSpecificOutput"]
         assert "CODEX_RECALL_RESIDENT:late" in captured.err
         assert len(calls) == 1
         assert _wb_said(root, "user") == [("user", "human_direct", "TEST 服务答得太慢。")]
-        time.sleep(3.0)  # the server's late recall ends; it writes nothing
+        release.set()
+        assert _eventually(lambda: finished), "the server's late recall ends; it writes nothing"
     finally:
+        release.set()
         endpoint.stop()
     assert _wb_said(root, "user") == [("user", "human_direct", "TEST 服务答得太慢。")]
+
+
+@pytest.fixture
+def busy_store(monkeypatch, metered_store):
+    """Another process holds the store's writer lease and the store is slow to read: each write a hook makes waits all
+    it may (what it asks, up to its core's write timeout) and fails as a busy store does, and each recall takes all the
+    time it is given.  Those waits move the hook's clock on rather than sleep, and a transaction that does reach the
+    store counts 0.01 s on it (``metered_store``), so a test of the hook's budget reads the time a host waits for it,
+    whatever the runner's store and sleeps take.  The fixture's value is that clock."""
+    from scope_recall.core import MemoryCore
+    from scope_recall.core.writer_lease import TruthWriterBusyError
+
+    clock = metered_store(0.01)
+
+    def busy(self, context, value, *, remaining_seconds=None, **kwargs):
+        timeout = self.config.write_timeout_seconds
+        clock.advance(timeout if remaining_seconds is None else min(timeout, remaining_seconds))
+        raise TruthWriterBusyError(role="truth_connection", scope="other_process")
+
+    def slow(self, context, request, *, deadline_seconds, **kwargs):
+        clock.advance(deadline_seconds)
+        raise ContractError("DEADLINE_EXCEEDED")
+
+    monkeypatch.setattr(MemoryCore, "record_host_event", busy)
+    monkeypatch.setattr(MemoryCore, "record_event", busy)
+    monkeypatch.setattr(MemoryCore, "recall_packet", slow)
+    return clock
+
+
+@pytest.mark.parametrize("configured", [None, 6])
+def test_a_workbuddy_prompt_hook_answers_within_its_budget(
+    workbuddy, small_reserve, busy_store, monkeypatch, capsys, configured
+):
+    """A WorkBuddy prompt hook that runs past its wait blocks the prompt, and what counts is the time the host waits.
+    The prompt's capture waits out a busy store as long as it may (2 s of the 6 s an entry's runtime config may give,
+    1 s of the 2 s default), and the entry's server and the hook's own recall need more than is left: the hook still
+    answers within its budget.  The runtime is not attached here: attaching it takes what it takes, not a share of
+    the hook's time."""
+    import threading
+
+    from scope_recall.adapters.clients import handler as handler_module
+    from scope_recall.adapters.clients import hook_entry, local_endpoint
+    from scope_recall.vector import process_store
+
+    monkeypatch.setattr(process_store, "prestart", lambda **kwargs: None)
+    monkeypatch.setattr(CodexHookHandler, "ensure_runtime", lambda self, audience=None: None)
+    _root, home, _projects = workbuddy
+    if configured is not None:
+        (home / "scope-recall" / "runtime-config.json").write_text(
+            json.dumps({"hook_processing_seconds": configured, "resident_recall_minutes": 0}), encoding="utf-8"
+        )
+    budget = configured or handler_module._TOTAL_BUDGET_S
+    endpoint = local_endpoint.serve(home, "workbuddy", warm=False)
+    assert endpoint is not None
+    release, asked = threading.Event(), []
+
+    def held(request, **kwargs):
+        asked.append(request["payload"].get("prompt"))
+        release.wait(60.0)
+        return {"result": {}, "diagnostics": {}}, (lambda: None)
+
+    monkeypatch.setattr(endpoint, "recall", held)
+    _wb_hook_reads(monkeypatch, "<user_query>TEST 服务答得太慢。</user_query>")
+    clock = busy_store
+    try:
+        started = clock()
+        assert hook_entry.main(["--home", str(home), "--host", "workbuddy"]) == 0
+        elapsed = clock() - started
+    finally:
+        release.set()
+        endpoint.stop()
+    err = capsys.readouterr().err
+    assert '"error_type":"TruthWriterBusyError"' in err and "CODEX_RECALL_RESIDENT:late" in err and len(asked) == 1
+    assert elapsed < budget + 0.5, f"the host waited {elapsed:.2f} s for a hook whose budget is {budget} s"
 
 
 def test_a_workbuddy_hook_with_nothing_to_add_writes_nothing(workbuddy, tmp_path, monkeypatch, capsys):
@@ -3760,7 +4155,7 @@ def _dsh_said(root, role=None):
     return sorted(_rows(root, f"SELECT role, origin, content FROM source_events WHERE entry_id='dsh'{where}"))
 
 
-def test_a_dsh_prompt_is_stored_under_its_turn_and_another_session_recalls_it(dsh):
+def test_a_dsh_prompt_is_stored_under_its_turn_and_another_session_recalls_it(dsh, still_clocks):
     """The plugin runs the prompt hook before a turn's first step: the prompt is the owner's, named by the session and
     dsh's turn number, and the answer is what is remembered, which the plugin appends to the step."""
     root, home = dsh
@@ -3780,10 +4175,12 @@ def test_a_dsh_prompt_is_stored_under_its_turn_and_another_session_recalls_it(ds
     assert "Mochi" in context, "a new session's first prompt recalls what another one said"
 
 
-def test_a_dsh_stop_stores_the_turn_s_messages_once_and_says_how_many(dsh):
+def test_a_dsh_stop_stores_the_turn_s_messages_once_and_says_how_many(dsh, still_clocks):
     """The plugin keeps a turn's messages and sends them with its Stop: the reply under the turn, and from the lines what
     the model said while it worked and what the person sent meanwhile.  The answer's ``through`` is how many lines are
-    stored; the same lines sent again (an answer lost on the way) store nothing twice."""
+    stored; the same lines sent again (an answer lost on the way, or the rest of a turn after a Stop that stored part
+    of it) store nothing twice: the reply sent again is the one stored, with nothing left in the inbox for the store's
+    worker to store under a key of its own."""
     root, home = dsh
     at = _dsh_ms()
     _dsh(home, {"hook_event_name": "UserPromptSubmit", "turn_id": "3", "prompt": "TEST 把两个文件改名。"})
@@ -3810,8 +4207,178 @@ def test_a_dsh_stop_stores_the_turn_s_messages_once_and_says_how_many(dsh):
         ]
     )
     assert _dsh_said(root) == expected
-    result, _diagnostics = _dsh(home, stop)
+    result, diagnostics = _dsh(home, stop)
     assert result == {"through": 4} and _dsh_said(root) == expected, "sent again, nothing is stored twice"
+    assert diagnostics.capture_error_detail is None and _rows(root, "SELECT count(*) FROM capture_inbox") == [(0,)]
+
+
+def _dsh_kept(root):
+    """The dsh session's rows as (what each was stored as, its words, its moment): ``user:<turn>`` (the prompt hook),
+    ``assistant:<turn>`` (a Stop's reply) or ``record:<id>`` (a line of the turn's messages)."""
+    return sorted(
+        (key.split(f":{DSH_SESSION}:", 1)[1].rsplit("@", 1)[0], content, at)
+        for key, content, at in _rows(
+            root, "SELECT source_event_key, content, occurred_at FROM source_events WHERE entry_id='dsh'"
+        )
+    )
+
+
+def _dsh_resent_cleanly(diagnostics, root):
+    """Nothing refused and nothing left in the inbox, where the store's worker would store it under a key of its own."""
+    return diagnostics.capture_error_detail is None and _rows(root, "SELECT count(*) FROM capture_inbox") == [(0,)]
+
+
+def test_a_dsh_reply_whose_line_carries_no_moment_is_stored_once_when_sent_again(dsh, still_clocks):
+    """A line without a moment the store can read shows nothing, so the reply it holds is dated by the hook that first
+    stores it; a later Stop that sends the reply again keeps that moment, and is the reply already stored."""
+    root, home = dsh
+    at = _dsh_ms()
+    stop = {
+        "hook_event_name": "Stop",
+        "turn_id": "4",
+        "last_assistant_message": "TEST 这一行没有时间。",
+        "reply_id": "a1",
+        "record": [
+            {"id": "u1", "role": "user", "text": "TEST 这一行有时间。", "time": at(0)},
+            {"id": "a1", "role": "assistant", "text": "TEST 这一行没有时间。", "time": "TEST 不是时间"},
+        ],
+    }
+    assert _dsh(home, stop)[0] == {"through": 2}
+    stored = _dsh_kept(root)
+    result, diagnostics = _dsh(home, stop)
+    assert result == {"through": 2} and _dsh_resent_cleanly(diagnostics, root)
+    assert _dsh_kept(root) == stored and [key for key, *_rest in stored] == ["assistant:4", "record:u1"]
+
+
+def test_a_dsh_reply_stored_at_another_moment_is_the_one_a_later_stop_sends_again(dsh, still_clocks):
+    """A reply stored under its turn's key at a moment other than its line's (a Stop that names no line for its reply
+    dates it by the hook) is the reply a later Stop sends with its line: it keeps the moment it was stored with, and its
+    line is that reply, not a message of its own."""
+    root, home = dsh
+    at = _dsh_ms()
+    reply = "TEST 先存下的回答。"
+    _dsh(home, {"hook_event_name": "Stop", "turn_id": "5", "last_assistant_message": reply})
+    stored = _dsh_kept(root)
+    record = [{"id": "a1", "role": "assistant", "text": reply, "time": at(0)}]
+    result, diagnostics = _dsh(
+        home,
+        {
+            "hook_event_name": "Stop",
+            "turn_id": "5",
+            "last_assistant_message": reply,
+            "reply_id": "a1",
+            "record": record,
+        },
+    )
+    assert result == {"through": 1} and _dsh_resent_cleanly(diagnostics, root)
+    assert _dsh_kept(root) == stored and [key for key, *_rest in stored] == ["assistant:5"]
+
+
+def test_two_dsh_replies_alike_in_one_session_are_two_messages(dsh, still_clocks):
+    """The model said the same words at the end of a turn and again in the next, still running when the first one's
+    Stop was sent.  The Stop's reply is the line the plugin names (``reply_id``), never the last with its words, and
+    that line is held as the reply stored under the turn's key, whatever the moment the reply was stored with: each is
+    stored once, the reply under its turn and the other from its line."""
+    root, home = dsh
+    at = _dsh_ms()
+    reply = "TEST 好的。"
+    _dsh(home, {"hook_event_name": "Stop", "turn_id": "1", "last_assistant_message": reply})
+    record = [
+        {"id": "u1", "role": "user", "text": "TEST 第一轮的问题。", "time": at(0)},
+        {"id": "a1", "role": "assistant", "text": reply, "time": at(1)},
+        {"id": "u2", "role": "user", "text": "TEST 第二轮的问题。", "time": at(25)},
+        {"id": "a2", "role": "assistant", "text": reply, "time": at(28)},
+    ]
+    result, diagnostics = _dsh(
+        home,
+        {
+            "hook_event_name": "Stop",
+            "turn_id": "1",
+            "last_assistant_message": reply,
+            "reply_id": "a1",
+            "record": record,
+        },
+    )
+    assert result == {"through": 4} and _dsh_resent_cleanly(diagnostics, root)
+    kept = _dsh_kept(root)
+    assert [(key, words) for key, words, _at in kept] == [
+        ("assistant:1", reply),
+        ("record:a2", reply),
+        ("record:u1", "TEST 第一轮的问题。"),
+        ("record:u2", "TEST 第二轮的问题。"),
+    ]
+
+
+def _dsh_inbox_resolved(home):
+    """What the store's worker does with the dsh session's captures that met another message under their key
+    (``capture_inbox.resolve_conflicted_ingress``)."""
+    from scope_recall.core import capture_inbox
+
+    hook = CodexHookHandler.from_home(str(home), "dsh")
+    try:
+        context = hook.context(hook.audience_of({"cwd": "C:/TEST/work"}), DSH_SESSION, "host_generated")
+        return capture_inbox.resolve_conflicted_ingress(
+            hook.core.storage,
+            hook.core.clock,
+            context,
+            authorize=lambda _scope: context.allowed_scope_ids,
+            remaining_seconds=5,
+        )
+    finally:
+        hook.close()
+
+
+def test_a_dsh_reply_sent_again_when_its_key_cannot_be_read_is_resolved_as_the_one_stored(
+    dsh, still_clocks, monkeypatch
+):
+    """The Stop reads what its turn's key holds to keep a reply's stored moment.  When that read fails, the reply sent
+    again with a moment of its own is refused and waits in the inbox, and the store's worker resolves it as the reply
+    already stored: one copy, and nothing under a key of its own."""
+    from scope_recall.core import MemoryCore
+
+    root, home = dsh
+    stop = {"hook_event_name": "Stop", "turn_id": "6", "last_assistant_message": "TEST 读不到也只存一次。"}
+    _dsh(home, stop)
+
+    def unreadable(self, *args, **kwargs):
+        raise sqlite3.OperationalError("TEST disk I/O error")
+
+    with monkeypatch.context() as broken:
+        broken.setattr(MemoryCore, "source_by_event_key", unreadable)
+        _result, diagnostics = _dsh(home, stop)
+    assert diagnostics.capture_error_code == "VERSION_CONFLICT"
+    assert _rows(root, "SELECT count(*) FROM capture_inbox") == [(1,)]
+    assert [receipt.disposition for receipt in _dsh_inbox_resolved(home)] == ["duplicate"]
+    assert _rows(root, "SELECT count(*) FROM capture_inbox") == [(0,)]
+    assert [(key, words) for key, words, _at in _dsh_kept(root)] == [("assistant:6", "TEST 读不到也只存一次。")]
+
+
+@pytest.mark.parametrize("reply", ["TEST 改之前的回答。", "TEST 改之后的回答。"])
+def test_an_edited_dsh_reply_is_its_own_line_under_the_id_it_shares(dsh, still_clocks, reply):
+    """dsh sent the model's message again, edited, under the same id.  The Stop's reply is the line with its id and its
+    words, whichever version it is, and is said when that line was; the id is one message, held with its reply, as the
+    read of a record holds every line of an id it holds."""
+    from scope_recall.adapters.clients import transcript
+
+    root, home = dsh
+    at = _dsh_ms()
+    record = [
+        {"id": "a1", "role": "assistant", "text": "TEST 改之前的回答。", "time": at(0)},
+        {"id": "a1", "role": "assistant", "text": "TEST 改之后的回答。", "time": at(3)},
+    ]
+    result, diagnostics = _dsh(
+        home,
+        {
+            "hook_event_name": "Stop",
+            "turn_id": "7",
+            "last_assistant_message": reply,
+            "reply_id": "a1",
+            "record": record,
+        },
+    )
+    assert result == {"through": 2} and diagnostics.capture_error_detail is None
+    said = {line.text: line.occurred_at for _end, line in transcript.dsh_lines(record) if line is not None}
+    assert _dsh_kept(root) == [("assistant:7", reply, said[reply])]
 
 
 def test_a_dsh_turn_without_a_reply_stores_what_its_lines_show(dsh):
@@ -4011,7 +4578,8 @@ def test_a_turn_larger_than_one_stop_is_stored_in_several_within_the_hook_s_inpu
 @_NEEDS_NODE
 def test_a_stop_that_stores_part_of_its_lines_is_followed_by_the_next_without_waiting(dsh, tmp_path):
     """A Stop stores what fits in its time; the next one takes the rest at once, so a backlog is not left to the sweep's
-    waits (the stand-in hook stores one line each time)."""
+    waits (the stand-in hook stores one line each time).  The reply goes again with each Stop that carries its line,
+    named by the line's id."""
     _root, home = dsh
     log = tmp_path / "TEST-hook-log.jsonl"
     result = _run_plugin(
@@ -4019,11 +4587,14 @@ def test_a_stop_that_stores_part_of_its_lines_is_followed_by_the_next_without_wa
         env={"SR_FAKE_HOOK": str(DSH_HARNESS / "fake_hook.mjs"), "SR_FAKE_HOOK_LOG": str(log)},
     )
     stops = [
-        len(payload["record"])
+        payload
         for payload in map(json.loads, log.read_text(encoding="utf-8").splitlines())
         if payload["hook_event_name"] == "Stop"
     ]
-    assert stops == [3, 2, 1], "each Stop sends what is left"
+    assert [len(payload["record"]) for payload in stops] == [3, 2, 1], "each Stop sends what is left"
+    assert [
+        (payload.get("turn_id"), payload.get("reply_id"), payload.get("last_assistant_message")) for payload in stops
+    ] == [("1", "a-2", "TEST 它叫 Mochi。")] * 3
     assert result["spool"] == [] and result["status"]["lastStore"]["error"] is None
     assert result["status"]["retryAfter"] is None
 
@@ -4066,9 +4637,9 @@ def test_an_aborted_step_is_passed_on_untouched(dsh, tmp_path):
 @_NEEDS_NODE
 def test_the_plugin_stores_what_a_dsh_that_is_gone_left_and_leaves_a_running_one_s_file(dsh, tmp_path):
     """A dsh that ended before its store did leaves its spool file; another dsh's plugin takes it, once it is idle and its
-    process is gone, and stores it.  That turn ended minutes ago, so its reply is stored from the record alone, once (sent
-    as the reply too, it would be stored again: the store compares moments 120 s apart at most).  A message older than
-    14 days is dropped and said; the file of a process that still runs is left to it."""
+    process is gone, and stores it.  That turn ended minutes ago, so its reply is stored from the record alone, once (the
+    plugin sends a reply with its Stop only while a store that dates it by the hook's moment would still know it).  A
+    message older than 14 days is dropped and said; the file of a process that still runs is left to it."""
     root, home = dsh
     spool = tmp_path / "TEST-spool"
     spool.mkdir()

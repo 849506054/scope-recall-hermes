@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import inspect
 import logging
 import threading
 import time
@@ -151,12 +150,6 @@ class ScopeRecallHermesAdapter(HermesToolSurface, _MemoryProviderBase):  # pyrig
         return self.PROVIDER_NAME
 
     @property
-    def installation_token(self) -> str:
-        if self._identity is None:
-            return ""
-        return self._identity.binding.installation_id
-
-    @property
     def diagnostics(self) -> AdapterDiagnostics:
         pending = self._retry.pending_identities()
         self._diagnostics.pending_capture_identities = tuple(f"{key}@{revision}" for key, revision in pending)
@@ -295,7 +288,7 @@ class ScopeRecallHermesAdapter(HermesToolSurface, _MemoryProviderBase):  # pyrig
         return ""
 
     def shutdown(self) -> None:
-        # A turn being written is finished first (``sync_turn``), as when it held the adapter lock throughout, and so
+        # A turn being written is finished first (``sync_turn``), as if it held the adapter lock throughout, and so
         # is a tool hook's capture whose store I/O runs without the lock, for at most ``_CAPTURE_DRAIN_WAIT_S``: its
         # bookkeeping needs the session it was said in.  One still writing after that is counted, not waited out.
         with self._sync_lock, self._lock:
@@ -352,39 +345,6 @@ class ScopeRecallHermesAdapter(HermesToolSurface, _MemoryProviderBase):  # pyrig
                 state["captures_still_writing"] = still_writing
             self._diagnostics.shutdown_state = state
             self._initialized = False
-
-
-def public_signatures_match(provider: PublicMemoryProvider) -> bool:
-    """Return whether a fixture provider exposes the documented public surface."""
-
-    required = {
-        "name": property,
-        "is_available": callable,
-        "initialize": callable,
-        "prefetch": callable,
-        "queue_prefetch": callable,
-        "sync_turn": callable,
-        "on_session_end": callable,
-        "on_session_switch": callable,
-        "on_pre_compress": callable,
-        "shutdown": callable,
-        "get_tool_schemas": callable,
-        "handle_tool_call": callable,
-    }
-    for attr, kind in required.items():
-        value = getattr(provider, attr, None)
-        if kind is property and not isinstance(getattr(type(provider), attr, None), property):
-            return False
-        if kind is callable and not callable(value):
-            return False
-    initialize_params = inspect.signature(provider.initialize).parameters
-    if "session_id" not in initialize_params:
-        return False
-    if "kwargs" not in initialize_params and not any(
-        p.kind is inspect.Parameter.VAR_KEYWORD for p in initialize_params.values()
-    ):
-        return False
-    return True
 
 
 def register_adapter(ctx: Any) -> ScopeRecallHermesAdapter:

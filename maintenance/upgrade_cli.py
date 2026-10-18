@@ -9,7 +9,10 @@ from pathlib import Path
 from ..adapters.hermes.audiences import HermesIdentityError
 from ..contracts import ContractError
 from .backup import BackupError
+from .legacy_episode_membership import MembershipProjectionError
+from .legacy_v2_compat import LegacyCompatibilityError
 from .migrate_v2 import MigrationError
+from .migration_records import constraint_failure
 from .onboarding import inspect_installation, workflow_text
 from .upgrade import (
     prepare_upgrade,
@@ -18,6 +21,26 @@ from .upgrade import (
     upgrade_status,
     verify_upgrade,
 )
+
+#: Refusals whose text is told.  Scope/identity mismatches may be acted on, but exception text must not reveal row
+#: content, model credentials or arbitrary filesystem data: a contract error's text is its code and field, an identity
+#: error's names what the manifest lacks, and the legacy converter's refusals are fixed phrases.
+_TOLD = (
+    MigrationError,
+    BackupError,
+    ContractError,
+    HermesIdentityError,
+    LegacyCompatibilityError,
+    MembershipProjectionError,
+)
+
+
+def _reason(exc: BaseException) -> str:
+    """A told refusal's text, or a constraint failure SQLite named (a migration once ended
+    "invalid_or_unavailable_input" on a CHECK it could have named); anything else in general terms."""
+    if isinstance(exc, _TOLD):
+        return str(exc)
+    return constraint_failure(exc) or "invalid_or_unavailable_input"
 
 
 def main(argv=None):
@@ -102,15 +125,10 @@ def main(argv=None):
         TimeoutError,
         sqlite3.Error,
     ) as exc:
-        # Scope/identity mismatches may be acted on, but exception text must not
-        # reveal row content, model credentials or arbitrary filesystem data.  A
-        # contract error's text is its code and field, and an identity error's
-        # names what the manifest lacks; anything else is said in general terms.
-        told = (MigrationError, BackupError, ContractError, HermesIdentityError)
         result = dict(
             status="blocked",
             error_type=type(exc).__name__,
-            reason=str(exc) if isinstance(exc, told) else "invalid_or_unavailable_input",
+            reason=_reason(exc),
             safe_action="preserve_old_host_and_diagnose",
             user_memory_review_required=False,
         )

@@ -1,7 +1,6 @@
-"""rc33 recall accuracy: dated items, questions that do not answer themselves, facts first.
+"""Recall accuracy: dated items, questions that do not answer themselves, facts first.
 
-Each case comes from the rc32 field report or the recall benchmark over alpha and
-beta: the newest test report dated a day early, "阿乙当前是什么模型" answered with
+The cases are the newest test report dated a day early, "阿乙当前是什么模型" answered with
 "你现在是什么模型呀", and facts reachable only through relation expansion.
 """
 
@@ -51,7 +50,7 @@ def test_claim_items_are_dated_by_their_newest_evidence(app):
 
 
 def test_a_rekeyed_capture_with_an_inherited_time_is_dated_by_its_write(app):
-    """Before rc33 the Hermes adapter copied the time of the unrelated message a
+    """An earlier Hermes adapter copied the time of the unrelated message a
     restarted gateway's reused turn number already named.  The stored rows are
     never rewritten, so recall dates the copy by when it was written."""
     core, ctx = app
@@ -73,7 +72,7 @@ def test_a_rekeyed_capture_with_an_inherited_time_is_dated_by_its_write(app):
 
 
 def test_an_earlier_question_does_not_outrank_the_answer(app):
-    """ "阿乙当前是什么模型" returned "你现在是什么模型呀" first on beta.
+    """ "阿乙当前是什么模型" must not return "你现在是什么模型呀" first.
 
     The index holds overlapping bigrams, so 是什么 contributed 是什, 什么 and
     么模 -- terms every earlier question shares and no answer does.
@@ -90,7 +89,7 @@ def test_an_earlier_question_does_not_outrank_the_answer(app):
 
 
 def test_earlier_questions_do_not_crowd_out_the_answer(app):
-    """Asked "你身上已经用上了新版的scoperecall插件了吗？" again, alpha returned
+    """Asked "你身上已经用上了新版的scoperecall插件了吗？" again, recall must not return
     five earlier questions like it and not the reply that answered one: they
     share every content word with the query and are short enough to rank first."""
     core, ctx = app
@@ -151,10 +150,10 @@ def _say(core, ctx, raw, *, origin, role, when, key):
 
 
 def test_a_reply_that_restates_recall_does_not_outrank_what_it_restates(app):
-    """beta tested her own recall and reported the queries and what came back;
-    the report then came back first for those very queries.  A reply written in
-    a turn that called the recall tool restates memory -- it keeps its place as
-    context, below first-hand evidence."""
+    """A reply that reports the queries made to recall and what came back must not
+    then come back first for those very queries.  A reply written in a turn that
+    called the recall tool restates memory -- it keeps its place as context,
+    below first-hand evidence."""
     core, ctx = app
     fact = _say(
         core,
@@ -286,9 +285,9 @@ def _bury(core, ctx, count=60):
 
 
 def test_a_fact_is_found_when_its_evidence_is_buried_under_newer_talk(app):
-    """Claims used to reach recall only through relation expansion out of an
-    event retrieved first; 19 of alpha's 29 missed benchmark facts were never
-    reached.  Sixty newer messages now outrank the fact's own evidence."""
+    """A claim reaches recall on its own, not only through relation expansion out
+    of an event retrieved first: sixty newer messages outrank the fact's own
+    evidence, and the fact is still found."""
     core, ctx = app
     item, _source = initial(core, ctx, value="蓝色", when="2026-09-01T12:00:00Z")
     _bury(core, ctx)
@@ -354,3 +353,44 @@ def test_asking_words_are_not_evidence_terms():
     }
     assert not {"怎么", "么配"} & set(meaningful_query_terms("Scope Recall 的整理模型怎么配置？"))
     assert set(meaningful_query_terms("which model does beta use")) == {"model", "beta", "use"}
+
+
+def test_words_that_only_frame_a_request_are_searched_but_not_asked():
+    """A request to be told about something names it and asks nothing more: tell me, describe, any updates, the latest,
+    介绍一下, 说说, 关于 ... 你知道, 怎么样, 的情况 and 进展 are none of the words it asks, nor are the bigrams that
+    join a Chinese one to the next word (绍一, 一下, 你知).  What a request asks for past its frame stays: a port, a
+    status page, a condition (情况下), and the person it is about (contact me, 给我订), whom an answer names too.
+    Recall searches every one of them, frame or not: a message that says one may be what was asked for."""
+    from scope_recall.core.recall_policy import asked_terms, meaningful_query_terms
+
+    assert set(meaningful_query_terms("show me the summary")) == {"show", "me", "summary"}
+    assert {"说说", "进展"} <= set(meaningful_query_terms("说说你的进展"))
+    assert "latest" in meaningful_query_terms("What's the latest version of Orchard?")
+    assert {"any", "news"} <= set(meaningful_query_terms("Any news from the Beacon team?"))
+    assert {"是多", "多少"}.isdisjoint(asked_terms("Orchard 的端口是多少？"))
+    assert "是多" in meaningful_query_terms("Orchard 的端口是多少？")
+    for request in (
+        "Tell me about Orchard",
+        "What do you know about Orchard?",
+        "Describe Orchard",
+        "Explain Orchard to me",
+        "Anything on Orchard?",
+        "Any updates on Orchard?",
+        "What's the latest on Orchard?",
+        "Please give me an overview of Orchard",
+        "Orchard 怎么样？",
+        "介绍一下 Orchard",
+        "说说 Orchard",
+        "给我讲讲 Orchard",
+        "讲讲 Orchard 的情况",
+        "关于 Orchard 你知道什么？",
+        "Orchard 的进展如何？",
+        "你还记得 Orchard 吗？",
+    ):
+        assert asked_terms(request) == ("orchard",), request
+    assert set(asked_terms("What do you know about Orchard's port?")) == {"orchard", "port"}
+    assert set(asked_terms("介绍一下 Orchard 的端口")) == {"orchard", "的端", "端口"}
+    assert set(asked_terms("Where is the Rivet status page?")) == {"rivet", "status", "page"}
+    assert {"情况", "况下"} <= set(asked_terms("周六什么情况下可以联系我？"))
+    assert set(asked_terms("When is it OK to contact me on a Saturday?")) == {"ok", "contact", "me", "saturday"}
+    assert "给我" in asked_terms("给我订机票时选什么座位？")

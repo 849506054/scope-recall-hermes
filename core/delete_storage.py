@@ -54,12 +54,18 @@ def purge_work_ref(operation_id: str, scope_id: str) -> str:
 def purge_work_parts(ref: str) -> tuple[str, str]:
     """``(operation_id, scope_id)`` of a purge work subject.
 
-    The operation id holds no colon and a scope id may hold several (``workspace:6:hermes|agent:7:...``): the
-    subject splits at its first colon.  The worker split it at the last, found no such operation, and marked every
-    delete's purge on such a store obsolete, leaving the deleted text and its vectors on disk behind the read block.
+    The operation id holds no colon and a scope id may hold several (``workspace:6:hermes|agent:7:...``): the subject
+    splits at its first colon.  Split at the last, it names no such operation, and the worker would mark every delete's
+    purge on such a store obsolete, leaving the deleted text and its vectors on disk behind the read block.
     """
     operation_id, _colon, scope_id = str(ref).partition(":")
     return operation_id, scope_id
+
+
+def purge_finished(receipt: dict) -> bool:
+    """Whether a delete's purge work is done: its active content is removed, and so is the SQLite history, the page
+    images the store's files kept from before the scrub."""
+    return bool(receipt["active_content_removed"]) and receipt["layers"].get("sqlite_history") == "removed"
 
 
 def group_digest(binding, scope_id, project_id, branch_id, group_key):
@@ -281,7 +287,7 @@ class Deletions:
         delete = request["mode"] == "delete"
         layers = dict(
             sqlite_active="pending" if delete else "retained",
-            sqlite_history="maintenance_pending" if delete else "retained",
+            sqlite_history="pending" if delete else "retained",
             vector_active="inventory_pending" if delete else "retained",
             vector_history="inventory_pending" if delete else "retained",
             attachments="inventory_pending" if delete else "retained",
@@ -320,11 +326,11 @@ class Deletions:
     def requeue_unfinished_purges(self, *, now: str, limit: int = 8) -> int:
         """Give once more the purge a worker marked obsolete before it removed anything.
 
-        Up to 3.4.0rc8 the worker read a purge's operation id at the last colon of its subject (see
-        ``purge_work_parts``), so every delete's purge on a store whose scope ids hold colons was marked obsolete
-        and the operation's physical layers stayed pending.  Such a row, obsolete within three attempts, whose
-        delete operation still has a layer to remove, goes back to pending under a new lease token; each try counts
-        an attempt, so one that keeps ending obsolete stops being queued.
+        A purge whose operation id was read at the last colon of its subject (see ``purge_work_parts``) names no
+        operation on a store whose scope ids hold colons: it was marked obsolete with the operation's physical
+        layers still pending.  Such a row, obsolete within three attempts, whose delete operation still has a layer
+        to remove, goes back to pending under a new lease token; each try counts an attempt, so one that keeps
+        ending obsolete stops being queued.
         """
         conn = self._tx._check(write=True)
         # The obsolete purges looked at, not the ones queued, are bounded: a row that never qualifies must not hide
@@ -386,8 +392,9 @@ class Deletions:
         texts: list[frozenset[tuple[str, str]]] = []
 
         def forgotten_texts() -> frozenset[tuple[str, str]]:
-            # Each version of a deleted message is put together once, and only when a waiting row is looked into:
-            # put together for each of its segments, under the writer lease, a delete of long messages took seconds.
+            # Each version of a deleted message is put together once, and only when a waiting row is looked into: put
+            # together for each of its segments under the writer lease, it would make a delete of long messages take
+            # seconds.
             if not texts:
                 texts.append(
                     frozenset(
@@ -471,12 +478,10 @@ class Deletions:
         # layer is owned by the native purge port and cannot be acknowledged by
         # a truth-database transaction.  A repeated call after the scrub is
         # therefore idempotent, while the durable purge item remains available
-        # for the physical phase.
+        # for the physical phase.  What the scrub replaces is overwritten with
+        # zeros (``truth_connection.require_secure_delete``).
         if receipt["layers"].get("sqlite_active") == "removed":
             return receipt
-        # This overwrites SQLite payload cells, not host logs, copies or SSD
-        # internals. VACUUM/checkpoint inventory remains explicit maintenance.
-        conn.execute("PRAGMA secure_delete=ON")
         members = conn.execute(
             "SELECT object_kind,object_ref FROM deletion_members WHERE operation_id=?", (operation_id,)
         ).fetchall()
@@ -518,7 +523,7 @@ class Deletions:
             if kind == "event":
                 lexical_index.forget(conn, ref)
                 # A row already purged keeps what it has: a restore purges its file again, and written over from its
-                # empty text, the digests a first purge kept would be lost; a row an older release purged keeps
+                # empty text, the digests a first purge kept would be lost; a row purged without them keeps
                 # having none.
                 for (revision,) in conn.execute(
                     "SELECT DISTINCT source_revision FROM source_events WHERE event_id=?", (ref,)
@@ -537,6 +542,9 @@ class Deletions:
             elif kind == "claim":
                 conn.execute("UPDATE claims SET subject='',predicate='' WHERE claim_id=?", (ref,))
                 conn.execute("UPDATE claim_versions SET payload_json='{}' WHERE claim_id=?", (ref,))
+                # A candidate's trigger terms are words of its subject, predicate and value, and a blocked
+                # candidate is never woken by them.
+                conn.execute("DELETE FROM candidate_trigger_terms WHERE candidate_ref=?", (ref,))
             elif kind == "episode":
                 conn.execute(
                     "UPDATE episode_versions SET resume_json=NULL,environment_revision=NULL WHERE episode_id=?", (ref,)
@@ -574,6 +582,20 @@ class Deletions:
         if layers.get("sqlite_active") != "removed":
             raise ContractError("VERSION_CONFLICT", "sqlite_scrub_required")
         layers["vector_active"] = "removed"
+        return self._record_layers(conn, operation_id, layers)
+
+    def mark_sqlite_history(self, operation_id: str, *, removed: bool) -> dict:
+        """Record the SQLite history removed when the write-ahead log was truncated after the scrub committed
+        (``SQLiteStorage.truncate_wal``): no page image from before the scrub is then left in the store's files.  The
+        receipt as it then reads."""
+        conn = self._tx._check(write=True)
+        receipt = self._deletion(operation_id)
+        layers = receipt["layers"]
+        if not removed or layers.get("sqlite_history") == "removed":
+            return receipt
+        if layers.get("sqlite_active") != "removed":
+            raise ContractError("VERSION_CONFLICT", "sqlite_scrub_required")
+        layers["sqlite_history"] = "removed"
         return self._record_layers(conn, operation_id, layers)
 
     def attachment_plan(self, operation_id: str) -> dict:

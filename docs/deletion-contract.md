@@ -1,8 +1,7 @@
 # Deletion and suppression contract
 
-The P06 implementation owns online event/Claim governance in the same SQLite
-transaction as its deletion operation, dependency blocks, epoch change and late
-work invalidation. It does not claim final P15 maintenance or P18 host acceptance.
+Online event/Claim governance runs in the same SQLite transaction as its
+deletion operation, dependency blocks, epoch change and late work invalidation.
 
 `forget` requires current captured human authorization, the exact target versions,
 scope/project/branch ownership and explicit references for a batch. Unknown and
@@ -14,8 +13,7 @@ project/branch, affected object count, minimum content unit and each cleanup lay
 `suppress` blocks automatic use and preserves explicitly requested reads. It does
 not become a permanent unsuppress when a later conversation discusses the object.
 Dependent captures and proposals inherit suppression; an exact scoped fresh mention
-of a suppressed Claim also stays suppressed for automatic retrieval. Semantic
-paraphrase handling belongs to the subsequent consolidation/recall implementation.
+of a suppressed Claim also stays suppressed for automatic retrieval.
 
 `delete` immediately denies all existing event/Claim representations, source
 expansion and historical reads. The minimum captured content unit is a complete
@@ -42,8 +40,8 @@ as another message. A delete purged before 3.4.0 kept no such digests, and
 whatever comes under its key is refused. A copy of a suppressed or deleted message stored under a new key,
 after its key collided with another message's, is stored suppressed, its whole
 source group with it.
-Future Episode, reference and artifact repositories must extend the dependency
-closure before accepting their object types; currently unknown types fail closed.
+The dependency closure also covers episodes, artifacts and references; a
+dependency of any other kind fails closed (`unresolved_dependency_kind`).
 
 All content exits rehydrate SQLite objects. `release_objects` refuses what was read
 before a deletion or suppression in the reader's scopes was recorded
@@ -56,16 +54,36 @@ not. An epoch move alone refuses nothing, since every capture moves it; it is no
 count of visible items either.
 Text already delivered to the host lies outside a later local transaction.
 
-Physical SQLite cleanup runs separately after online blocking, under the existing
-writer boundary. It clears active raw content, source keys/extras, Claim payloads,
-evidence quotations/locations and lexical rows. Minimal opaque dependency IDs and
-governance records remain, with digests of the deleted words (as stored, without
-whitespace, and their letters and digits) by which a later copy under the message's
-key is refused. A cleanup failure rolls back physical changes while the
-earlier read block remains effective. SQLite history, vector active/history files,
-attachments, backup inventory and host-owned sources each retain their actual
-pending, unknown or external state. No SSD erasure or complete physical removal is
-claimed; P15 performs explicit checkpoint/VACUUM and file inventory work.
+Physical SQLite cleanup runs separately after online blocking, in the worker's purge
+work, under the store's writer boundary. It clears active raw content, source
+keys/extras, Claim payloads, evidence quotations/locations and lexical rows: the
+source's postings, the index terms no other source holds and a deleted candidate's
+trigger terms. Minimal opaque dependency IDs and governance records remain, with
+digests of the deleted words (as stored, without whitespace, and their letters and
+digits) by which a later copy under the message's key is refused. A cleanup failure
+rolls back physical changes while the earlier read block remains effective.
+
+Every writable connection to the store overwrites with zeros what it deletes or
+replaces (SQLite's `secure_delete`), so the free space of a page keeps no copy:
+neither what the cleanup replaced nor the inbox row a stored capture leaves. Once the
+cleanup has committed, the purge copies the write-ahead log into the store and
+truncates it (`wal_checkpoint(TRUNCATE)`): no frame from before the cleanup is left
+in `memory.sqlite3-wal`, the store's pages hold what the cleanup wrote, and the
+receipt's `sqlite_history` layer reads `removed`. The log grows again with the
+commits that follow, the purge's own receipt among them, and none of them holds the
+deleted words; `memory.sqlite3-shm` holds no page. A reader still on an older
+snapshot holds the truncation back: the purge waits for it no longer than the
+store's timeout, leaves `sqlite_history` at `pending` and stays queued for a later
+worker pass, and is done once every layer it removes is removed. A vector companion
+holds vectors and opaque identities and refuses a row that carries text. Vector
+active/history files, attachments, backup inventory and host-owned sources each
+retain their actual pending, unknown or external state.
+
+A purge does not remove what lies outside the store's files: backups and their
+copies, text already delivered to a host, and what a storage device keeps of blocks
+that were overwritten or released; no SSD erasure is claimed. Nor does it reach what
+an earlier release's writes left in free space without overwriting it, such as the
+inbox row of a capture that release stored.
 
 Restore admission is an explicit installation maintenance capability, separate
 from an ordinary `TrustedContext`, even when that context contains all scopes.
@@ -82,11 +100,24 @@ a missing human source or ordinary correction history. Physical cleanup is repea
 on the restored file; status from the latest file is not treated as evidence about
 the old copy. The resulting epoch exceeds both snapshot and latest-checkpoint
 epochs, preventing cache ABA. Failed replay or commit leaves admission closed and
-permits retry. P15 still owns the complete backup identity/manifest, snapshot copy,
-ordinary data completeness and operator-facing restore workflow.
+permits retry.
 
-The isolated tests retain actual failures and reruns. They cover online C08/C09/
-C10/C11/C20/C30 paths, missing late segments, terminal intentions, withdrawal
-restoration, project/branch isolation, cleanup/commit failure and retry. They use
-real SQLite backup/transactions and controlled raw sources; no model or host
-semantic acceptance is inferred from these tests.
+The operator's backup and restore are the `backup` and `restore` commands
+([install.md](install.md), section 9). `restore` exports the ledger from the store
+it replaces and backs that store up. `begin_restore` then writes the ledger beside
+the store (`restore-ledger.json`) and the marker after it, each through a file of
+its own that is synced and moved into place, so a crash leaves either whole or not
+there. The snapshot, held open in one read transaction from its checks on, is then
+copied over the store through SQLite's backup API, and the replay truncates the
+write-ahead log, which held the snapshot's pages, before admission reopens: a
+reader still on an older snapshot holds that back (`wal_busy`), and admission stays
+closed. A run cut short after admission closed is finished by running `restore`
+again: the kept ledger, or the store itself while nothing has replaced it, is
+checked against the marker before anything else is written, and a marker left
+partial is written again while nothing has replaced the store. A snapshot copied
+back by hand, without its ledger, brings back what was forgotten after it was
+taken. The ledger's format (`scope-recall-deletion-ledger/1`) names what it holds
+whatever schema the exporting release writes, so the release that reads a
+snapshot's schema replays the ledger a newer release exported; a ledger of another
+format, or of this one with other fields, is refused (`RESTORE_UNVERIFIED`,
+`ledger_format` or a `*_shape` field) and admission stays closed.

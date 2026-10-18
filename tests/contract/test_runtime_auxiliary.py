@@ -20,8 +20,9 @@ from scope_recall.runtime.consolidation_models import ConsolidationRouteConfig, 
 from scope_recall.runtime.embedding_models import (
     EmbeddingRouteConfig,
     GeminiEmbeddingAdapter,
+    _embedding_usage,
+    _embedding_vector,
     build_gemini_embed_body,
-    parse_embedding_response,
     validate_embedding_vector,
 )
 from scope_recall.runtime.model_budget import (
@@ -278,6 +279,33 @@ def test_malformed_and_invalid_vectors(tmp_path, monkeypatch):
         validate_embedding_vector([0.0] * 3072)
 
 
+def test_an_openai_answer_is_read_with_its_usage_and_a_wrong_width_is_refused(tmp_path, monkeypatch):
+    """The openai dialect carries the vector in ``data`` and the prompt tokens in ``usage``.  A provider that ignores
+    the width the route asks for is refused: the space digest commits to it, so such a vector is unusable."""
+    embedding = {
+        "credential_env": "SCOPE_RECALL_TEST_EMBED_KEY",
+        "model": EMBEDDING_SPACE["model"],
+        "endpoint": "https://example.test/v1/embeddings",
+        "dimensions": 64,
+        "dialect": "openai",
+    }
+    config, ledger, _ = _runtime_config(tmp_path, embedding=embedding)
+    monkeypatch.setenv("SCOPE_RECALL_TEST_EMBED_KEY", "test-key")
+
+    def answer(vector):
+        body = json.dumps({"data": [{"embedding": vector}], "usage": {"prompt_tokens": 7}}).encode()
+        return lambda **kwargs: (200, body)
+
+    transport = FakeTransport(answer(_vector(64)))
+    runtime = build_auxiliary_runtime(config, transport=transport)
+    assert len(runtime.query_embedding.embed_query("hello", remaining_seconds=2.0)) == 64
+    assert [(row["status"], row["actual_input"]) for row in _ledger_rows(ledger)] == [("http_200", 7)]
+    transport.handler = answer(_vector(length=63))
+    with pytest.raises(AuxiliaryModelError) as wrong_width:
+        runtime.query_embedding.embed_query("hello", remaining_seconds=2.0)
+    assert wrong_width.value.error_type == "vector_dimension_mismatch"
+
+
 def test_consolidation_returns_raw_content_without_json_repair(tmp_path, monkeypatch):
     config, _, _ = _runtime_config(tmp_path)
     monkeypatch.setenv("SCOPE_RECALL_TEST_CHAT_KEY", "test-key")
@@ -370,8 +398,8 @@ def test_a_cache_count_that_cannot_be_true_is_not_recorded(tmp_path, monkeypatch
     ],
 )
 def test_output_billed_outside_completion_tokens_is_recorded_and_charged(tmp_path, monkeypatch, usage, unreported):
-    """beta's Gemini route recorded 325 completion tokens a call while the
-    provider billed thousands of thinking tokens nobody could see."""
+    """A Gemini route can record few completion tokens a call (325, say) while the
+    provider bills thousands of thinking tokens nobody can see."""
     config, ledger, budget = _runtime_config(tmp_path)
     monkeypatch.setenv("SCOPE_RECALL_TEST_CHAT_KEY", "test-key")
     runtime = build_auxiliary_runtime(config, transport=_cached_reply(usage))
@@ -441,6 +469,171 @@ def test_truncated_reply_without_answer_text_keeps_its_shape_error(tmp_path, mon
     with pytest.raises(AuxiliaryModelError) as exc:
         runtime.consolidation.propose([{"role": "user", "content": "bounded input"}], remaining_seconds=2.0)
     assert exc.value.error_type == "unsupported_response_shape"
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        {"role": "assistant", "content": '{"protocol_version":"1.1","source_refs":["'},
+        {"role": "assistant", "content": ""},
+        {"role": "assistant", "content": None},
+        {"role": "assistant"},
+        {},
+    ],
+    ids=["partial_text", "empty_text", "null_text", "no_text_field", "empty_message"],
+)
+def test_a_reply_the_content_filter_stopped_is_a_refusal_whatever_the_message_holds(tmp_path, monkeypatch, message):
+    """The provider's policy ended the answer, so the text left, if any, is incomplete and no proposal; the call is
+    still settled with the usage the provider reported."""
+    config, ledger, _ = _runtime_config(tmp_path)
+    monkeypatch.setenv("SCOPE_RECALL_TEST_CHAT_KEY", "test-key")
+    runtime = build_auxiliary_runtime(
+        config, transport=FakeTransport(lambda **kwargs: (200, _chat_reply(message, "content_filter")))
+    )
+    with pytest.raises(AuxiliaryModelError) as exc:
+        runtime.consolidation.propose([{"role": "user", "content": "bounded input"}], remaining_seconds=2.0)
+    assert exc.value.error_type == "model_refused"
+    with sqlite3.connect(ledger) as db:
+        assert db.execute("SELECT status,actual_output FROM requests").fetchall() == [("http_200", 512)]
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        {"role": "assistant", "content": None, "refusal": "I can't help with that."},
+        {"role": "assistant", "refusal": "I can't help with that."},
+        {"role": "assistant", "content": "", "refusal": "I can't help with that."},
+    ],
+    ids=["null_text", "no_text_field", "empty_text"],
+)
+def test_a_refusal_where_the_answer_belongs_is_a_refusal(tmp_path, monkeypatch, message):
+    config, _, _ = _runtime_config(tmp_path)
+    monkeypatch.setenv("SCOPE_RECALL_TEST_CHAT_KEY", "test-key")
+    runtime = build_auxiliary_runtime(
+        config, transport=FakeTransport(lambda **kwargs: (200, _chat_reply(message, "stop")))
+    )
+    with pytest.raises(AuxiliaryModelError) as exc:
+        runtime.consolidation.propose([{"role": "user", "content": "bounded input"}], remaining_seconds=2.0)
+    assert exc.value.error_type == "model_refused"
+
+
+@pytest.mark.parametrize("refusal", [None, "", "kept as metadata by a gateway"])
+def test_a_refusal_field_beside_answer_text_is_metadata(tmp_path, monkeypatch, refusal):
+    config, _, _ = _runtime_config(tmp_path)
+    monkeypatch.setenv("SCOPE_RECALL_TEST_CHAT_KEY", "test-key")
+    message = {"role": "assistant", "content": '{"protocol_version":"1.1"}', "refusal": refusal}
+    runtime = build_auxiliary_runtime(
+        config, transport=FakeTransport(lambda **kwargs: (200, _chat_reply(message, "stop")))
+    )
+    answer = runtime.consolidation.propose([{"role": "user", "content": "bounded input"}], remaining_seconds=2.0)
+    assert answer == '{"protocol_version":"1.1"}'
+
+
+@pytest.mark.parametrize(
+    "content",
+    [" \n\t ", [], {}, [{"type": "text", "text": "  "}], [{"type": "annotation", "note": "n"}]],
+    ids=["blank_text", "empty_list", "empty_object", "blank_text_part", "part_without_text"],
+)
+def test_a_refusal_beside_content_without_answer_text_is_a_refusal(tmp_path, monkeypatch, content):
+    config, _, _ = _runtime_config(tmp_path)
+    monkeypatch.setenv("SCOPE_RECALL_TEST_CHAT_KEY", "test-key")
+    message = {"role": "assistant", "content": content, "refusal": "I can't help with that."}
+    runtime = build_auxiliary_runtime(
+        config, transport=FakeTransport(lambda **kwargs: (200, _chat_reply(message, "stop")))
+    )
+    with pytest.raises(AuxiliaryModelError) as exc:
+        runtime.consolidation.propose([{"role": "user", "content": "bounded input"}], remaining_seconds=2.0)
+    assert exc.value.error_type == "model_refused"
+
+
+@pytest.mark.parametrize(
+    "content",
+    [[{"type": "text", "text": '{"protocol_version":"1.1"}'}], {"text": '{"protocol_version":"1.1"}'}],
+    ids=["text_parts", "object"],
+)
+def test_a_refusal_beside_content_that_may_hold_the_answer_is_not_a_refusal(tmp_path, monkeypatch, content):
+    """Parts that hold text, or content in a shape this route does not read, may hold the answer, whatever else the
+    message carries; the reply is a shape this route does not read, not a refusal."""
+    config, _, _ = _runtime_config(tmp_path)
+    monkeypatch.setenv("SCOPE_RECALL_TEST_CHAT_KEY", "test-key")
+    message = {"role": "assistant", "content": content, "refusal": "kept as metadata by a gateway"}
+    runtime = build_auxiliary_runtime(
+        config, transport=FakeTransport(lambda **kwargs: (200, _chat_reply(message, "stop")))
+    )
+    with pytest.raises(AuxiliaryModelError) as exc:
+        runtime.consolidation.propose([{"role": "user", "content": "bounded input"}], remaining_seconds=2.0)
+    assert exc.value.error_type == "unsupported_response_shape"
+
+
+@pytest.mark.parametrize(
+    "refusal", ["", " \n", None, ["I can't help with that."]], ids=["empty", "blank", "null", "list"]
+)
+def test_a_refusal_that_declines_nothing_is_no_refusal(tmp_path, monkeypatch, refusal):
+    """Without a refusal text there is no refusal to name: null content is then a shape the route does not read."""
+    config, _, _ = _runtime_config(tmp_path)
+    monkeypatch.setenv("SCOPE_RECALL_TEST_CHAT_KEY", "test-key")
+    message = {"role": "assistant", "content": None, "refusal": refusal}
+    runtime = build_auxiliary_runtime(
+        config, transport=FakeTransport(lambda **kwargs: (200, _chat_reply(message, "stop")))
+    )
+    with pytest.raises(AuxiliaryModelError) as exc:
+        runtime.consolidation.propose([{"role": "user", "content": "bounded input"}], remaining_seconds=2.0)
+    assert exc.value.error_type == "unsupported_response_shape"
+
+
+@pytest.mark.parametrize("finish_reason", [[], {}, 7, True], ids=["list", "object", "number", "boolean"])
+def test_a_finish_reason_that_is_not_text_is_a_shape_this_route_does_not_read(tmp_path, monkeypatch, finish_reason):
+    """A route that does not say why it stopped cannot be told from one that finished, so a stop reason that is
+    neither text nor absent is refused, beside valid JSON as beside a prefix."""
+    config, _, _ = _runtime_config(tmp_path)
+    monkeypatch.setenv("SCOPE_RECALL_TEST_CHAT_KEY", "test-key")
+    message = {"role": "assistant", "content": '{"protocol_version":"1.1"}'}
+    runtime = build_auxiliary_runtime(
+        config, transport=FakeTransport(lambda **kwargs: (200, _chat_reply(message, finish_reason)))
+    )
+    with pytest.raises(AuxiliaryModelError) as exc:
+        runtime.consolidation.propose([{"role": "user", "content": "bounded input"}], remaining_seconds=2.0)
+    assert exc.value.error_type == "unsupported_response_shape"
+
+
+@pytest.mark.parametrize("sent", [False, True], ids=["absent", "null"])
+def test_a_reply_that_names_no_stop_reason_is_read_as_an_answer(tmp_path, monkeypatch, sent):
+    """A gateway that sends no stop reason, or null, has said nothing wrong: its answer is read."""
+    config, _, _ = _runtime_config(tmp_path)
+    monkeypatch.setenv("SCOPE_RECALL_TEST_CHAT_KEY", "test-key")
+    choice = {"message": {"role": "assistant", "content": '{"protocol_version":"1.1"}'}}
+    if sent:
+        choice["finish_reason"] = None
+    body = json.dumps({"usage": {"prompt_tokens": 10, "completion_tokens": 5}, "choices": [choice]}).encode()
+    runtime = build_auxiliary_runtime(config, transport=FakeTransport(lambda **kwargs: (200, body)))
+    answer = runtime.consolidation.propose([{"role": "user", "content": "bounded input"}], remaining_seconds=2.0)
+    assert answer == '{"protocol_version":"1.1"}'
+
+
+@pytest.mark.parametrize("finish_reason", ["insufficient_system_resource", "aborted"])
+@pytest.mark.parametrize(
+    "message",
+    [
+        {"role": "assistant", "content": '{"protocol_version":"1.1","source_refs":["'},
+        {"role": "assistant", "content": None},
+    ],
+    ids=["partial_text", "null_text"],
+)
+def test_a_reply_the_provider_interrupted_is_a_transient_failure_whatever_the_message_holds(
+    tmp_path, monkeypatch, message, finish_reason
+):
+    """The provider ended the generation itself, so the text left, if any, is incomplete and no invalid derivation;
+    the call is still settled with the usage the provider reported."""
+    config, ledger, _ = _runtime_config(tmp_path)
+    monkeypatch.setenv("SCOPE_RECALL_TEST_CHAT_KEY", "test-key")
+    runtime = build_auxiliary_runtime(
+        config, transport=FakeTransport(lambda **kwargs: (200, _chat_reply(message, finish_reason)))
+    )
+    with pytest.raises(AuxiliaryModelError) as exc:
+        runtime.consolidation.propose([{"role": "user", "content": "bounded input"}], remaining_seconds=2.0)
+    assert exc.value.error_type == "model_output_interrupted"
+    with sqlite3.connect(ledger) as db:
+        assert db.execute("SELECT status,actual_output FROM requests").fetchall() == [("http_200", 512)]
 
 
 def test_consolidation_route_options_are_explicit(tmp_path, monkeypatch):
@@ -945,7 +1138,8 @@ def test_openai_embedding_usage_settles_single_and_batch(tmp_path, monkeypatch, 
 )
 def test_embedding_response_parsers_keep_dialect_usage(dialect, metadata, expected):
     payload = {"embeddings": [{"values": [1.0, 0.0]}], "data": [{"embedding": [1.0, 0.0]}], **metadata}
-    assert parse_embedding_response(payload, dialect=dialect, dimensions=2) == ((1.0, 0.0), expected)
+    assert _embedding_vector(payload, dialect=dialect, dimensions=2) == (1.0, 0.0)
+    assert _embedding_usage(payload, dialect=dialect) == expected
 
 
 def test_chat_total_tokens_keeps_unknown_input_reserved(tmp_path, monkeypatch):
@@ -1448,7 +1642,7 @@ def test_cumulative_caps_are_optional_and_zero_still_denies(tmp_path):
     uncapped = policy()
     ledger = tmp_path / "uncapped.sqlite3"
     initialize_auxiliary_budget_ledger(ledger, uncapped)
-    # Far past every number the old fixed caps used; none of them binds now.
+    # Far past every number a fixed cap would use; none of them binds.
     for _ in range(12):
         assert _reserve(ledger, uncapped, "deepseek-v4-flash") > 0
 

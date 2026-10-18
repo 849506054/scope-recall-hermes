@@ -5,16 +5,21 @@ The hook's state stays the handler's, reached through ``self._hook``; reading th
 
 from __future__ import annotations
 
+import sqlite3
 from typing import TYPE_CHECKING, Any, cast
 
-from scope_recall.contracts import ContractError, Origin
+from scope_recall.contracts import ContractError, Origin, SourceEvent
+from scope_recall.core.events import stored_content_digest
 from scope_recall.core.secret_patterns import contains_secret_like_text
 
 from . import transcript
 from .boundary import (
+    IN_CONTEXT_FIELD,
     TURN_FIELD,
     assistant_stop_source_event,
     authorized_attachment_refs,
+    claude_code_person_text,
+    in_context_since,
     is_codex_suggestions_prompt,
     is_codex_suggestions_reply,
     is_task_notification,
@@ -36,14 +41,16 @@ from .session_marks import (
 
 if TYPE_CHECKING:
     from .handler import CodexHookHandler
+    from .record_reader import RecordLines
 
 #: How long a capture waits for the writer lease.
 CAPTURE_TIMEOUT_S = 1.0
 #: The owner's own message may wait longer for the writer lease: another agent's long reply can hold it 1-2 s
-#: while it is matched against the candidates, and in the work computer's first day 12 of its 55 prompts
+#: while it is matched against the candidates, and on one machine's first day 12 of its 55 prompts
 #: waited their one second and were not stored.  It takes at most half of what the hook has left, and never
-#: less than the one second every other capture waits, so a 6 s budget waits 2 s and a 2 s one still 1 s.
-_PROMPT_CAPTURE_TIMEOUT_S = 2.0
+#: less than the one second every other capture waits, so a 6 s budget waits 2 s and a 2 s one still 1 s.  The
+#: core a hook writes through lets a write wait this long (``handler``).
+PROMPT_CAPTURE_TIMEOUT_S = 2.0
 #: Attaching the trusted runtime after a capture needs this much budget left.
 RUNTIME_ATTACH_MIN_S = 0.3
 
@@ -57,7 +64,10 @@ class HookEvents:
     def session_start(self, session_id: str, audience, deadline: float) -> bool:
         context = self._hook.context(audience, session_id, "host_generated")
         try:
-            self._hook.core.status(context)
+            # The hook's core lets a write wait 2 s for the store's lock (``PROMPT_CAPTURE_TIMEOUT_S``), and a read
+            # given no time would wait as long: this one waits no longer than a capture does.
+            wait = min(CAPTURE_TIMEOUT_S, max(0.001, self._hook.remaining(deadline)))
+            self._hook.core.status(context, remaining_seconds=wait)
         except ContractError:
             self._hook.note("binding_unavailable")
             return False
@@ -120,14 +130,14 @@ class HookEvents:
         if event is not None and attachment_refs:
             event["artifact_refs"] = attachment_refs
         context = self._hook.context(audience, session_id, "human_direct")
-        wait = min(_PROMPT_CAPTURE_TIMEOUT_S, max(CAPTURE_TIMEOUT_S, self._hook.remaining(deadline) / 2))
+        wait = min(PROMPT_CAPTURE_TIMEOUT_S, max(CAPTURE_TIMEOUT_S, self._hook.remaining(deadline) / 2))
         current_refs, capture_gaps = self._hook.capture(
             context, audience, event, deadline=deadline, gaps=gaps, wait=wait
         )
-        # The vector search comes with the runtime.  A prompt the store was too busy to take is recalled by
-        # meaning as well: six on the work computer's two entries in one night were recalled by words alone.  One
-        # the capture refused, or that holds a credential however the capture ended, goes without it, so that
-        # nothing of it reaches an embedding provider.
+        # The vector search comes with the runtime.  A prompt the store was too busy to take is recalled by meaning as
+        # well: without it, six on one machine's two entries in one night were recalled by words alone.  One the
+        # capture refused, or that holds a credential however the capture ended, goes without it, so that nothing of it
+        # reaches an embedding provider.
         vectors = (
             self._hook.call.captured
             or (
@@ -144,17 +154,34 @@ class HookEvents:
             return {}
         if event is not None and not current_refs and not self._hook.call.queued:
             self._hook.note("capture_failed", gaps=capture_gaps)
-        # The turn is recalled whether or not its message was stored; skipping here left it without memory
-        # whenever the store was busy, which is when a writer holds the lease.  A message that failed or still
+        # The turn is recalled whether or not its message was stored; skipping here would leave it without memory
+        # whenever the store is busy, which is when a writer holds the lease.  A message that failed or still
         # waits in the inbox is not among the sources a recall reads, so there is nothing of this turn to fence
         # out.  One refused (a credential) attached no runtime above, so its recall has no vector channel and
         # nothing of it goes to an embedding provider.
         request_id = f"{self._hook.host}-auto:{session_id}:{turn_id}"
+        since = None
+        if self._hook.host == "claude-code":
+            payload = self._with_context_since(session_id, payload)
+            since = in_context_since(payload)
         if vectors and self._hook.resident_recall is not None:
             return self._hook.prompt_recall.answer(
-                payload, context, prompt, request_id, current_refs, deadline, capture_gaps
+                payload, context, prompt, request_id, current_refs, deadline, capture_gaps, since=since
             )
-        return self._hook.prompt_recall.own(context, prompt, request_id, current_refs, deadline, capture_gaps)
+        return self._hook.prompt_recall.own(
+            context, prompt, request_id, current_refs, deadline, capture_gaps, since=since
+        )
+
+    def _with_context_since(self, session_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        """The payload with since when Claude Code's model still holds this session's own turns
+        (``transcript.context_since``), read from the session record here, for this recall and the entry's server's.
+        A client on another machine read its own record and sent it (the server opens no path a request names)."""
+        if not self._hook.call.local_record:
+            return payload
+        record = transcript.record_path(payload.get("transcript_path"), session_id)
+        since = transcript.context_since(record) if record is not None else None
+        kept = {key: value for key, value in payload.items() if key != IN_CONTEXT_FIELD}
+        return kept if since is None else {**kept, IN_CONTEXT_FIELD: since}
 
     def _prompt_turn(self, session_id: str, payload: dict[str, Any]) -> tuple[str, str, tuple[str, ...]] | None:
         """The turn and the words of a prompt this hook stores and recalls for, with its gaps; or None, said why: a
@@ -183,10 +210,14 @@ class HookEvents:
             if type(prompt) is not str:
                 self._hook.note("missing_prompt", gaps=(*gaps, "capability_gap:missing_prompt"))
                 return None
+            if self._hook.host == "claude-code":
+                # The reminders Claude's desktop app puts in a message are not the person's; one that holds nothing
+                # else stores nothing and is recalled for nothing, as an empty prompt.
+                prompt = claude_code_person_text(prompt)
             notice = self._hook.host == "claude-code" and is_task_notification(prompt)
         if notice:
             # Claude Code's own notice that a background task finished: recorded as the owner's words it
-            # became a message they never wrote, and a recall on it answers nothing they asked.  WorkBuddy
+            # would become a message they never wrote, and a recall on it answers nothing they asked.  WorkBuddy
             # hands its model the same notice (its ``BackgroundTaskNotifier``), and a Stop hook's or a goal's
             # request to go on.
             self._hook.note("task_notification")
@@ -203,7 +234,10 @@ class HookEvents:
             in_suggestions_thread(self._hook.config, session_id, ended=True)
         return turn_id, prompt, gaps
 
-    def stop(self, session_id: str, audience, payload: dict[str, Any], deadline: float) -> dict[str, Any]:
+    def stop(
+        self, session_id: str, audience, payload: dict[str, Any], deadline: float, *, record: RecordLines | None = None
+    ) -> dict[str, Any]:
+        """Store the turn's reply; ``record`` holds the lines the Stop carries (``record_reader.RecordLines``)."""
         if self._hook.host == "dsh" and type(payload.get("last_assistant_message")) is not str:
             # A turn that ended without a reply (aborted, failed), or dsh's plugin sending what it kept of earlier
             # turns: the record lines carry whatever was said.
@@ -239,6 +273,13 @@ class HookEvents:
             # The model's answer to Codex's request for suggestions (``is_codex_suggestions_prompt``).
             self._hook.note("host_generated_reply")
             return {}
+        # dsh's plugin names the line that holds the reply (``reply_id``): the reply is said when that line was, and the
+        # read of the lines after this Stop holds that line as this reply.
+        line = None
+        if self._hook.host == "dsh" and record is not None:
+            line = record.reply(payload.get("reply_id"), message)
+        if line is not None:
+            self._hook.call.reply_line = (line.entry_id, turn_id)
         event, outcome_gaps = assistant_stop_source_event(
             installation_id=self._hook.config.installation_id,
             host=self._hook.host,
@@ -246,15 +287,40 @@ class HookEvents:
             turn_id=turn_id,
             message=message,
             recorded_at=self._hook.clock.utc_now(),
+            occurred_at=line.occurred_at if line is not None else None,
         )
         context = self._hook.context(audience, session_id, "assistant_visible")
+        if self._hook.host == "dsh" and event is not None:
+            self._keep_stored_moment(context, event, deadline)
         self._hook.capture(context, audience, event, deadline=deadline, gaps=(*gaps, *outcome_gaps))
         return {}
+
+    def _keep_stored_moment(self, context, event: SourceEvent, deadline: float) -> None:
+        """A dsh reply already stored under its turn's key with the same words keeps the moment it was stored with.
+
+        The plugin sends the reply again with each later Stop that carries its line: after one whose time ran out
+        before all of the turn's lines were stored, and from its sweep after a store that failed.  Sent again, it can
+        come with a moment of its own (a reply whose line carries none is dated by each hook, one stored at its hook's
+        moment by its line the next time), and is then refused under its key (VERSION_CONFLICT) and left in the inbox
+        until the store's worker resolves it as the reply already stored (``capture_inbox``).  Read here, the Stop
+        stores it as that reply at once; a store that cannot be read now leaves the moment as it is."""
+        remaining = self._hook.remaining(deadline)
+        if remaining <= 0:
+            return
+        try:
+            stored = self._hook.core.source_by_event_key(
+                context, event["source_event_key"], remaining_seconds=remaining
+            )
+        except (ContractError, OSError, RuntimeError, sqlite3.Error):
+            return
+        if stored is not None and stored.content_sha256 == stored_content_digest(event["content"]):
+            event["occurred_at"] = stored.event["occurred_at"]
+            event["time_precision"] = stored.event["time_precision"]
 
     def _workbuddy_error_reply(self, session_id: str, payload: dict[str, Any], reply: str) -> bool:
         """Whether a WorkBuddy Stop's reply is an error its record marks (``transcript.workbuddy_error_reply``).  A client
         on another machine judges it from its own record and says so (this side never opens a record for a request); a
-        record that cannot be found or read says no, and the reply is stored as before."""
+        record that cannot be found or read says no, and the reply is stored."""
         if not self._hook.call.local_record:
             return self._hook.call.client_error_reply
         try:

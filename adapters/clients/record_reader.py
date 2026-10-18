@@ -6,13 +6,13 @@ reading resumes where the last one stopped (``transcript.Cursor``)."""
 from __future__ import annotations
 
 import sqlite3
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any
 
 from scope_recall.contracts import ContractError
 
 from . import transcript
-from .boundary import host_source_key, recorded_source_event
+from .boundary import claude_code_person_text, host_source_key, recorded_source_event
 from .config import SharedClientConfig
 from .session_marks import record_turns, replied_entry
 
@@ -46,6 +46,22 @@ class RecordLines:
     lines: list[tuple[int, "transcript.Said | None"]]
     through: int | None = None
 
+    @classmethod
+    def from_dsh(cls, payload: dict[str, Any]) -> RecordLines:
+        """The turn's messages dsh's plugin sends inside its Stop's payload (``transcript.dsh_lines``)."""
+        return cls(start=0, lines=transcript.dsh_lines(payload.get("record")))
+
+    def reply(self, entry_id: object, text: str) -> transcript.Said | None:
+        """The model's line with this id that says ``text``: the line a client names as its Stop's reply (dsh's
+        ``reply_id``), found by its words as well as its id, since a message edited later comes again under its id.
+        The last such line; None when no line is one."""
+        wanted = (entry_id.strip() if type(entry_id) is str else None, "assistant", text)
+        found = None
+        for _end, said in self.lines:
+            if said is not None and (said.entry_id, said.role, said.text) == wanted:
+                found = said
+        return found
+
 
 class RecordReader:
     """A hook's reading of its session record; one per handler."""
@@ -69,6 +85,7 @@ class RecordReader:
         *,
         remote: RecordLines | None = None,
         closed_reply: tuple[str, str] | None = None,
+        reply_line: tuple[str, str] | None = None,
     ) -> None:
         """Record what the session record shows was said since the last read (see ``transcript``).
 
@@ -76,7 +93,8 @@ class RecordReader:
         cannot be written now ends the read there; the next Stop starts again from that message.  A client
         on another machine reads its record there and sends the lines (``remote``); the offset reached goes
         back in ``remote.through`` for that client's own cursor.  ``closed_reply`` is the turn a WorkBuddy Stop closed
-        and the words of its reply (``session_marks.close_turn``).
+        and the words of its reply (``session_marks.close_turn``); ``reply_line`` the line of ``remote`` holding the
+        reply a dsh Stop stored, and its turn: that line is held as the reply under the turn's key, not by its words.
         """
         cursor = None
         workbuddy = self._hook.host == "workbuddy"
@@ -100,12 +118,16 @@ class RecordReader:
             except OSError:
                 self._hook.note("session_record_unavailable", gaps=("capture_gap:session_record_unavailable",))
                 return
+        if self._hook.host == "claude-code":
+            # Read here or sent by a client on another machine, of any version: the record keeps the reminders
+            # Claude's desktop app puts in a person's message, and they are not the person's.
+            lines = [(end, _person_words(entry)) for end, entry in lines]
         said = [entry for _end, entry in lines if entry is not None]
         # WorkBuddy's record names no turn: a person's message there is the turn its prompt hook kept for the same words,
         # and the model's message after it with the words of the Stop's reply is that Stop's turn: held when the Stop
         # stored it, stored from here when the Stop took it for the previous reply repeated (``close_turn``).
         turns = record_turns(self._hook.config, session_id, said) if workbuddy else {}
-        replied = replied_entry(said, closed_reply) if workbuddy else None
+        replied = replied_entry(said, closed_reply) if workbuddy else reply_line
         held: tuple[bool, ...] = ()
         if said:
             try:
@@ -155,7 +177,7 @@ class RecordReader:
     def _key(
         self, session_id: str, entry: "transcript.Said", turns: dict[str, str], replied: tuple[str, str] | None
     ) -> str | None:
-        """The key a hook stored a record message under, when the record or a kept turn names it."""
+        """The key a hook stored a record message under, when the record, a kept turn or the Stop names it."""
         if entry.role == "user" and (turns.get(entry.entry_id) or entry.prompt_id):
             kind, event_id = "user", turns.get(entry.entry_id) or entry.prompt_id
         elif replied is not None and entry.entry_id == replied[0]:
@@ -176,3 +198,14 @@ class RecordReader:
         diagnostics.capture_disposition = diagnostics.capture_error_code = diagnostics.capture_error_type = None
         self._hook.capture(context, audience, event, deadline=deadline, via_inbox=False)
         return diagnostics.capture_settled
+
+
+def _person_words(entry: transcript.Said | None) -> transcript.Said | None:
+    """A Claude Code record message with only the person's words in it (``claude_code_person_text``); None for one that
+    holds nothing else.  The model's messages are as they were."""
+    if entry is None or entry.role != "user":
+        return entry
+    text = claude_code_person_text(entry.text)
+    if text == entry.text:
+        return entry
+    return replace(entry, text=text) if text.strip() else None

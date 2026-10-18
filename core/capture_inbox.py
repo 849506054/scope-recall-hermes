@@ -178,7 +178,7 @@ def _commit(storage, clock, context, token, prepared, scope_id, policy, deadline
         )
         if receipt.disposition in {"conflict", "cancelled"}:
             # A capture that conflicts under the key it was given for its content stays final: written back as a
-            # bare conflict, it was given the same key and refused again on every pass.
+            # bare conflict, it would be given the same key and refused again on every pass.
             code = _REKEYED_CONFLICT if rekeyed and receipt.disposition == "conflict" else receipt.error_code
             with storage.write(context, remaining_seconds=max(0.001, deadline - time.monotonic())) as tx:
                 tx._check(write=True).execute("UPDATE capture_inbox SET last_error_code=? WHERE token=?", (code, token))
@@ -271,8 +271,8 @@ def _rekeyed_event(event: dict, capture: str = "") -> dict:
     A segment of a long message moves with its group: the group key takes the
     marker and the fingerprint of the whole capture (``capture``), and the
     segment's own key is derived from the new group key as when it was split
-    (``events.prepare_capture``).  Only the segment's key had changed, so the
-    segments met the first message's group again and were never stored.
+    (``events.prepare_capture``).  Were only the segment's key changed, the
+    segments would meet the first message's group again and never be stored.
     """
     segment = event.get("segment")
     if segment:
@@ -302,8 +302,8 @@ _KEY_LIMIT = 512
 
 def _rekey(key: str, fingerprint: str) -> str:
     """``key`` with the marker and the fingerprint, its original part cut to fit the key limit: a key of 490 characters
-    or more went past it and was refused on every pass.  The fingerprint covers the whole original key, so the cut
-    one stays unique."""
+    or more would go past it and be refused on every pass.  The fingerprint covers the whole original key, so the
+    cut one stays unique."""
     suffix = f"{REKEY_MARKER}{fingerprint}"
     return key[: _KEY_LIMIT - len(suffix)] + suffix
 
@@ -380,7 +380,12 @@ def _replay_rows(storage, clock, context, rows, authorize, admission_policy, dea
         if time.monotonic() >= deadline:
             break
         try:
-            revalidated = _revalidated(storage, context, row, authorize, deadline, rekey=rekey)
+            revalidated = _revalidated(storage, context, row, authorize, deadline, rekey=False)
+            stored = None
+            if rekey and revalidated is not None:
+                stored = _as_stored(storage, clock, *revalidated, row, admission_policy, deadline)
+                if stored is None:
+                    revalidated = _revalidated(storage, context, row, authorize, deadline, rekey=True)
         except _TRANSIENT:
             # The store itself: the rest of the page waits for the next pass.  Raised, it would lose what this replay
             # had done, and the rekey replay after it would not run.
@@ -393,6 +398,9 @@ def _replay_rows(storage, clock, context, rows, authorize, admission_policy, dea
         except (ContractError, KeyError, TypeError, ValueError, RuntimeError, OSError) as exc:
             # A host's check that raises (Hermes' identity errors are RuntimeErrors) put off this row only.
             receipts.append(_defer(storage, clock, context, row, exc, deadline, path="rekey" if rekey else "replay"))
+            continue
+        if stored is not None:
+            receipts.append(stored)
             continue
         if revalidated is None:
             receipts.append(
@@ -414,6 +422,42 @@ def _replay_rows(storage, clock, context, rows, authorize, admission_policy, dea
             )
         )
     return tuple(receipts)
+
+
+def _as_stored(storage, clock, context, prepared, row, policy, deadline) -> CaptureReceipt | None:
+    """A conflicted capture committed as the message its key holds, when it is that message dated anew.
+
+    A host can send a message again with a moment of its own (dsh's plugin sends a turn's reply with each later Stop
+    that carries its line): the same words under the same key, refused on the moment alone.  Each part whose key holds
+    a message of its role, origin and words takes that message's moment, and the capture commits as the message already
+    stored and leaves the inbox; re-keyed, it would be stored a second time.  Its receipt, or None when a part's key
+    holds nothing or other words, or the capture differs in more than its moment: a key collision, which is re-keyed.
+    """
+    events = []
+    with storage.read(context, remaining_seconds=max(0.001, deadline - time.monotonic())) as tx:
+        for event in prepared.events:
+            stored = tx.sources.source_by_event_key(event["source_event_key"], event["source_revision"])
+            words = hashlib.sha256(event["content"].encode("utf-8")).hexdigest()
+            if stored is None or (stored.event["role"], stored.event["origin"], stored.content_sha256) != (
+                event["role"],
+                event["origin"],
+                words,
+            ):
+                return None
+            events.append(
+                {**event, "occurred_at": stored.event["occurred_at"], "time_precision": stored.event["time_precision"]}
+            )
+    receipt = _commit(
+        storage,
+        clock,
+        context,
+        row["token"],
+        PreparedCapture(tuple(events), prepared.gaps),
+        row["scope_id"],
+        policy,
+        deadline,
+    )
+    return None if receipt.disposition == "conflict" else receipt
 
 
 def _revalidated(storage, context, row, authorize, deadline, *, rekey):

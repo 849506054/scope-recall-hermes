@@ -7,9 +7,6 @@ for Hermes, `<instance-root>\codex-installation.json` for Codex. The
 behaviour: budgets, the vector companion, and the external model routes. This
 document is a reference for the second file.
 
-The former 2.x `config.json` key reference lived here until the 2.x engine was
-removed; it remains in repository history at tag `v2.0.1`.
-
 ## Where the file goes
 
 `runtime-config.json` belongs in the Core data directory, beside `memory.sqlite3`:
@@ -133,7 +130,7 @@ defaults a standalone worker pass uses.
 | `max_auto_recoveries` | int | `2` | 0–4 | Automatic retries a recoverable failure gets. `0` disables automatic recovery; the failure then waits for `retry-failures`. |
 | `auto_recall_seconds` | number | `5.0` | 0.001–5.0 | Deadline for *automatic* recall on the read path. On timeout, recall degrades to lexical. |
 | `hook_processing_seconds` | number | `6.0` | 0.001–6.0 | Total budget a trusted-host hook has to answer. Must be at least `auto_recall_seconds`, so the hook can cover a full automatic recall; a smaller value fails the file with `hook_processing_seconds_must_cover_auto_recall`. |
-| `resident_recall_minutes` | int | unset | 0–1440 | For a client attached to a shared store (from 3.6.0): minutes its resident recall server stays up after the last prompt's recall and the last of the client's running MCP servers. Unset, the client's default applies: 120 for WorkBuddy, which runs the entry's MCP server only with a conversation's process, 120 for dsh, whose plugin runs each hook as a process of its own and whose headless runs are one process each, and none for Claude Code and Codex, whose server runs as long as the client. An entry with no runtime config file keeps none. **`0` keeps none**: a running server reads the value every 30 s and ends at 0. Each of the client's MCP servers decides at its own start whether it answers the hooks itself (0) or keeps the resident server, so a change reaches that side when the client starts it again: for Claude Code, Codex and dsh at the client's restart, for WorkBuddy with each conversation's process. While it runs the server holds a vector helper, about 1 GB. Under WorkBuddy it also ends with the conversation's agent process that started it, since that process ends every process it started. Read from the entry's own runtime config; a value outside the bounds or of another type (`true`, `"60"`, `2.0`) fails the whole runtime config, as any field's does. See [install.md](install.md), sections 12 and 13. |
+| `resident_recall_minutes` | int | unset | 0–1440 | For a client attached to a shared store: minutes its resident recall server stays up after the last prompt's recall and the last of the client's running MCP servers. Unset, the client's default applies: 120 for WorkBuddy, which runs the entry's MCP server only with a conversation's process, 120 for dsh, whose plugin runs each hook as a process of its own and whose headless runs are one process each, and none for Claude Code and Codex, whose server runs as long as the client. An entry with no runtime config file keeps none. **`0` keeps none**: a running server reads the value every 30 s and ends at 0. Each of the client's MCP servers decides at its own start whether it answers the hooks itself (0) or keeps the resident server, so a change reaches that side when the client starts it again: for Claude Code, Codex and dsh at the client's restart, for WorkBuddy with each conversation's process. While it runs the server holds a vector helper, about 1 GB. Under WorkBuddy it also ends with the conversation's agent process that started it, since that process ends every process it started. Read from the entry's own runtime config; a value outside the bounds or of another type (`true`, `"60"`, `2.0`) fails the whole runtime config, as any field's does. See [install.md](install.md), sections 12 and 13. |
 
 A running supervisor reads the file again before each pass, so an edited setting takes effect at
 its next pass. Only a file that names another store ends it, as `suspended` with the reason
@@ -142,9 +139,9 @@ its next pass. Only a file that names another store ends it, as `suspended` with
 `daily_work_limit` is not the spend guard. Money, calls and tokens are enforced
 per request by the auxiliary ledger (`runtime/model_budget.py`), which cannot see
 this counter, and this counter cannot see cost. A limit set below the rate at
-which work arrives is not thrift, it is a permanent backlog: the comment on the
-field records an instance where roughly fifteen work items arrived per captured
-source, so the old default of 256 could never drain one day's own output.
+which work arrives is not thrift, it is a permanent backlog: on one measured
+instance roughly fifteen work items arrived per captured source, so a limit of
+256 could never drain one day's own output.
 
 The maxima above are protections, not recommendations. `request_seconds` at
 45 seconds and `drain_seconds` at 120 seconds are the contract ceilings; a
@@ -203,17 +200,11 @@ unset and let recall stay lexical; a guessed threshold either admits noise as
 evidence or admits nothing at all.
 
 On a shared store (`docs/shared-store.md`) in the shipped space, the accepted
-value admits too much: the store holds every entry's memories. Measured on a copy
-of a store of nine entries (2026-09-30, on 3.4.5), two agents' sets of 20
-questions that have no answer were each given an unrelated memory for 12 of them
-at `0.653`, and for 2 of them from `0.68` up, as by words alone. At `0.653` the
-best memory the vector search offered such a question scored from 0.653 to
-0.691 (an offer is not always delivered), and the replies it found for the
-owner's questions asked again scored 0.722 or more. Over all 428 questions measured, `0.70`
-answered 23 more than `0.653` and one fewer, and two more than `0.68` and one
-fewer; `0.72` answered four more than `0.70` and two fewer, one of them a fact
-an agent had been told. So on a shared store in the shipped space whose runtime
-configs hold `0.653`, set `0.70` in each entry's runtime config. A store in
+value admits too much: the store holds every entry's memories, so a question
+with no answer meets far more unrelated memories just above `0.653`, while the
+replies that do answer the owner's questions score well above `0.70`. On a
+shared store in the shipped space whose runtime configs hold `0.653`, set `0.70`
+in each entry's runtime config. A store in
 another space, or one whose threshold was calibrated on it, keeps its own.
 `attach` copies the attached instance's value as it is.
 
@@ -256,13 +247,9 @@ particle, a preposition, a common verb or adverb, a time: `王芳对…`, `王�
 (`王芳芳`, `王芳林`); a name followed by a word outside that list is recalled as
 asked. List the name as it is written. A name of one character is never matched.
 
-Measured on a copy of a shared store of nine entries (2026-10-11, against 3.9.7):
-of 52 questions agents ask about the owner by name, each answered by one of the
-owner's own messages, 16 came back in the top five before and 27 after, none
-lost; asked as the recall tool asks them, 16 and 24 of the 48 that both runs
-searched by meaning; the same questions about a configured Chinese name (`王芳`),
-19 and 24 of 45. The owner's own 173 questions, which name no one, came back
-exactly as before.
+The second search brings more of the owner's own messages into the top results
+for questions that name the owner, and loses none; questions that name no one
+are recalled as they would be without it.
 
 ## `auxiliary`
 
@@ -304,7 +291,7 @@ Omitted, the policy is deliberately fail-closed: `cap_micro_usd`,
 | `total_input_cap` | int ≥ 0 or `null` | `0` | Selected-period input-token cap. Same `0` versus `null` distinction. |
 | `total_output_cap` | int ≥ 0 or `null` | `0` | Selected-period output-token cap. Same distinction. |
 | `total_call_cap` | int ≥ 0 or `null` | `0` | Selected-period request-count cap. Same distinction. |
-| `max_request_bytes` | int ≥ 1 | `128000` | Largest request body the ledger lets out, counted after JSON encoding. A candidate evaluation's messages may hold 64,000 bytes, and the request escapes their quotes, backslashes and line breaks again: measured at the full budget, about 66,000 bytes for prose and 85,000 for code or JSON, and at most twice the messages. A cap below that refuses such evaluations: the item fails as `request_too_large` (before 3.10.3 it waited forever as `budget_unavailable`) and `retry-failures` re-opens it once the cap is raised. |
+| `max_request_bytes` | int ≥ 1 | `128000` | Largest request body the ledger lets out, counted after JSON encoding. A candidate evaluation's messages may hold 64,000 bytes, and the request escapes their quotes, backslashes and line breaks again: measured at the full budget, about 66,000 bytes for prose and 85,000 for code or JSON, and at most twice the messages. A cap below that refuses such evaluations: the item fails as `request_too_large` and `retry-failures` re-opens it once the cap is raised. |
 | `default_reserve_input` | int ≥ 1 | `32768` | Input tokens reserved before usage is known. |
 | `default_reserve_output` | int ≥ 1 | `4096` | Output tokens reserved before usage is known. |
 | `model_reserve_output` | mapping of model to int ≥ 1 | one shipped entry | Per-model override of the output reservation. |
@@ -374,7 +361,7 @@ The default kind is an OpenAI-compatible chat-completions route
 | Key | Type | Default | Meaning |
 |-----|------|---------|---------|
 | `model` | string, non-empty | required | Model name. It must also be in `budget.approved_models` and `budget.pricing`. |
-| `endpoint` | URL | required | Full chat-completions URL. Not a base URL: no path is appended. `https://` to any host; `http://` to a loopback host, or to a non-loopback host only with `allow_insecure_endpoint`. |
+| `endpoint` | URL | required | Full chat-completions URL. `https://` to any host; `http://` to a model server on this machine (a loopback host), or to another host only with `allow_insecure_endpoint`: the embedding route's rule. User-info, fragments and credential-bearing query keys are refused. Over plain HTTP the key is not sent, so a local server that needs none still names a `credential_env` holding any value. |
 | `credential_env` | string matching `^[A-Z][A-Z0-9_]{0,127}$` | required | Name of the environment variable holding the API key. |
 | `output_limit_field` | `"max_tokens"` or `"max_completion_tokens"` | required | Which field this provider expects the output limit in. |
 | `max_output_tokens` | int, 1–131072 | required | Value sent in that field. |
@@ -384,7 +371,27 @@ The default kind is an OpenAI-compatible chat-completions route
 | `stream` | boolean | `false` | Must stay `false`; streaming is refused. |
 | `n` | int | `1` | Must stay `1`. |
 | `headers` | mapping or absent | absent | Extra request headers, validated before use. A second `Authorization` cannot be smuggled in this way. |
-| `allow_insecure_endpoint` | literal `true` or `false` | `false` | Permits plaintext `http://` to a host that is not loopback, for a gateway served on the operator's own network without TLS. The text being consolidated then crosses that network unencrypted: state it only for a network you trust. A plaintext request carries no credential header, so a gateway reachable only over HTTPS is out of reach this way. |
+| `allow_insecure_endpoint` | literal `true` or `false` | `false` | Permits plaintext `http://` to a host that is not loopback, as in `auxiliary.embedding`. **What is consolidated, your memory, then crosses the network unencrypted: turn it on only for a server on a network you trust.** A model server on a loopback host needs no opt-in, and a quoted `"true"` is refused. |
+
+A chat answer is the text of the one choice's assistant message. One cut off at
+the output limit (`finish_reason: "length"`) fails as `DERIVATION_INVALID` on
+`model_output_truncated`. One the provider's policy stopped
+(`finish_reason: "content_filter"`, whatever text the message holds), or that
+the model refused (a `refusal` beside a `content` with no answer text: absent,
+blank, or a list of parts without text), fails as `model_refused`: no output
+limit is involved, so the item is not asked again. It is a terminal failure
+(`retry-failures` in [install.md](install.md)), and `--include-terminal` runs
+it again once the model, the route or the provider's policy has changed. One
+the provider ended without finishing
+(`finish_reason: "insufficient_system_resource"` or `"aborted"`, whatever text
+the message holds) fails as `model_output_interrupted`: a transient fault, not
+a failure by design. A consolidation is asked again as after a timeout and
+re-opened by the automatic recovery (`max_auto_recoveries`); a candidate
+evaluation, which is asked once, fails at once. A plain `retry-failures` run
+re-opens what is left. A pass that meets an interrupted answer stops asking
+for that kind of work for the rest of the pass, as after a 429, so an outage
+costs one request a pass; unlike a refusal, it was a billed answer, and counts
+as an attempt of its item.
 
 Setting `"kind": "openai_responses"` selects a Responses-API route instead of
 chat completions. It targets the documented contract of DeepSeek
@@ -394,17 +401,18 @@ another provider, and streaming is not implemented:
 | Key | Type | Default | Meaning |
 |-----|------|---------|---------|
 | `model` | string, non-empty | required | Model name, for example `deepseek-flash`. It must also be in `budget.approved_models` and `budget.pricing`. |
-| `endpoint` | URL | required | Full Responses URL. Not a base URL: no path is appended. `https://` to any host; `http://` to a loopback host, or to a non-loopback host only with `allow_insecure_endpoint`. |
+| `endpoint` | URL | required | Full Responses URL. Not a base URL: no path is appended. `https://` to any host; `http://` to a model server on this machine (a loopback host), or to another host only with `allow_insecure_endpoint`: the embedding route's rule. User-info, fragments and credential-bearing query keys are refused. Over plain HTTP the key is not sent, so a local server that needs none still names a `credential_env` holding any value. |
 | `credential_env` | string matching `^[A-Z][A-Z0-9_]{0,127}$` | required | Name of the environment variable holding the API key. It is read per request and never written to the ledger; the key travels only in the `Authorization` header, as a `Bearer` token that extra `headers` cannot override. |
 | `max_output_tokens` | int, 1–131072 | required | Sent as `max_output_tokens`. On a thinking route this bounds the visible answer **and** the reasoning tokens. |
 | `reasoning_effort` | `"none"`/`"low"`/`"high"`/`"max"`, or absent | absent | Sent as `reasoning.effort`; absent leaves the provider's own default. |
 | `text_format` | `{"type": "json_object"}` or absent | absent | Sent as `text.format`. Plain text is the default and is expressed by omitting the key; a JSON schema is refused rather than forwarded unvalidated. |
 | `stream` | boolean | `false` | Must stay `false`; streaming is refused. |
 | `kind` | `"openai_responses"` | required | Selects this route. |
-| `allow_insecure_endpoint` | literal `true` or `false` | `false` | The same plaintext opt-in as the chat route above. |
+| `allow_insecure_endpoint` | literal `true` or `false` | `false` | Permits plaintext `http://` to a host that is not loopback, as in `auxiliary.embedding`. **What is consolidated, your memory, then crosses the network unencrypted: turn it on only for a server on a network you trust.** A model server on a loopback host needs no opt-in, and a quoted `"true"` is refused. |
+
 Unknown keys in this block are rejected (`consolidation_unknown_config`) rather
-than ignored, the way the `codex_cli` block already behaves: this dialect is new
-and has no legacy key to stay compatible with.
+than ignored, as in the `codex_cli` block: this dialect has no legacy key to stay
+compatible with.
 
 The request explicitly carries `store: false`. DeepSeek documents this parameter
 as unsupported/ignored and its API as stateless; this flag is not a substitute
@@ -414,16 +422,19 @@ including interleaved `system` messages. Text parts use `input_text` for `system
 and `user`, and `output_text` for `assistant`. A `tool` message is refused
 (`input_invalid`): function-call item pairs are not implemented by this adapter.
 
-Only a response whose own `status` is `completed` is an answer. `incomplete`
-currently fails as `DERIVATION_INVALID` on
-`model_output_truncated`, exactly like a chat answer cut off at the output
-limit (the diagnostic does not yet distinguish content filtering from the
-token limit); `failed` fails as `response_status_failed`. From a completed response the
+Only a response whose own `status` is `completed` is an answer. An `incomplete`
+one says why in `incomplete_details.reason`: `max_output_tokens`, or no reason
+at all, fails as `DERIVATION_INVALID` on `model_output_truncated`, exactly like
+a chat answer cut off at the output limit; `content_filter` fails as
+`model_refused`, like a chat answer the provider's policy stopped; any other
+reason fails as `unsupported_response_shape`. `failed` fails as
+`response_status_failed`, a transient fault recovered like a timeout: asked
+again, then re-opened by the automatic recovery (`max_auto_recoveries`). From a completed response the
 adapter reads only the `output_text` parts of `assistant` message items —
 `reasoning` items and `reasoning_text` parts are never treated as an answer, a
 refusal part fails as `model_refused`, and an answer with no text fails as
-`empty_output`. The text is handed to the existing proposal validator
-unchanged, with no JSON repair.
+`empty_output`. The text is handed to the proposal validator unchanged, with
+no JSON repair.
 
 Usage is read as `input_tokens`/`output_tokens`, with
 `input_tokens_details.cached_tokens` recorded for observation.
@@ -644,7 +655,7 @@ state, and recalls without holding it. With a timeout of 0 or less, which Hermes
 reads as none, a hook waits at most 10 s. A finished turn is written one capture
 at a time, so the next turn's hooks get in between; its message and reply are
 dated when its writing began, and a shutdown waits for it. A tool result is written
-without holding its session (from 3.5.1), so a step's parallel tool calls do not
+without holding its session, so a step's parallel tool calls do not
 wait for one another's writes; those still take turns at the store's one writer,
 each within its own budget. After its write a tool hook takes its session back once
 more, which can wait behind a message being captured. A shutdown waits up to 10 s

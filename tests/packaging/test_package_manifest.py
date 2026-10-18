@@ -1,7 +1,6 @@
 """The version and the wheel module list must be derived, not retyped.
 
-Six of the eight packaging failures on 2026-09-13 were new modules missing from
-a hand-copied allowlist, plus three version strings that had drifted apart.
+A hand-copied allowlist misses new modules, and version strings drift apart.
 These tests make both conditions loud and tell the reader the one command that
 fixes them.
 """
@@ -97,8 +96,8 @@ def _read(name: str) -> str:
 
 
 def test_the_readme_names_the_version_being_shipped() -> None:
-    """It said rc10 while the package said rc11: the first thing a reader
-    checks was the one thing nothing verified."""
+    """The version the README names is the package's: the first thing a reader checks is the one thing nothing
+    else verifies."""
     version = inventory.source_version(REPO_ROOT)
     readme = _read("README.md")
     assert f"`{version}`" in readme, f"README.md does not mention {version}; update it when bumping _version.py"
@@ -108,6 +107,26 @@ def test_the_readme_does_not_still_advertise_an_older_candidate() -> None:
     version = inventory.source_version(REPO_ROOT)
     stale = [line.strip() for line in _read("README.md").splitlines() if "3.1.0rc" in line and version not in line]
     assert not stale, f"README.md still names an older candidate: {stale}"
+
+
+def test_the_readme_installs_the_vector_extra_and_no_older_release() -> None:
+    """The README's install commands carry ``[lancedb]`` and pin no older release: whoever follows the first page
+    (PyPI shows it too) gets the current release and recall with vectors."""
+    import re
+
+    version = inventory.source_version(REPO_ROOT)
+    readme = _read("README.md")
+    installs = [line.strip() for line in readme.splitlines() if "pip install" in line and "hermes-scope-recall" in line]
+    assert installs, "README.md has no install command"
+    assert all("[lancedb" in line for line in installs), f"an install without the vector extra: {installs}"
+    # Unpinned, pip keeps an older install that satisfies the name and only adds the extra.
+    unpinned = [line for line in installs if "==" not in line]
+    assert all(" -U " in line or " --upgrade " in line for line in unpinned), f"no upgrade: {unpinned}"
+    pins = re.findall(r"hermes-scope-recall(?:\[[^\]]*\])?==([0-9][^\s\"'`]*)", readme)
+    assert all(pin == version for pin in pins), f"README.md pins {pins}; this is {version}"
+    # The 3.1.0 notes hold the 2.0.x migration; any other release link must be this one or "latest".
+    tags = re.findall(r"releases/tag/v([0-9][^\s)\"'`]*)", readme)
+    assert all(tag in {version, "3.1.0"} for tag in tags), f"README.md links releases {tags}"
 
 
 def test_the_changelog_has_an_entry_for_this_version() -> None:
@@ -130,11 +149,9 @@ def _git(*args):
 
 
 def test_a_tagged_version_is_not_reused_for_a_different_tree():
-    """rc23 was tagged and installed, then a behaviour change was committed under
-    the same version. For about an hour the repository and the live instance ran
-    different code behind the identical string `3.1.0rc23`, and nothing on the
-    instance could tell them apart -- the divergence was found by hashing a file.
-    A version that already names a tree may not name a second one."""
+    """A version that already names a tree may not name a second one: a behaviour change committed under a tagged
+    and installed version leaves the repository and the live instance running different code behind the
+    identical string, with nothing on the instance to tell them apart."""
     from scope_recall._version import __version__
 
     code, _ = _git("rev-parse", "--git-dir")

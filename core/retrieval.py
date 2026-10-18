@@ -15,11 +15,11 @@ from datetime import tzinfo
 from typing import Literal
 
 from ..contracts import ContractError, RecallRequest, TrustedContext, utc_timestamp, validate_model_request
-from .recall_scope import QueryScope
+from .recall_scope import QueryScope, QueryTime
 
 ObjectKind = Literal["event", "claim", "episode", "artifact", "reference"]
 CandidateChannel = Literal[
-    "lexical", "claim_lexical", "exact_ref", "vector", "recent_raw", "relation", "background", "scoped"
+    "lexical", "claim_lexical", "exact_ref", "vector", "recent_raw", "relation", "background", "scoped", "dated"
 ]
 RecallMode = Literal["auto", "current", "history", "as_of", "method"]
 Coverage = Literal["complete_for_query", "partial", "unknown"]
@@ -65,10 +65,10 @@ class SearchLimits:
             "candidate_pool": (self.candidate_pool, 1, 200),
             "recent_items": (self.recent_items, 0, 24),
             "relation_hops": (self.relation_hops, 0, 2),
-            # The ceiling used to equal the default, so an operator who noticed
-            # relation_bound_reached could not raise it.  Claims now also have
-            # their own channel (``RetrievalStorage.claims``); expansion still
-            # brings in the claims and episodes around what was retrieved.
+            # The ceiling is well above the default, so an operator who notices
+            # relation_bound_reached can raise it.  Claims also have their own
+            # channel (``RetrievalStorage.claims``); expansion still brings in the
+            # claims and episodes around what was retrieved.
             "relation_objects": (self.relation_objects, 0, 200),
             "vector_limit": (self.vector_limit, 0, 200),
             "followups": (self.followups, 0, 1),
@@ -111,6 +111,14 @@ class SearchContext:
     zone: tzinfo | None = None
     #: The days and entries the question names, read once the store's entries are known (``RetrievalPipeline``).
     scope: QueryScope | None = None
+    #: The time the question names (``recall_scope.query_time``), read once for a recall of what holds now and never
+    #: for a historical or as-of read (``RetrievalPipeline``): what was said then ranks first, and is searched for the
+    #: question's other words (``RetrievalStorage.dated``).
+    time: QueryTime | None = None
+    #: Since when the asking host's model still holds this session's own turns word for word: its last compaction,
+    #: or the session's start when it has had none.  An automatic recall leaves out what stands only on those turns
+    #: (``RetrievalPipeline._in_context``).  A trusted caller's word, never a request field; None when unknown.
+    in_context_since: str | None = None
 
     def __post_init__(self) -> None:
         if type(self.query) is not str or not self.query.strip() or len(self.query) > 8192:
@@ -123,6 +131,10 @@ class SearchContext:
             raise ContractError("INPUT_INVALID", "zone")
         if self.scope is not None and not isinstance(self.scope, QueryScope):
             raise ContractError("INPUT_INVALID", "scope")
+        if self.time is not None and not isinstance(self.time, QueryTime):
+            raise ContractError("INPUT_INVALID", "time")
+        if self.in_context_since is not None:
+            object.__setattr__(self, "in_context_since", utc_timestamp(self.in_context_since))
         if self.mode not in {"auto", "current", "history", "as_of", "method"}:
             raise ContractError("INPUT_INVALID", "mode")
         if self.mode == "as_of" and self.as_of is None:
@@ -150,6 +162,7 @@ class SearchContext:
         current_source_refs: tuple[str, ...] = (),
         background_without_evidence: bool = True,
         zone: tzinfo | None = None,
+        in_context_since: str | None = None,
     ) -> "SearchContext":
         payload = validate_model_request(
             "recall_request", dict(request) if isinstance(request, dict) else request, trusted_context
@@ -168,6 +181,7 @@ class SearchContext:
             request_id=payload["request_id"],
             background_without_evidence=background_without_evidence,
             zone=zone,
+            in_context_since=in_context_since,
         )
 
 
@@ -217,6 +231,7 @@ class CandidateRef:
             "relation",
             "background",
             "scoped",
+            "dated",
         }:
             raise ContractError("INPUT_INVALID", "candidate_source")
         if type(self.rank) is not int or self.rank < 1:

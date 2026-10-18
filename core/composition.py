@@ -100,7 +100,7 @@ class MemoryCore:
         self.storage = (
             storage
             if storage is not None
-            else SQLiteStorage(config.binding, timeout_seconds=config.write_timeout_seconds)
+            else SQLiteStorage(config.binding, timeout_seconds=config.write_timeout_seconds, clock=self.clock.monotonic)
         )
         if self.storage.binding != config.binding:
             raise ValueError("storage binding differs from core binding")
@@ -127,12 +127,18 @@ class MemoryCore:
         return self.storage.initialize()
 
     def status(
-        self, context: TrustedContext, *, include_admission: bool = True, include_queue_age: bool = True
+        self,
+        context: TrustedContext,
+        *,
+        include_admission: bool = True,
+        include_queue_age: bool = True,
+        remaining_seconds: float | None = None,
     ) -> StoreStatus:
         """Queue and store standing.  The admission counts scan every source's JSON and the
         queue age walks every queued row, so a caller that only needs the queue's depth says
-        so and skips both."""
-        with self.storage.read(context) as tx:
+        so and skips both.  ``remaining_seconds`` bounds the read's wait for the store's lock,
+        which is otherwise the core's write timeout."""
+        with self.storage.read(context, remaining_seconds=remaining_seconds) as tx:
             return tx.status(include_admission=include_admission, include_queue_age=include_queue_age)
 
     def memory_epoch(self, context: TrustedContext) -> int:
@@ -171,8 +177,8 @@ class MemoryCore:
 
         if type(ref) is str and ref.startswith(RECALL_DIAGNOSTIC_PREFIX):
             # A recall packet's ``diagnostic_ref`` names a record this process keeps for its last recalls
-            # (``recall_diagnostics``), never a stored object: looked up in the store it was always SOURCE_MISSING
-            # (yuheng's audit of 3.4.2).  Only the session that recalled reads it, and only counts and gap codes.
+            # (``recall_diagnostics``), never a stored object: looked up in the store it would always be
+            # SOURCE_MISSING.  Only the session that recalled reads it, and only counts and gap codes.
             if revision not in (None, 1):
                 raise ContractError("INPUT_INVALID", "revision")
             record = self.recall_diagnostics.get(ref)
@@ -268,6 +274,7 @@ class MemoryCore:
         deadline_seconds: float | None,
         background_without_evidence: bool,
         zone: tzinfo | None,
+        in_context_since: str | None = None,
     ) -> tuple[SearchContext, float]:
         """A recall request's search context, and the seconds it was given: the caller's, else the core's for an
         automatic recall and 2 for any other; an automatic recall never gets more than the core's."""
@@ -292,6 +299,7 @@ class MemoryCore:
             current_source_refs=tuple(current_source_refs),
             background_without_evidence=background_without_evidence,
             zone=zone,
+            in_context_since=in_context_since,
         )
         return search_context, effective_deadline
 
@@ -324,15 +332,18 @@ class MemoryCore:
         deadline_seconds: float | None = None,
         background_without_evidence: bool = True,
         zone: tzinfo | None = None,
+        in_context_since: str | None = None,
     ):
         """Retrieve once, compile once, and return the public RecallPacket contract.
 
         Explicit tool lookups pass ``background_without_evidence=False``: a
         query that finds nothing then compiles to ``no_match`` rather than to
-        ambient preferences a caller could read as the answer.
+        ambient preferences a caller could read as the answer.  A host whose
+        model still holds this session's turns says since when
+        (``in_context_since``, see :class:`SearchContext`).
         """
         search_context, effective_deadline = self._search_context(
-            context, request, current_source_refs, deadline_seconds, background_without_evidence, zone
+            context, request, current_source_refs, deadline_seconds, background_without_evidence, zone, in_context_since
         )
         # Candidate collection is optional work. Reserve part of the original
         # deadline for the mandatory fresh SQLite release checks and rendering.

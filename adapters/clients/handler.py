@@ -17,7 +17,6 @@ from scope_recall.core.capture_inbox import DELETED_KEY
 from scope_recall.runtime.instance_config import RuntimeInstanceConfig
 
 from ..runtime_wiring import strict_hook_budget
-from . import transcript
 from .boundary import (
     is_workbuddy_agent_run,
     without_lone_surrogates,
@@ -26,7 +25,7 @@ from .config import CodexConfigError, CodexInstallationConfig, SharedClientConfi
 from .hook_answer import (
     HookDiagnostics,
 )
-from .hook_events import CAPTURE_TIMEOUT_S, RUNTIME_ATTACH_MIN_S, HookEvents
+from .hook_events import CAPTURE_TIMEOUT_S, PROMPT_CAPTURE_TIMEOUT_S, RUNTIME_ATTACH_MIN_S, HookEvents
 from .identity import resolve_runtime_audience, trusted_context
 from .prompt_recall import PromptRecall
 from .record_reader import RecordLines, RecordReader
@@ -46,8 +45,8 @@ _TOTAL_BUDGET_S = 2.0
 _SUPPORTED_EVENTS = frozenset({"SessionStart", "UserPromptSubmit", "Stop", "PostToolUse", "Interrupt", "SessionEnd"})
 #: Clients whose prompt hook may run the entry's ``hook_processing_seconds`` (at most 6 s) from the
 #: start.  Both wait 15 s for a prompt's hook (``maintenance/install_claude_code.py``,
-#: ``maintenance/install_codex.py``), and recall on the pilot's shared store took 2.7-5.7 s: with 2 s most
-#: automatic recalls came back empty, as Codex's did until 3.4.0rc5.  The budget bounds the work; the hook
+#: ``maintenance/install_codex.py``), and recall on a shared store took 2.7-5.7 s: with 2 s most
+#: automatic recalls would come back empty.  The budget bounds the work; the hook
 #: answers as soon as it is done.  WorkBuddy waits 60 s unless its hook says otherwise, and a prompt hook
 #: that runs past its wait blocks the prompt: the budget is what keeps it inside.
 _CONFIGURED_PROMPT_BUDGET = frozenset({"claude-code", "codex", "workbuddy", "dsh"})
@@ -83,6 +82,8 @@ class HookCall:
     queued: bool = False
     #: The turn a WorkBuddy Stop closed and the words of its reply, for the read of the record after it.
     closed_reply: tuple[str, str] | None = None
+    #: The id of the line holding the reply a dsh Stop stored, and its turn, for the read of the lines after it.
+    reply_line: tuple[str, str] | None = None
     #: Whether this hook may open the session record its payload names: a client on another machine sends its lines.
     local_record: bool = True
     #: That client's word that its Stop's reply is an error its record marks.
@@ -91,6 +92,14 @@ class HookCall:
     @property
     def captured(self) -> bool:
         return self.persisted or self.queued
+
+
+def _hook_core(config: CodexInstallationConfig | SharedClientConfig, clock: HookClock | None) -> MemoryCore:
+    """The core a hook captures through until its trusted runtime attaches: its writes may wait for the writer lease as
+    long as the owner's prompt asks (``PROMPT_CAPTURE_TIMEOUT_S``); every other capture asks for its 1 s.  A store waits
+    no longer than its core's write timeout, whatever a capture asks, and at the default 1 s a prompt that met a lease
+    held longer would not be stored."""
+    return MemoryCore(CoreConfig(config.to_binding(), write_timeout_seconds=PROMPT_CAPTURE_TIMEOUT_S), clock=clock)
 
 
 class CodexHookHandler:
@@ -113,7 +122,7 @@ class CodexHookHandler:
                 raise CodexConfigError("injected core mismatch")
             self.core = host_runtime.core
         elif core is None:
-            self.core = MemoryCore(CoreConfig(config.to_binding()), clock=clock)
+            self.core = _hook_core(config, clock)
         else:
             if core.config.binding != config.to_binding():
                 raise CodexConfigError("injected core binding mismatch")
@@ -157,7 +166,7 @@ class CodexHookHandler:
         if host_runtime is None and core is None:
             # Capture uses a basic Core first.  Trusted runtime attach
             # (Lance/aux/worker) waits until after a durable Source commit.
-            core = MemoryCore(CoreConfig(config.to_binding()), clock=clock)
+            core = _hook_core(config, clock)
             handler = cls(config, core=core, clock=clock, hook_started_at=hook_started_at)
             handler._pending_runtime_config_path = trusted_runtime_config_path
             return handler
@@ -189,7 +198,7 @@ class CodexHookHandler:
         ``clock``'s time for when it stored them.
         """
         config = load_shared_client(home, host)
-        core = MemoryCore(CoreConfig(config.to_binding()), clock=clock)
+        core = _hook_core(config, clock)
         handler = cls(
             config, core=core, clock=event_clock if event_clock is not None else clock, hook_started_at=hook_started_at
         )
@@ -370,7 +379,7 @@ class CodexHookHandler:
             return self.events.prompt(session_id, audience, payload, deadline)
         if self.host == "codex" and in_suggestions_thread(self.config, session_id, ended=event == "SessionEnd"):
             # The rest of a thread Codex opened to ask the model for suggestions: its tool calls, its answer and its
-            # end are Codex's own activity.  On the pilot one thread left four tool outputs of 2-11 kB and an end
+            # end are Codex's own activity.  In one store such a thread left four tool outputs of 2-11 kB and an end
             # marker after its request and answer had been kept out.
             self.note("host_generated_thread")
             return {}
@@ -406,9 +415,10 @@ class CodexHookHandler:
 
     def _session_started(self, session_id: str, audience, deadline: float) -> dict[str, Any]:
         if isinstance(self.config, SharedClientConfig):
-            # An entry starts no worker, and its binding was checked when the config loaded.  The
-            # status a local installation reads here counts the whole store: 7-8 s on the pilot's
-            # shared store of 277,000 sources, past Codex's 2 s hook timeout at every session start.
+            # An entry starts no worker, and its binding was checked when the config loaded, so its session start
+            # returns at once.  The status a local installation's session start reads (``events.session_start``) counts
+            # the whole store: on a shared store of 277,000 sources, 7-8 s, past Codex's 2 s hook timeout at every
+            # session start.
             return {}
         if (
             self.events.session_start(session_id, audience, deadline)
@@ -433,15 +443,23 @@ class CodexHookHandler:
         if self.host == "dsh" and record is None:
             # The turn's messages as dsh's plugin kept them (it has no record a hook could open), read as a remote
             # client's lines; the answer says how many are stored, so the plugin drops those and sends the rest again.
-            record = RecordLines(start=0, lines=transcript.dsh_lines(payload.get("record")))
-        capture = self.events.stop if event == "Stop" else self.events.session_end
-        result = capture(session_id, audience, payload, deadline)
+            record = RecordLines.from_dsh(payload)
+        if event == "Stop":
+            result = self.events.stop(session_id, audience, payload, deadline, record=record)
+        else:
+            result = self.events.session_end(session_id, audience, payload, deadline)
         # A server for a client on another machine reads only the lines that client sent (``local_record``
         # False): the payload's transcript_path names a file over there, and a path from a request is never
         # opened here.
         if self.record_reader.reads(event) and (record is not None or local_record):
             self.record_reader.read(
-                session_id, audience, payload, deadline, remote=record, closed_reply=self.call.closed_reply
+                session_id,
+                audience,
+                payload,
+                deadline,
+                remote=record,
+                closed_reply=self.call.closed_reply,
+                reply_line=self.call.reply_line,
             )
         if self.host == "workbuddy" and event == "SessionEnd":
             forget_turns(self.config, session_id)
@@ -561,8 +579,8 @@ class CodexHookHandler:
 
 
 #: What a runtime config that does not name ``hook_processing_seconds`` runs: the worker's default.  No
-#: installer writes the key, so without this an entry's hooks fell back to 2 s, and most automatic recalls
-#: came back empty.
+#: installer writes the key, so without this an entry's hooks would fall back to 2 s, and most automatic
+#: recalls would come back empty.
 _DEFAULT_CONFIGURED_BUDGET_S = RuntimeInstanceConfig.hook_processing_seconds
 
 

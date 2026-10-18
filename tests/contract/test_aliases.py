@@ -70,6 +70,7 @@ def test_alias_target_from_other_project_is_not_accepted(app):
         "TEST-mist 项目改名为 TEST暮光吗？",
         "TEST-mist 项目改名为 TEST暮光吗",
         "TEST-mist 如果改名为 TEST暮光，就保留旧称。",
+        "要是 TEST-mist 改名为 TEST暮光，就保留旧称。",
         "TEST-mist 不是改名为 TEST暮光，仍叫 TEST晨雾。",
     ],
 )
@@ -220,7 +221,7 @@ def _said(text, *, principal=("human", "verified"), origin="human_direct"):
 
 
 def _naming_alias(root, name, *, target_ref=None):
-    """The shape the consolidation model gave the pilot: an alias of a thing nothing yet names, targeting the message itself."""
+    """The shape a consolidation model hands back: an alias of a thing nothing yet names, targeting the message itself."""
     return dict(
         kind="alias",
         subject="我的猫咪",
@@ -276,7 +277,7 @@ def test_only_a_first_hand_naming_statement_is_reframed(root, target_ref):
 
 
 def test_a_naming_alias_an_earlier_release_stored_is_repaired_into_the_fact(app, monkeypatch):
-    """The pilot's store already holds the cat's name as an unproved alias; the frame repair re-frames it."""
+    """A store already holds the cat's name as an unproved alias; the frame repair re-frames it."""
     from scope_recall.contracts import TrustedSourcePrincipal
     from scope_recall.core import claim_normalization, mutate
 

@@ -11,7 +11,7 @@ from functools import partial
 from typing import Callable, Protocol
 
 from ..contracts import ContractError
-from .delete_storage import purge_work_parts
+from .delete_storage import purge_finished, purge_work_parts
 from .file_lock import advisory_file_lock
 from .retained_artifacts import RetainedBlob, erase_retained
 from .source_records import StoredSource
@@ -139,8 +139,8 @@ def prepare_embed_group(storage, clock, context, items, *, embed, started: float
 
     A refusal that is the provider's -- capacity or budget -- raises ``EmbedGroupRefused``
     instead.  Asking again one member at a time is the same refusal times the group's size:
-    a group of five hundred sent that way after one refused request spent its whole pass on
-    sixty-seven members and let the rest of the group's leases run out.
+    a group of five hundred sent that way after one refused request would spend its whole pass
+    on sixty-seven members and let the rest of the group's leases run out.
     """
     if len(items) < 2 or budget_left(started, clock, budget) <= 0:
         return {}
@@ -167,9 +167,10 @@ def _prepare_in_halves(batch, members: list, *, clock, started: float, budget: f
 
     One text the request guard refuses -- a message holding something shaped like a key -- or
     one the provider rejects fails the whole request.  Falling back to one request per member
-    made a single such text cost the group's size in requests, and a group larger than its lease
-    covers went back and failed the same way the next pass.  Halving costs a few requests and
-    leaves the one bad text, alone, to fail for itself.  A half of one is left to ask for itself.
+    would make a single such text cost the group's size in requests, and a group larger than its
+    lease covers would go back and fail the same way the next pass.  Halving costs a few requests
+    and leaves the one bad text, alone, to fail for itself.  A half of one is left to ask for
+    itself.
     """
     if len(members) < 2 or budget_left(started, clock, budget) <= 0:
         return {}
@@ -194,11 +195,11 @@ def publish_embed_group(
 ) -> dict:
     """Write a group's vectors in one fenced commit per kind; answer with each written member's fence.
 
-    The store's write API is plural and the adapter used it one row at a time, so a pass paid
-    a lock-held handshake and a dataset commit per source -- nine times the cost of one commit
-    carrying the group.  The fence does not weaken: the guard verifies every member's lease,
-    subject and derivation while the helper holds the lock, and a group it refuses writes
-    nothing, leaving every member to publish on its own fence exactly as before.
+    The store's write API is plural; used one row at a time, a pass would pay a lock-held
+    handshake and a dataset commit per source -- nine times the cost of one commit carrying
+    the group.  The fence does not weaken: the guard verifies every member's lease, subject
+    and derivation while the helper holds the lock, and a group it refuses writes nothing,
+    leaving every member to publish on its own fence.
 
     The result maps ``(subject_ref, subject_revision)`` to the derivation fence read before the
     commit, which is what recording the member afterwards checks against.
@@ -289,7 +290,7 @@ def _publish_kind(
             remaining_seconds=budget_left(started, clock, budget),
         )
     except Exception:
-        # Nothing was written, or the guard refused the group: each member now
+        # Nothing was written, or the guard refused the group: each member
         # publishes on its own fence and records its own outcome.
         return {}
     return {(item.subject_ref, item.subject_revision): fences[item.work_id] for item, _subject in members}
@@ -298,14 +299,14 @@ def _publish_kind(
 def complete_embed_group(storage, clock, context, items, *, published: dict, started: float, budget: float) -> dict:
     """Record the group's published members together; each one's outcome by work id.
 
-    Each member used to answer for itself in three transactions -- read it, guard it, complete
-    it -- after the group's requests and its one commit had done the work.  At about sixty
-    milliseconds a member, a group of five hundred spent thirty seconds on that, and a group of
-    a thousand outlived its sixty-second lease: vectors already paid for were dropped as stale
-    and embedded again the next pass.  The checks are the single path's last ones, made under
-    the write transaction that records the verdict: the subject is still live, its derivation
-    has not moved since the commit's fence was read, and ``complete`` verifies the lease.  A
-    chunk that fails records nothing, and its members answer for themselves as before.
+    Answering for itself in three transactions -- read it, guard it, complete it -- after the
+    group's requests and its one commit had done the work, each member would take about sixty
+    milliseconds: thirty seconds for a group of five hundred, and a group of a thousand would
+    outlive its sixty-second lease, its vectors already paid for dropped as stale and embedded
+    again the next pass.  The checks are the single path's last ones, made under the write
+    transaction that records the verdict: the subject is still live, its derivation has not
+    moved since the commit's fence was read, and ``complete`` verifies the lease.  A chunk that
+    fails records nothing, and its members answer for themselves.
     """
     members = [item for item in items if (item.subject_ref, item.subject_revision) in published]
     outcomes: dict = {}
@@ -544,9 +545,13 @@ def _purge_layers(storage, clock, context, item, *, purge, started, budget, fini
         remaining = budget_left(started, clock, budget)
         if remaining <= 0:
             return deadline_result(storage, context, item)
-        now = clock.utc_now()
         try:
-            with storage.write(context, remaining_seconds=remaining) as tx:
+            # The scrub is committed: truncated now, the log keeps no frame from before it, so the page images that
+            # still held the deleted words leave the store's files; the frames this pass writes after it hold none of
+            # them.  A reader on an older snapshot holds the truncation back, and the purge stays queued.
+            truncated = storage.truncate_wal(context, remaining_seconds=remaining)
+            now = clock.utc_now()
+            with storage.write(context, remaining_seconds=budget_left(started, clock, budget)) as tx:
                 if not tx.work._verify_lease(*item.lease, now=now):
                     return stale_result(tx, item)
                 receipt = tx.deletions.receipt(operation_id)
@@ -555,7 +560,8 @@ def _purge_layers(storage, clock, context, item, *, purge, started, budget, fini
                 if receipt["layers"].get("vector_active") != "removed":
                     receipt = tx.deletions.mark_vector_active_removed(operation_id)
                 receipt = tx.deletions.finalize_attachments(operation_id, attachment_plan, erased=True)
-                if not receipt["active_content_removed"]:
+                receipt = tx.deletions.mark_sqlite_history(operation_id, removed=truncated)
+                if not purge_finished(receipt):
                     return work_result(
                         tx.work.fail(*item.lease, error_code="storage_unavailable", now=now, recoverable=True)
                     )
@@ -563,5 +569,6 @@ def _purge_layers(storage, clock, context, item, *, purge, started, budget, fini
         except Exception:
             # Physical layers may already be gone when the final CAS fails.
             # Keep the one work item retryable; the next pass inventories and
-            # idempotently acknowledges both native and attachment layers.
+            # idempotently acknowledges the native and attachment layers, and
+            # truncates the log again.
             return finish("retry", "storage_unavailable")

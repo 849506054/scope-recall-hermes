@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import ast
 import json
 import shutil
 import sys
 import tempfile
 from pathlib import Path
+
+import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPTS = ROOT / "scripts"
@@ -118,6 +121,21 @@ def test_watchdog_seconds_are_bounded_and_release_is_600() -> None:
     assert check.pytest_watchdog_seconds("integration", 0) == check.INTEGRATION_WATCHDOG_SECONDS
 
 
+def test_the_retrieval_tier_s_watchdog_carries_the_recall_bench_s_own_allowance() -> None:
+    """The recall bench builds a whole synthetic store before its tests run, more work on a slow runner than the
+    20s a file its tier gives: its allowance comes on top of them, after the release budget has capped them, so a
+    tier the cap already holds still gets all of it, and the sum is still a bound."""
+    bench = "tests/recall_bench/test_recall_bench.py"
+    selected = list(check.SUITES["retrieval"])
+    rest = [path for path in selected if path != bench]
+    assert bench in selected
+    assert check.HEAVY_FILE_SECONDS[bench] == 600
+    assert check.pytest_watchdog_seconds("retrieval", len(rest), rest) == 180 + 20 * len(rest)
+    assert check.pytest_watchdog_seconds("retrieval", len(selected), selected) == 180 + 20 * len(selected) + 600
+    assert check.pytest_watchdog_seconds("retrieval", 1, [bench]) == 800
+    assert check.pytest_watchdog_seconds("retrieval", 40, [bench]) == check.RELEASE_WATCHDOG_SECONDS + 600
+
+
 def test_release_wrapper_records_actual_600s_watchdog(monkeypatch, tmp_path: Path) -> None:
     captured: dict[str, object] = {}
     (tmp_path / "tests" / "unit").mkdir(parents=True)
@@ -178,3 +196,57 @@ def test_pytest_and_cleanup_success_is_zero(monkeypatch, tmp_path: Path) -> None
     assert "pytest_completed_waiting_cleanup" in receipt["transition_history"]
     assert "cleanup_succeeded" in receipt["transition_history"]
     assert "cleanup_failed" not in log
+
+
+# --- one table says what each tier's runs may do ------------------------------
+
+
+def test_the_process_tiers_are_the_tiers_the_table_lists() -> None:
+    assert check.PROCESS_TIERS == frozenset(check.TIER_ALLOWS)
+    assert set(check.TIER_ALLOWS) <= set(check.SUITES)
+
+
+@pytest.mark.parametrize("tier", sorted(check.SUITES))
+def test_a_tier_gets_the_helpers_the_table_lets_it_use(tier) -> None:
+    allows = check.TIER_ALLOWS.get(tier, frozenset())
+
+    assert (check.packaging_helper_env(tier) != {}) <= ("build" in allows)
+    assert (check.node_helper_env(tier) != {}) <= ("node" in allows)
+
+
+def test_a_declared_uv_goes_into_the_runs_that_drive_it(monkeypatch, tmp_path: Path) -> None:
+    """The packaging tests take the uv ``SCOPE_RECALL_UV`` names before they search ``PATH``, and the run authorizes
+    the directory of that uv; a run handed only ``PATH`` would find another uv first, outside that directory."""
+    uv = tmp_path / "declared" / "uv"
+    uv.parent.mkdir()
+    uv.write_bytes(b"")
+    monkeypatch.setenv("SCOPE_RECALL_UV", str(uv))
+
+    for tier in ("packaging", "release"):
+        env = check.packaging_helper_env(tier)
+        assert env["SCOPE_RECALL_UV"] == str(uv)
+        assert env["SCOPE_RECALL_TEST_PACKAGING_HELPER_ROOTS"] == str(uv.parent.resolve())
+    for tier in ("unit", "native", "host"):
+        assert check.packaging_helper_env(tier) == {}
+    run = tmp_path / "run"
+    run.mkdir()
+    assert check._test_environment("packaging", run)["SCOPE_RECALL_UV"] == str(uv)
+
+
+def test_a_run_without_a_declared_uv_is_handed_none(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.delenv("SCOPE_RECALL_UV", raising=False)
+    run = tmp_path / "run"
+    run.mkdir()
+
+    assert "SCOPE_RECALL_UV" not in check.packaging_helper_env("packaging")
+    assert "SCOPE_RECALL_UV" not in check._test_environment("packaging", run)
+
+
+def test_the_guard_takes_what_a_tier_may_do_from_the_table() -> None:
+    """A second copy of the table in the guard would let the runner select what the guard then refuses."""
+    tree = ast.parse((ROOT / "tests" / "v11_guard.py").read_text(encoding="utf-8"))
+    imported = {node.module for node in ast.walk(tree) if isinstance(node, ast.ImportFrom)}
+    strings = {node.value for node in ast.walk(tree) if isinstance(node, ast.Constant) and isinstance(node.value, str)}
+
+    assert "tier_allows" in imported
+    assert not strings & set(check.TIER_ALLOWS)

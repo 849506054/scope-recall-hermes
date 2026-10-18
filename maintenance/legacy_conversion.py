@@ -19,6 +19,7 @@ from typing import Any, Callable, Iterable, Mapping
 from scope_recall.contracts import InstanceBinding, TrustedContext
 from scope_recall.core import lexical_index
 from scope_recall.core.events import indexed_terms
+from scope_recall.core.requalify import settle_brought_denials
 from scope_recall.core.schema import SCHEMA_VERSION, normalize_scope_authorizations
 from scope_recall.core.storage import SQLiteStorage
 from scope_recall.maintenance.legacy_episode_membership import plan_legacy_episode_memberships
@@ -65,6 +66,7 @@ from .migration_records import (
     blocked_report,
     canonical_digest,
     canonical_json,
+    constraint_failure,
     materialize_explicit_scope_selection,
     open_immutable,
     recorded_time,
@@ -158,7 +160,6 @@ def migrate_legacy(
     legacy_memory_reader_contract: str | None = None,
     completed_bridge_archive_path: str | Path | None = None,
     import_ledger_archive_path: str | Path | None = None,
-    project_legacy_memberships: bool = False,
 ) -> dict[str, Any]:
     """Import a frozen store; explicitly opt in to verified legacy compatibility.
 
@@ -183,7 +184,6 @@ def migrate_legacy(
             legacy_memory_reader_contract=legacy_memory_reader_contract,
             completed_bridge_archive_path=completed_bridge_archive_path,
             import_ledger_archive_path=import_ledger_archive_path,
-            project_legacy_memberships=project_legacy_memberships,
         )
         report = _convert(conversion)
     except Blocked as blocked:
@@ -211,7 +211,6 @@ def _prepare(
     legacy_memory_reader_contract: str | None,
     completed_bridge_archive_path: str | Path | None,
     import_ledger_archive_path: str | Path | None,
-    project_legacy_memberships: bool,
 ) -> Conversion:
     """Validate the request and bind it to a trusted target before reading rows."""
     if single_scope_to is not None:
@@ -258,7 +257,6 @@ def _prepare(
         memory_reader_contract=legacy_memory_reader_contract,
         bridge_archive_path=completed_bridge_archive_path,
         import_ledger_archive_path=import_ledger_archive_path,
-        project_memberships=project_legacy_memberships,
     )
 
 
@@ -591,21 +589,30 @@ def _write_target(cv: Conversion, storage: SQLiteStorage, context: TrustedContex
         # Preserve the old ordinary-recall lifecycle policy using the same Core
         # suppression/group/dependency mechanism as runtime governance. Run
         # after all sources and derived links exist, before commit.
+        now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
         cv.lifecycle_suppression = apply_lifecycle_suppression(
-            tx,
-            [row for row in cv.rows["memories"] if str(row.get("id")) in cv.memory_refs],
-            now=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            tx, [row for row in cv.rows["memories"] if str(row.get("id")) in cv.memory_refs], now=now
         )
+        # 2.0 took a denial ("not CircleCI") for its slot's value as readily as any other value: each is settled as
+        # restore-displaced-values settles it, before anything reads the converted store.
+        cv.denials_settled = settle_brought_denials(tx, sorted(set(cv.fact_claim_refs.values())), now=now)
 
 
 def _insert_sources(cv: Conversion, conn: sqlite3.Connection) -> None:
     """Insert archived events; a rerun must find the same content at the same id."""
     placeholders = ",".join("?" for _ in SOURCE_EVENT_FIELDS)
     for item in cv.sources:
-        conn.execute(
-            f"INSERT INTO source_events({','.join(SOURCE_EVENT_FIELDS)}) VALUES ({placeholders}) ON CONFLICT(event_id,source_revision) DO NOTHING",
-            tuple(item[key] for key in SOURCE_EVENT_FIELDS),
-        )
+        try:
+            conn.execute(
+                f"INSERT INTO source_events({','.join(SOURCE_EVENT_FIELDS)}) VALUES ({placeholders}) ON CONFLICT(event_id,source_revision) DO NOTHING",
+                tuple(item[key] for key in SOURCE_EVENT_FIELDS),
+            )
+        except sqlite3.IntegrityError as exc:
+            # Named by its table and its event id, never by a legacy id: an id is legacy text, and can hold a path.
+            failure = constraint_failure(exc) or "a constraint failed"
+            raise MigrationError(
+                f"legacy {item['legacy_table']} record {item['event_id']} cannot be stored: {failure}"
+            ) from exc
         current = conn.execute(
             "SELECT source_event_key,content_sha256,scope_id FROM source_events WHERE event_id=?", (item["event_id"],)
         ).fetchone()
@@ -651,25 +658,41 @@ def _episode_resume(
     }
 
 
-def _insert_episodes(cv: Conversion, conn: sqlite3.Connection) -> None:
-    episodes = cv.rows["task_episodes"]
-    plan = None
-    if cv.project_memberships:
-        plan = plan_legacy_episode_memberships(
-            {
-                cv.episode_refs[str(row.get("id"))]: [
-                    cv.journal_refs[str(ref)]
-                    for ref in json_list(row.get("journal_entry_ids"))
-                    if str(ref) in cv.journal_refs
-                ]
-                for row in episodes
-            }
+def _episode_members(cv: Conversion) -> dict[str, list[str]]:
+    """Each legacy episode's journal entries as Core source refs, in its own order.
+
+    An entry stored under another scope, project or branch than its episode (a 2.0 store whose scope ids changed
+    while it ran has episodes naming entries of their own session under the old id) can be neither its member nor its
+    evidence, which the episode's readers could not open: the entry stays its own source and the report names it."""
+    context = {item["event_id"]: (item["scope_id"], item["project_id"], item["branch_id"]) for item in cv.sources}
+    members: dict[str, list[str]] = {}
+    for row in cv.rows["task_episodes"]:
+        here = (
+            scope_descriptor(row)["row_scope_id"],
+            text_or_none(row.get("project_id")),
+            text_or_none(row.get("branch_id")),
         )
-    sequence = int(conn.execute("SELECT COALESCE(max(sequence),0) FROM episode_events").fetchone()[0])
-    for row in episodes:
+        ids = [str(x) for x in json_list(row.get("journal_entry_ids"))]
+        outside = [x for x in ids if x in cv.journal_refs and context[cv.journal_refs[x]] != here]
+        if outside:
+            cv.unmapped(
+                "task_episodes", str(row.get("id")), "episode_source_outside_episode_scope", journal_entry_ids=outside
+            )
+        members[cv.episode_refs[str(row.get("id"))]] = [
+            cv.journal_refs[x] for x in ids if x in cv.journal_refs and x not in outside
+        ]
+    return members
+
+
+def _insert_episodes(cv: Conversion, conn: sqlite3.Connection) -> None:
+    """A 2.0 journal entry may belong to several episodes, whose automatic windows overlap, while a Core source has one
+    processing owner: ``legacy_episode_membership`` picks it, and every episode keeps its evidence link."""
+    members = _episode_members(cv)
+    plan = plan_legacy_episode_memberships(members)
+    for row in cv.rows["task_episodes"]:
         episode_ref, scope = cv.episode_refs[str(row.get("id"))], scope_descriptor(row)
         ids = [str(x) for x in json_list(row.get("journal_entry_ids"))]
-        refs = [cv.journal_refs[x] for x in ids if x in cv.journal_refs]
+        refs = members[episode_ref]
         missing = [x for x in ids if x not in cv.journal_refs]
         resume = _episode_resume(cv, row, episode_ref, refs, missing, scope)
         state = str(row.get("status") or "unknown").lower()
@@ -703,19 +726,7 @@ def _insert_episodes(cv: Conversion, conn: sqlite3.Connection) -> None:
             ),
         )
         for ref in refs:
-            if plan is not None:
-                plan.apply(conn, episode_ref, ref)
-            elif (
-                conn.execute(
-                    "SELECT 1 FROM episode_events WHERE episode_id=? AND source_ref=?", (episode_ref, ref)
-                ).fetchone()
-                is None
-            ):
-                sequence += 1
-                conn.execute(
-                    "INSERT INTO episode_events(sequence,episode_id,source_ref,source_revision,membership,environment_revision) VALUES (?,?,?,?,?,?)",
-                    (sequence, episode_ref, ref, 1, "anchored", None),
-                )
+            plan.apply(conn, episode_ref, ref)
             conn.execute(
                 "INSERT INTO evidence_links(object_kind,object_ref,object_revision,source_ref,source_revision,relation,quote) VALUES ('episode',?,?,?,?,?,'') ON CONFLICT DO NOTHING",
                 (episode_ref, 1, ref, 1, "derived_from"),
@@ -723,8 +734,7 @@ def _insert_episodes(cv: Conversion, conn: sqlite3.Connection) -> None:
         if missing:
             cv.unmapped("task_episodes", str(row.get("id")), "source_missing_unknown", missing=missing)
         cv.inserted["episodes"] += 1
-    if plan is not None:
-        cv.membership_audit = plan.verify(conn)
+    cv.membership_audit = plan.verify(conn)
 
 
 def _project_lexical_terms(cv: Conversion, conn: sqlite3.Connection) -> None:
@@ -812,11 +822,16 @@ def _report(cv: Conversion, target: dict[str, Any]) -> dict[str, Any]:
         "fact_authority": {
             "active": authority.get("active", 0),
             "proposed_or_disputed": sum(value for state, value in authority.items() if state != "active"),
+            "denials_settled": cv.denials_settled,
             "slot_encoding": "semantic conditions only; legacy fact_key and value_fingerprint remain in sanitized source archives linked to claim revisions; conflicts remain archived with explicit incomplete conversion",
         },
         "source_status": target["source_status"],
         "deletion_receipts": target["deletion_receipts"],
         "insert_attempts": dict(cv.inserted),
+        # Records longer than a source holds, each stored in parts (``legacy_sources.archive``).
+        "segmented_records": [
+            {"record": parts[0]["legacy_record"], "parts": len(parts)} for parts in cv.record_parts.values()
+        ],
         "schema_inventory": {
             "tables": sorted(cv.tables),
             "unknown_tables": cv.unknown_tables,
@@ -833,7 +848,7 @@ def _report(cv: Conversion, target: dict[str, Any]) -> dict[str, Any]:
             "pipeline": "scope_recall.core.capture_filters.sanitize_report_text/sanitize_structured_value",
             "redacted_records": cv.redactions,
         },
-        "rollback_boundary": "new sources/deletions/corrections not representable in 578b require Core restore-required stop-write protection; old snapshot is never overwritten",
+        "rollback_boundary": "the 578b source is never written; going back to it keeps nothing this store receives after the migration, deletions included",
         "candidate_auto_promoted": False,
         "vectors": "not imported; rebuildable",
         "old_governance_engines": "sanitized imported history only; not executable in new Core",

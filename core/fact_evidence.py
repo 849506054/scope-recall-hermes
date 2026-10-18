@@ -39,7 +39,7 @@ CORROBORATING_EVIDENCE_SOURCE_TYPES = frozenset(
 AUTHORITATIVE_EVIDENCE_SOURCE_TYPES = DIRECT_EVIDENCE_SOURCE_TYPES | CORROBORATING_EVIDENCE_SOURCE_TYPES
 _WORD_RE = re.compile(r"[^\W_]+(?:[-'][^\W_]+)*", re.UNICODE)
 # A "." with an ASCII letter or digit on both sides sits inside one token
-# (3.1.0rc28, 3.5, example.com) and ends no clause; splitting there left a
+# (3.1.0rc28, 3.5, example.com) and ends no clause; splitting there would leave a
 # dotted value in no single clause, so it could never be proved.  A "." before
 # a space, the end or CJK text still ends one.  The dotted-date rewrites below
 # likewise match whole tokens only, never the "1.0" inside v3.1.0-rc28.
@@ -138,7 +138,8 @@ def _normalized(value: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
-def _stem(token: str) -> str:
+def stem(token: str) -> str:
+    """A Latin word without its inflection (``drinks``, ``drinking`` -> ``drink``), to compare words by their frame."""
     value = _normalized(token).strip("-'_")
     if len(value) > 5 and value.endswith("ing"):
         value = value[:-3]
@@ -253,7 +254,7 @@ def _relation_spans(quote: str, claim: ClaimDraft) -> tuple[_Span, ...]:
 
     predicate_tokens = tuple(_WORD_RE.finditer(normalized_predicate))
     quote_tokens = tuple(_WORD_RE.finditer(normalized_quote))
-    predicate_stems = tuple(_stem(match.group(0)) for match in predicate_tokens)
+    predicate_stems = tuple(stem(match.group(0)) for match in predicate_tokens)
     # Only morphological variants of the *same* predicate frame may authorize a
     # durable claim. Events such as move/relocate can be useful retrieval hints,
     # but they do not entail the current state "lives in".
@@ -265,7 +266,7 @@ def _relation_spans(quote: str, claim: ClaimDraft) -> tuple[_Span, ...]:
             continue
         for index in range(len(quote_tokens) - frame_size + 1):
             frame = quote_tokens[index : index + frame_size]
-            if tuple(_stem(match.group(0)) for match in frame) != authority_frame:
+            if tuple(stem(match.group(0)) for match in frame) != authority_frame:
                 continue
             spans.append(_Span(frame[0].start(), frame[-1].end()))
     return tuple(spans)
@@ -534,4 +535,5 @@ __all__ = [
     "DIRECT_EVIDENCE_SOURCE_TYPES",
     "evidence_supports_claim",
     "evidence_supports_relation",
+    "stem",
 ]

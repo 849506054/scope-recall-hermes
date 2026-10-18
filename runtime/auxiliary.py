@@ -236,10 +236,14 @@ def _responses_route_from_mapping(raw: Mapping[str, Any]) -> ResponsesRouteConfi
         text_format=raw.get("text_format"),
         stream=raw.get("stream", False),
         kind=raw.get("kind", RESPONSES_KIND),
-        allow_insecure_endpoint=strict_bool(
-            "consolidation_allow_insecure_endpoint", raw.get("allow_insecure_endpoint", False)
-        ),
+        allow_insecure_endpoint=_consolidation_opt_in(raw),
     )
+
+
+def _consolidation_opt_in(raw: Mapping[str, Any]) -> bool:
+    """A consolidation route's permission for plaintext HTTP beyond this machine: only a literal boolean, as the
+    embedding route's, so a string "true" in a config file cannot open it."""
+    return strict_bool("consolidation_allow_insecure_endpoint", raw.get("allow_insecure_endpoint", False))
 
 
 def _consolidation_route_from_mapping(
@@ -268,9 +272,7 @@ def _consolidation_route_from_mapping(
         stream=raw.get("stream", False),
         n=raw.get("n", 1),
         headers=raw.get("headers"),
-        allow_insecure_endpoint=strict_bool(
-            "consolidation_allow_insecure_endpoint", raw.get("allow_insecure_endpoint", False)
-        ),
+        allow_insecure_endpoint=_consolidation_opt_in(raw),
     )
 
 

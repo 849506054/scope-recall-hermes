@@ -15,14 +15,13 @@ memories are recalled by their words.
 Three things cannot be copied as they are.
 
 * Source ids are derived from the store's keys, and legacy migrations gave
-  different stores the same keys for different content: three pilot stores
-  shared 13,073 ids.  Every imported source gets an id of its own,
+  different stores the same keys for different content: three stores of one
+  owner shared 13,073 ids.  Every imported source gets an id of its own,
   ``event-sha256(["import", entry, old id])``, and every reference to it --
   columns, JSON and the work that names it -- is rewritten; keys and group keys
   take the prefix ``import:<entry>:``, and sessions ``<entry>:``, as a live
   capture's do.  An id is renamed where the old store has it, whatever its
-  form: 85,112 of the pilot's sources were ``event-legacy-<32 hex>``, which
-  3.2.0rc3 renamed in columns but not in JSON or queued work.
+  form: 85,112 of one store's sources were ``event-legacy-<32 hex>``.
 * Integer ids local to a store -- ``source_id``, episode sequences, lexical
   term ids, authorization payload ids -- are renumbered.
 * A group block's digest includes the installation id; it is recomputed for
@@ -30,8 +29,12 @@ Three things cannot be copied as they are.
 
 A fact whose slot the shared store already fills is not imported, nor are its
 candidate rows: the first store imported keeps the slot, and the receipt names
-what was left out.  Its sources are imported like every other.  Work history is not copied; pending
-work is, as new work.  A store already imported for the entry is refused.
+what was left out.  Its sources are imported like every other.  A fact whose
+head the source store took for its value though it is a denial ("not
+CircleCI") is settled in the same transaction as ``restore-displaced-values``
+settles it, and the receipt counts them (``denials_settled``).  Work history is
+not copied; pending work is, as new work.  A store already imported for the
+entry is refused.
 """
 
 from __future__ import annotations
@@ -49,15 +52,18 @@ from typing import Any, Callable, Iterator
 from urllib.request import pathname2url
 
 from ..adapters.hermes.shared_entries import read_shared_payload
+from ..contracts import InstanceBinding, TrustedContext
 from ..core import lexical_index
 from ..core.delete_storage import group_digest
 from ..core.events import indexed_terms, withheld_tool_output
+from ..core.requalify import settle_brought_denials
 from ..core.schema import SCHEMA_VERSION
+from ..core.storage import Transaction
 from ..core.truth_connection import connect_truth_database
 from ..core.writer_lease import TruthWriterBusyError
 from ..runtime.running_code import live_records
 from ..runtime.vector_retention import OMITTED_TOOL_OUTPUT, REPEATED_TOOL_OUTPUT
-from .shared_run import Run, SharedStoreError
+from .shared_run import Run, SharedStoreError, store_lock
 
 #: Store versions whose tables this import reads.  An older store is upgraded first.
 SOURCE_SCHEMAS = frozenset({1109, 1110})
@@ -355,7 +361,7 @@ def _import_rows(conn, src, names: _Names, *, store_installation: str, store_sco
 
     # A deletion is recorded at the epoch it moved its store to, and ``retraction_after`` compares that
     # with the epoch a read was made at.  The old store's numbers mean nothing here: one above this
-    # store's read as a deletion after every read in its scopes -- recall emptied, derived work failed
+    # store's would read as a deletion after every read in its scopes -- recall emptied, derived work failed
     # with memory_epoch_changed -- until this store's own epoch passed it.  Here they happen at the
     # import, so they carry the epoch the import moves the store to.
     imported_epoch = conn.execute("SELECT memory_epoch FROM instance_meta WHERE singleton=1").fetchone()[0] + 1
@@ -420,7 +426,7 @@ def _import_rows(conn, src, names: _Names, *, store_installation: str, store_sco
     )
     conn.execute("DROP TABLE temp.import_terms")
     # A withheld tool output's placeholder is indexed by its error text alone, when it carries one; the rest of the
-    # postings an older release gave it stay behind.
+    # postings the source store holds for it stay behind.
     withheld: dict[int, tuple[str, ...]] = {}
     for source_id, role, content in src.execute(
         f"SELECT e.source_id, e.role, e.content FROM source_events e WHERE e.role='tool' AND {OMITTED_TOOL_OUTPUT}"
@@ -496,8 +502,8 @@ def _drop_expirable_embeddings(conn, names: _Names, *, now: str) -> int:
     """Take back the imported tool outputs' embeddings that vector retention would expire at once.
 
     A summary the capture filter left for an output it withheld, and a repeat of an earlier tool
-    output in the same scope, are what the intake gate keeps as sources only.  A store from an
-    earlier release embedded them anyway, and its embed history would queue them again: thousands
+    output in the same scope, are what the intake gate keeps as sources only.  A store can have
+    embedded them anyway, and its embed history would queue them again: thousands
     in front of the shared worker, each embedded and then deleted by retention within the hour.
     They are recorded as expired, under the reason retention gives, and never asked for; the text
     and everything drawn from it stay, recalled by their words.
@@ -519,10 +525,44 @@ def _drop_expirable_embeddings(conn, names: _Names, *, now: str) -> int:
     return len(rows)
 
 
+def _brought_in(conn, src, names: _Names, *, payload: dict[str, Any], root: Path, now: str) -> dict:
+    """Copy the source store's rows (``_import_rows``), then settle the facts it brought whose head is a denial it took
+    for its slot's value, in the same transaction (``settle_brought_denials``), counted as ``denials_settled``."""
+    copied = _import_rows(
+        conn,
+        src,
+        names,
+        store_installation=payload["installation_id"],
+        store_scopes=frozenset(payload["scope_ids"]),
+        now=now,
+    )
+    left_out = {item["claim_id"] for item in copied["claims_left_out"]}
+    brought = [row[0] for row in src.execute("SELECT claim_id FROM claims") if row[0] not in left_out]
+    copied["counts"]["denials_settled"] = 0
+    if brought:
+        scopes = frozenset(row[0] for row in src.execute("SELECT DISTINCT scope_id FROM claims"))
+        binding = InstanceBinding(
+            payload["agent_id"], payload["installation_id"], root.resolve(), scopes, payload["test_mode"], "shared"
+        )
+        tx = Transaction(conn, TrustedContext(binding, "import-entry", scopes, "host_generated"), writable=True)
+        try:
+            copied["counts"]["denials_settled"] = settle_brought_denials(tx, brought, now=now)
+        finally:
+            tx._finish()
+    return copied
+
+
 def import_entry(
     *, root: Path, entry_id: str, source: Path, dry_run: bool = False, now: str | None = None
 ) -> dict[str, Any]:
+    """Copy what the entry's own store at ``source`` held into the shared store at ``root``, holding the store's lock
+    from the read of its manifest to the receipt: no other shared-store command writes meanwhile."""
     now = now or _now()
+    with store_lock(root, f"import-entry --entry {entry_id}", now):
+        return _imported(root=root, entry_id=entry_id, source=source, dry_run=dry_run, now=now)
+
+
+def _imported(*, root: Path, entry_id: str, source: Path, dry_run: bool, now: str) -> dict[str, Any]:
     payload = read_shared_payload(root)
     record = next((e for e in payload["entries"] if e["entry_id"] == entry_id and not e.get("detached_at")), None)
     if record is None:
@@ -568,16 +608,7 @@ def import_entry(
                 if live_records(root):
                     raise SharedStoreError("a host or the worker still has the shared store open; stop them first")
                 try:
-                    result.update(
-                        _import_rows(
-                            conn,
-                            src,
-                            names,
-                            store_installation=payload["installation_id"],
-                            store_scopes=frozenset(payload["scope_ids"]),
-                            now=now,
-                        )
-                    )
+                    result.update(_brought_in(conn, src, names, payload=payload, root=root, now=now))
                 except sqlite3.IntegrityError as exc:
                     # Only sources are renamed; any other id the store already holds is refused, not guessed at.
                     raise SharedStoreError(f"the source cannot be imported as it is: {exc}") from None

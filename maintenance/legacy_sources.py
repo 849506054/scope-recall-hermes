@@ -13,6 +13,7 @@ import re
 from collections import defaultdict
 from typing import Any, Mapping, cast
 
+from scope_recall.core.events import MAX_SEGMENT_CHARS, segment_key
 from scope_recall.maintenance.legacy_v2_compat import resolve_memory_scope
 
 from .legacy_catalog import DIGEST_TABLES, HISTORY_TABLES
@@ -238,7 +239,11 @@ def _source_event(
     extra: dict[str, Any],
     redacted: bool,
 ) -> Row:
-    key = f"legacy:{table}:{identity}"
+    """One imported source event; ``extra["segment"]`` makes it a part of a record stored in parts (``archive``)."""
+    group = f"legacy:{table}:{identity}"
+    segment = extra.get("segment")
+    index = segment["index"] if segment else 0
+    key = segment_key(group, index) if index else group
     stamp = row.get("created_at") or row.get("updated_at") or row.get("started_at")
     occurred, precision = parse_instant(stamp)
     recorded = recorded_time(row.get("updated_at") or row.get("created_at") or row.get("started_at"))
@@ -264,13 +269,17 @@ def _source_event(
         "scope_authorization": scope,
         **cast(dict[str, Any], sanitized_value(extra)),
     }
+    if segment:
+        body["segment"] = extra_payload["segment"] = segment
     return {
-        "event_id": stable_legacy_id("event", f"{table}:{identity}"),
+        "event_id": stable_legacy_id(
+            "event", canonical_json([table, identity, index]) if index else f"{table}:{identity}"
+        ),
         "source_event_key": key,
         "source_revision": 1,
-        "source_group_key": key,
-        "segment_index": 0,
-        "segment_total": None,
+        "source_group_key": group,
+        "segment_index": index,
+        "segment_total": segment["total"] if segment else None,
         "scope_id": scope["row_scope_id"],
         "session_id": str(row.get("session_id") or f"legacy-session-{scope['row_scope_id']}"),
         "project_id": text_or_none(row.get("project_id")),
@@ -287,12 +296,15 @@ def _source_event(
         "capture_state": "complete",
         "source_original_origin": original,
         "dataset_id": "legacy-578b",
-        "import_provenance_sha256": canonical_digest({"baseline": LEGACY_BASELINE, "key": key}),
+        "import_provenance_sha256": canonical_digest({"baseline": LEGACY_BASELINE, "key": group}),
         "extra_json": canonical_json(extra_payload),
         "capture_gaps_json": canonical_json([scope["gap"]] if scope["gap"] else []),
         "read_blocked": int(bool(scope["gap"])),
         "suppressed": 0,
         "scope_gap": scope["gap"],
+        # The record a source came from, which no later stage changes (a digest row moves to its memory's group).
+        "legacy_table": table,
+        "legacy_record": group,
     }
 
 
@@ -308,11 +320,39 @@ def archive(
     scope: dict[str, Any],
     redacted: bool = False,
 ) -> Row:
-    """Queue one legacy record as an imported source event; scope gaps block."""
+    """Queue one legacy record as an imported source event; scope gaps block.
+
+    A record longer than a source holds (a 2.0 memory merged again and again reached 77,000 characters) is queued in
+    parts of at most ``MAX_SEGMENT_CHARS``, as ``prepare_capture`` stores a long message: every character once and in
+    order, one source group under the record's key.  The first part keeps the record's event id, key and metadata, so
+    whatever cites the record cites it; ``cv.record_parts`` lists the parts."""
     cv.redactions += int(redacted)
     cv.permission_gaps += int(bool(scope["gap"]))
-    item = _source_event(table, identity, row, scope, content, kind, original, extra, redacted)
-    cv.sources.append(item)
+    texts = [content[start : start + MAX_SEGMENT_CHARS] for start in range(0, len(content), MAX_SEGMENT_CHARS)]
+    if len(texts) > 1:
+        group = f"legacy:{table}:{identity}"
+        parts = [
+            _source_event(
+                table,
+                identity,
+                row,
+                scope,
+                text,
+                kind,
+                original,
+                {
+                    **(extra if index == 0 else {}),
+                    "segment": dict(group_key=group, index=index, total=len(texts), truncated=False),
+                },
+                redacted,
+            )
+            for index, text in enumerate(texts)
+        ]
+        cv.record_parts[parts[0]["event_id"]] = parts
+    else:
+        parts = [_source_event(table, identity, row, scope, content, kind, original, extra, redacted)]
+    cv.sources.extend(parts)
+    item = parts[0]
     if scope["gap"]:
         cv.unmapped(table, item["source_event_key"], scope["gap"], scope_authorization=sanitized_value(scope))
     return item
@@ -330,6 +370,8 @@ def _archive_record(
 ) -> Row:
     """Archive a row whose content is its own sanitized canonical JSON."""
     content, changed = sanitized_text(canonical_json(sanitized_value(row)))
+    # A row longer than a source is held whole by its parts; a second copy in its metadata would not fit there.
+    copy = {"legacy_row": sanitized_value(row)} if len(content) <= MAX_SEGMENT_CHARS else {}
     item = archive(
         cv,
         table,
@@ -338,7 +380,7 @@ def _archive_record(
         content,
         kind,
         "origin_unknown",
-        {"legacy_row": sanitized_value(row), **extra},
+        {**copy, **extra},
         scope if scope is not None else scope_descriptor(scope_row),
         changed,
     )
@@ -528,13 +570,17 @@ def archive_digests(cv: Conversion) -> None:
                     extra["legacy_parent_event_id"] = parent_item["event_id"]
             scope = json.loads(parent_item["extra_json"])["scope_authorization"] if attached else None
             item = _archive_record(cv, table, identity, scope_row, row, "legacy_audit", scope, **extra)
-            item["read_blocked"] = 1
-            if attached:
-                for key in ("source_group_key", "scope_id", "project_id", "branch_id"):
-                    item[key] = parent_item[key]
-                group = str(parent_item["source_group_key"])
-                item["segment_index"] = next_segment.get(group, 1)
-                next_segment[group] = item["segment_index"] + 1
+            # Every part of a row stored in parts, as its first.
+            for part in cv.record_parts.get(item["event_id"], [item]):
+                part["read_blocked"] = 1
+                if attached and parent_item is not None:
+                    for key in ("source_group_key", "scope_id", "project_id", "branch_id"):
+                        part[key] = parent_item[key]
+                    group = str(parent_item["source_group_key"])
+                    # After the memory's own parts, when it is stored in parts, and the bridge's own earlier ones.
+                    part["segment_index"] = next_segment.get(group, parent_item["segment_total"] or 1)
+                    part["segment_total"] = None
+                    next_segment[group] = part["segment_index"] + 1
 
 
 def archive_sources(cv: Conversion) -> None:

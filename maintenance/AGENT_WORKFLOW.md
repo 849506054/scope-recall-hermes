@@ -46,11 +46,18 @@ instance. Approve one only where everyone who can reach that surface without
 logging in is the owner; if you cannot tell, ask the user that one question.
 On a host that serves its dashboard to other machines this is every dashboard
 login: the dashboard's Chat tab runs there as a session that names no user.
+A Hermes whose gateway runs these conversations, and the CLI's turns, over its
+local session transport names the gateway's own OS account instead (`sid:<SID>`,
+`uid:<uid>`): that binds as the owner on an approved surface, and on another
+binds nothing while the host log names the approval, so approve the same way.
 A session that carries a dashboard login (`hermes serve` with
 `dashboard.basic_auth`, or the Desktop app connected to such a host) is that
-login, `basic:<name>`, never the local owner, and binds nothing until approved:
-add `--owner-login desktop=basic:<name>` (or `tui=`) only for a login that is
-the owner's own, and ask which one is if you cannot tell.
+login, `basic:<name>` (over the transport `auth:v1:["basic","","<name>"]`), never
+the local owner, and binds nothing until approved: add
+`--owner-login desktop=<login>` (or `tui=`) with the login the host log names,
+only for a login that is the owner's own, and ask which one is if you cannot tell.
+On an entry of a shared store `apply-install` approves neither: add the owner
+principal and row with `scope-recall grants` (docs/shared-store.md).
 A Desktop installation of 1.9 to 2.x wrote under a minted `srdesk_*` principal. When
 the old runtime's own settings show that principal is the owner, keep its private
 scope as it is: list that scope ID in `allowed_scope_ids` of the owner's rows (the
@@ -63,11 +70,11 @@ scope map is one-to-one. The 3.x host never sends that principal, so it needs no
 owner principal of its own. Never approve anything for a scheduled (`cron`) run;
 the installer refuses it.
 
-## 1.1 Current package upgrades (D14, including pip-less uv venvs)
+## 1.1 Current package upgrades (including pip-less uv venvs)
 
 Reuse this workflow and the installed `maintenance.cli package-upgrade` command.
-The historical root `managed_upgrade.py` upgrades old plugin trees and is not in
-the current wheel; do not route wheel-based installations through that engine.
+The root `managed_upgrade.py` of old plugin trees is not in the wheel; do not
+route wheel-based installations through it.
 
 1. Verify the exact interpreter/home/controller and offline wheel identity. Back
    up configuration, installation manifests/receipts/wrappers and consistent SQLite
@@ -110,14 +117,18 @@ the current wheel; do not route wheel-based installations through that engine.
    database rollback is NOT permitted; reconcile any new writes first. Once the
    new package has opened the store, the previous one may refuse it: 3.2's first
    open moves a 3.1 store to schema 1110, which 3.1 cannot open. Going back then
-   needs the external pre-upgrade backup, and writes made since are lost.
+   needs the external pre-upgrade backup, put back with `scope-recall restore`
+   (never by copying the file, which brings back what was forgotten since); other
+   writes made since are lost. Across a schema step, `restore` with the newer
+   package prepares and `restore` with the older one finishes (docs/install.md,
+   section 9); a snapshot below schema 1110 is refused.
 5. `package_verified` means only that package replacement and isolated import
    succeeded. Run existing plan-install/apply-install for the same binding and
    doctor, verify receipt/wrapper/package, then restore the original wake policy,
    restart and probe the real host. The package receipt never authorizes restart
    on its own (`host_restart_allowed=false`). Keep the backup until that succeeds.
 
-The Windows preflight removes the known D14 held-handle path before uninstall.
+The Windows preflight rules out the known held-handle failure before uninstall.
 It is not a guarantee against disk failure or a new process started in violation
 of quiescence. Those failures remain explicit recovery, never a green upgrade.
 
@@ -135,8 +146,9 @@ package manager builds (`packages.venv.environment` in that file), not in the ve
 the `hermes` command runs with, and builds it again from each plugin's declaration
 in `<home>\plugins\`. Upgrading the venv with `package-upgrade` does not reach the
 gateway, and pip or uv into the package manager's environment is undone by its next
-build. A declaration written there by hand without the vector extra once left every
-recall without vectors for two days, while every check read the venv.
+build. A declaration written there by hand without the vector extra leaves a LanceDB
+store's recall without vectors; `doctor` reads that environment and reports it
+under `hermes_runtime`.
 
 1. Once the release is on PyPI, run plan-install/apply-install with
    `--target-plugin-dir <home>\plugins\scope-recall`. A receipt that names another
@@ -147,8 +159,11 @@ recall without vectors for two days, while every check read the venv.
    `<hermes python> -m hermes_cli.venv_sync --project-root <home>\hermes-agent --json`.
    A running gateway keeps the environment it started with. `"state": "synced"` or
    `"current"` is success. A failed sync disables the plugin: Hermes adds
-   `scope-recall` to `plugins.disabled` in `config.yaml`. Fix the cause, remove
-   exactly that entry and sync again before the gateway restarts.
+   `scope-recall` to `plugins.disabled` in `config.yaml` and empties
+   `memory.provider`. Copy `config.yaml` before the sync and put the copy back after
+   a failed one; removing only the `plugins.disabled` entry leaves the gateway
+   without memory (`doctor`: `host_registration_status: "not_selected"`). Then fix
+   the cause and sync again before the gateway restarts.
 3. Restart the gateway through its controller and run `doctor`: `hermes_runtime`
    must name the new version with `vector_dependencies: true`, and no
    `hermes_runtime_*` gap may remain. A Hermes that runs elevated may keep that
@@ -212,7 +227,7 @@ and out of automatic memory/skill discovery.
 4. Inspect the structured blockers. `prepared` means the snapshot/catalog/target
    binding are fixed, not that migration is complete.
 5. Run `scope-recall migrate run --job <job-dir> --source-quiesced`.
-   Supply `--legacy-reader-contract one instance-2.0.1/memories-physical-scope-in-accessible-scopes`
+   Supply `--legacy-reader-contract legacy-2.0.1/memories-physical-scope-in-accessible-scopes`
    only after verifying the matching old runtime/schema. Do not apply it to other
    reader semantics. Completed bridge records are archived without replay.
    Known OpenClaw import ledgers are preserved as verified, non-searchable audit
@@ -221,6 +236,13 @@ and out of automatic memory/skill discovery.
 6. On interruption, run `migrate status`, then `migrate run` on the same job after
    diagnosing the recorded error. No blind retry loop. A changed source requires
    a fresh snapshot before cutover; never discard changes made after preparation.
+
+A record longer than a source holds (65,536 characters) is stored in parts with
+every character kept (`segmented_records` in the conversion report). A journal
+entry several episodes name has one processing owner; the other episodes keep
+its evidence link and leave automatic recall (`legacy_episode_memberships`). An
+entry stored under another scope than its episode stays its own source, unlinked
+(`episode_source_outside_episode_scope`).
 
 The converter preserves original status, evidence/history and deletion closure.
 Do not re-extract the entire old journal or promote every old candidate. The
@@ -235,7 +257,7 @@ gate, not proof that the live host has loaded the new plugin.
 
 Configure the destination's approved embedding route and own budget ledger using
 the existing runtime configuration. Preserve the user's main model choice. Never
-silently add another extraction model. Current Codex host-model consolidation is
+silently add another extraction model. Codex host-model consolidation is
 a separate capability boundary; installing/upgrading cannot claim to create it.
 
 Run `scope-recall migrate queue-index --job <job-dir>` until `index_queue_complete`
@@ -261,10 +283,14 @@ the auxiliary route is unavailable or a required identity mapping is unresolved.
 
 If conversion or host checks fail, leave/restart the old host using its verified
 original namespace/configuration. Preserve the failed job and exact error. If the
-new host has accepted writes, first freeze it and preserve its database and new
+new host has accepted writes, first stop it and preserve its database and new
 writes. Reconcile them before claiming a lossless rollback. Never overwrite the
-new database with an old snapshot. `scope-recall rollback` supplies the existing
-snapshot checks; it deliberately refuses unsafe replacement when new writes exist.
+new database with an old snapshot. The old host's own database is never written by
+the migration; `scope-recall backup --database <it> --output <new file>` makes a
+verified copy of it. Going back to it keeps nothing the new database received,
+deletions included: what was forgotten there since the migration is still in the
+old database. To go back to a snapshot of the new database itself, use
+`scope-recall restore`.
 After going back to an earlier release and forward again, run `scope-recall
 retry-failures --config <file>` (the shared worker's config for a shared store), and
 with `--apply` if it counts any `inbox_given_up`: a capture the earlier release could

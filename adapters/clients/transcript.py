@@ -7,7 +7,9 @@ given.  At the end of a turn the lines added since the last read are read here, 
 handler records what they show being said:
 
 * the person's messages, typed or sent while a turn was running: only entries the record
-  itself marks as the person's (``origin.kind == "human"``);
+  itself marks as the person's (``origin.kind == "human"``), as the record has them; the
+  reminders Claude's desktop app puts in them are taken out where they are stored
+  (``record_reader``), so that a client on another machine is held to the same rule;
 * the model's visible text, block by block, as it was shown.
 
 Nothing else: no tool calls or results, no compaction summaries, task notifications, command
@@ -105,7 +107,7 @@ def said(row: object) -> Said | None:
     if not text.strip():
         return None
     # Half of a broken emoji is kept as U+FFFD, with the rest of the message (``boundary.without_lone_surrogates``);
-    # the line was skipped and the message lost.  An entry id that cannot be encoded still skips its line.
+    # skipping the line would lose the message.  An entry id that cannot be encoded still skips its line.
     text = without_lone_surrogates(text)
     try:
         entry_id.encode("utf-8")
@@ -317,7 +319,7 @@ def workbuddy_record_path(
     session, else that file in one of the workspace folders of ``projects`` (``workbuddy_projects``), else None.
 
     The record is named by the session's store id when it has one (``record_id``, the hook's ``agent_id``), else by
-    the session id.  The hook's path has been reported wrong (``.json`` for ``.jsonl``, cut two characters short), so
+    the session id.  The hook's path can be wrong (``.json`` for ``.jsonl``, cut two characters short), so
     any other path is not read and the record is looked for by its name instead."""
     names = [
         f"{name.strip()}.jsonl"
@@ -387,6 +389,59 @@ def said_from_wire(value: object) -> Said | None:
     except UnicodeEncodeError:
         return None
     return Said(entry_id.strip(), role, text, occurred_at, prompt_id.strip() if prompt_id else None)
+
+
+#: How much of a session record's end ``context_since`` reads for the last compaction.  At every prompt of 24 local
+#: sessions measured, the last one lay at most 12.2 MB back (median 5.4 MB).
+_CONTEXT_TAIL_BYTES = 16 * 1024 * 1024
+#: What a record line naming a compaction holds: the summary that replaces what came before, or its boundary.  Only
+#: the names: a line is parsed and its values checked (``_compaction``) whatever spacing its JSON has.
+_COMPACTION_MARKS = (b'"isCompactSummary"', b'"compact_boundary"')
+
+
+def _compaction(row: object) -> str | None:
+    """The moment of a record line that is a compaction of the main session (not of a subagent's), or None."""
+    if not isinstance(row, dict) or row.get("isSidechain"):
+        return None
+    boundary = row.get("type") == "system" and row.get("subtype") == "compact_boundary"
+    if row.get("isCompactSummary") is True or boundary:
+        return _stamp(row.get("timestamp"))
+    return None
+
+
+def _line(raw: bytes) -> object:
+    try:
+        return json.loads(raw)
+    except (ValueError, RecursionError):
+        return None
+
+
+def context_since(path: Path) -> str | None:
+    """Since when Claude Code's model still holds the session's own turns word for word: the session record's last
+    compaction, or its first line when it has had none.  None when that cannot be told: a record that cannot be read,
+    or one longer than ``_CONTEXT_TAIL_BYTES`` with no compaction in that much of its end.
+
+    What was said before a compaction reaches the model only as the compaction's summary, so an automatic recall may
+    bring it back; what was said after it is still there, and recalled it would be a second copy."""
+    try:
+        with path.open("rb") as handle:
+            start = max(0, handle.seek(0, os.SEEK_END) - _CONTEXT_TAIL_BYTES)
+            handle.seek(start)
+            lines = handle.read().split(b"\n")
+    except OSError:
+        return None
+    if start > 0:
+        lines = lines[1:]  # cut by where the read began
+    for raw in reversed(lines):
+        if any(mark in raw for mark in _COMPACTION_MARKS) and (moment := _compaction(_line(raw))) is not None:
+            return moment
+    if start > 0:
+        return None
+    for raw in lines:
+        row = _line(raw)
+        if isinstance(row, dict) and not row.get("isSidechain") and (moment := _stamp(row.get("timestamp"))):
+            return moment
+    return None
 
 
 def record_path(value: object, session_id: str) -> Path | None:

@@ -1,6 +1,7 @@
 """Which session the Hermes adapter speaks for: the one Hermes opens (``initialize``), the one it switches to
-(``on_session_switch``), and the line a desktop or tui session bound to no scope says in the host's log.  It works on
-the adapter's state under the adapter's lock (``self._adapter``)."""
+(``on_session_switch``), and what a local session bound to no scope says: a line in the host's log, and for the owner's
+a record ``doctor`` reads (``unbound_sessions``).  It works on the adapter's state under the adapter's lock
+(``self._adapter``)."""
 
 from __future__ import annotations
 
@@ -10,10 +11,11 @@ from typing import TYPE_CHECKING, Any
 
 from scope_recall.core import CoreConfig, MemoryCore
 
-from .audiences import LOCAL_PLATFORMS
+from .audiences import LOCAL_PLATFORMS, LOCAL_USER_ID
 from .capture import CAPTURE_TIMEOUT_S
 from .identity import (
     HermesIdentity,
+    LocalSurfaceUnapproved,
     assert_same_installation,
     bind_hermes_identity,
     switch_hermes_identity,
@@ -21,12 +23,13 @@ from .identity import (
 )
 from .installation import assert_core_binding_matches
 from .runtime_wiring import GAP_WORKER_LAUNCH_FAILED, HermesHostRuntime, attach_trusted_host_runtime
+from .unbound_sessions import note_owner_session
 
 if TYPE_CHECKING:
     from .provider import ScopeRecallHermesAdapter
 
-#: The adapter's log name, which these lines carried before the adapter was split: a host writes it into each line,
-#: and a logging configuration may name it.
+#: The adapter's log name, the provider module's, which this module logs under as well: a host writes it into each
+#: line, and a logging configuration may name it.
 _log = logging.getLogger("scope_recall.adapters.hermes.provider")
 _BOUNDED_MESSAGE_SCAN = 8
 
@@ -34,8 +37,8 @@ _BOUNDED_MESSAGE_SCAN = 8
 def _start_vector_helper(host_runtime) -> None:
     """Start the vector search's helper when a gateway first binds (``vector.process_store.prestart``).
 
-    The first search opened it then, and its LanceDB import (about 2 s) could outrun that recall's budget: a probe
-    run as a gateway's first turn after a start came back without its vector search (``helper_open_deadline``).
+    Left to the first search, its LanceDB import (about 2 s) could outrun that recall's budget: a probe run as a
+    gateway's first turn after a start came back without its vector search (``helper_open_deadline``).
     """
     runtime = getattr(host_runtime, "runtime", None)
     if sys.platform != "win32" or runtime is None or runtime.config.vector is None:
@@ -45,7 +48,7 @@ def _start_vector_helper(host_runtime) -> None:
 
         prestart()
     except OSError as exc:
-        # The first search starts its own helper, as before: slower, never a reason not to bind.
+        # The first search starts its own helper: slower, never a reason not to bind.
         _log.warning("could not start a vector helper ahead: %s", type(exc).__name__)
 
 
@@ -58,7 +61,17 @@ class SessionBinding:
         self._unbound_route: tuple[str, ...] | None = None
 
     def bind(self, session_id: str, **kwargs) -> None:
-        fresh = bind_hermes_identity(session_id, **kwargs)
+        try:
+            fresh = bind_hermes_identity(session_id, **kwargs)
+        except LocalSurfaceUnapproved as refused:
+            # The owner's session there, refused for want of the surface's approval, keeps nothing either.
+            note_owner_session(
+                refused.data_directory,
+                entry_id=refused.entry_id,
+                platform=refused.platform,
+                gaps=("capability_gap:local_surface_unapproved",),
+            )
+            raise
         with self._adapter._lock:
             assert_same_installation(self._adapter._identity, fresh)
             runtime_path = kwargs.get("trusted_runtime_config_path") or fresh.runtime_config_path
@@ -101,7 +114,7 @@ class SessionBinding:
             self._adapter._turns.reset_source_refs()
             self._adapter._current_task_message = ""
             # The buffer stays: each capture keeps the session, actor and scope it was said in, and is written under
-            # its own scope's grant (``_retry_pass``).  Cleared here, a session started again in this adapter dropped
+            # its own scope's grant (``_retry_pass``).  Cleared here, a session started again in this adapter would drop
             # tool results that had only met a busy store.
             self._adapter._diagnostics.capability_gaps = tuple(
                 dict.fromkeys((*fresh.runtime_audience.capability_gaps, *self._adapter._host_runtime.capability_gaps))
@@ -109,7 +122,7 @@ class SessionBinding:
             self._adapter._worker_launch_gaps = ()
             self._adapter._initialized = True
             self._unbound_route = None
-            self._say_if_unbound(fresh)
+            self._report_unbound(fresh)
             from .hooks import update_adapter_binding
 
             update_adapter_binding(self._adapter)
@@ -131,8 +144,8 @@ class SessionBinding:
         self._adapter._ledger.reset()
         self._adapter._turns.reset_source_refs()
         # A compression gives the conversation a new session id in the middle of a turn, and the turn goes on:
-        # its id and what it said on the way stay, or its post_llm_call no longer matched the turn and what it
-        # said between tool calls, and what the person sent meanwhile, was never recorded.
+        # its id and what it said on the way stay, or its post_llm_call would no longer match the turn, and what
+        # it said between tool calls, and what the person sent meanwhile, would never be recorded.
         if reset or kwargs.get("reason") != "compression":
             self._adapter._current_task_message = ""
             self._adapter._pre_llm_pending = False
@@ -155,7 +168,7 @@ class SessionBinding:
             )
         )
         self._adapter._worker_launch_gaps = ()
-        self._say_if_unbound(fresh)
+        self._report_unbound(fresh)
         if self._adapter._host_runtime is not None:
             self._adapter._host_runtime.rebind_session(new_session_id, fresh.writable_scope_ids)
         from .hooks import update_adapter_binding
@@ -165,21 +178,34 @@ class SessionBinding:
             self._adapter._turn_counter = 0
         self._adapter._session_watermark += 1
 
-    def _say_if_unbound(self, identity: HermesIdentity) -> None:
-        """Say once per session, in the host's log, that a desktop or tui session binds no scope.
+    def _report_unbound(self, identity: HermesIdentity) -> None:
+        """Say once per session, in the host's log, that a local session binds no scope, and keep the owner's where
+        ``doctor`` reads it, until a session of theirs on that surface binds.
 
-        Such a session fails closed: nothing in it is captured or recalled.  Hermes reads none of this
-        adapter's diagnostics, so without this line a Desktop login's sessions wrote nothing for days and
-        nothing said so.  A gateway chat left unmapped is the owner's choice and says nothing, as before: a line
-        for each would name its users, some by phone number.  The platform, the login and the
-        gap codes only, never what was said, and nothing a login could make into a line of its own.
+        Such a session fails closed: nothing in it is captured or recalled.  Hermes reads none of this adapter's
+        diagnostics, so without the line a Desktop login's sessions could write nothing for days with nothing
+        to say so, and without the record no ``doctor`` would know of the owner's.  A local session is a Desktop or
+        ``hermes --tui`` one, or the owner's at the CLI.  A gateway chat left unmapped is the owner's choice and says
+        nothing: a line for each would name its users, some by phone number.  The platform, the login and the gap
+        codes only, never what was said, and nothing a login could make into a line of its own.
         """
         scope = identity.scope
-        if (
-            scope.platform not in LOCAL_PLATFORMS
-            or scope.agent_context != "primary"
-            or identity.runtime_audience.allowed_scope_ids
-        ):
+        owner = scope.user_id == LOCAL_USER_ID
+        local = scope.platform in LOCAL_PLATFORMS or (
+            scope.platform == "cli" and owner and not scope.gateway_session_key
+        )
+        if not local or scope.agent_context != "primary":
+            self._unbound_route = None
+            return
+        bound = bool(identity.runtime_audience.allowed_scope_ids)
+        if owner:
+            note_owner_session(
+                identity.manifest.data_directory,
+                entry_id=scope.entry_id,
+                platform=scope.platform,
+                gaps=None if bound else identity.runtime_audience.capability_gaps,
+            )
+        if bound:
             self._unbound_route = None
             return
         route = (scope.platform, scope.user_id, scope.chat_type, scope.chat_id, scope.thread_id, scope.agent_workspace)
@@ -193,7 +219,7 @@ class SessionBinding:
             scope.platform,
             scope.user_id[:120],
             ", ".join(identity.runtime_audience.capability_gaps),
-            unbound_session_hint(scope),
+            unbound_session_hint(scope.platform, scope.user_id, shared_entry=bool(scope.entry_id)),
         )
         _log.warning("%s", "".join(character for character in said if character.isprintable()))
 

@@ -7,8 +7,8 @@ assertion returns ``Mutation(..., "duplicate", ...)`` and its evidence is never
 recorded.  So the system has no way to get stronger by hearing something twice,
 which is how 401 claims in one store produced only 36 active ones.
 
-This is the missing dimension, and it is deliberately the *only* one being
-added.  Nothing here loosens a single judgement about a single source.  What it
+This module adds that missing dimension, and deliberately no other.
+Nothing here loosens a single judgement about a single source.  What it
 adds is the ordinary human standard: two people, or the same person on two
 separate occasions, independently stating the same thing is better evidence
 than either statement alone.
@@ -34,7 +34,9 @@ Five conditions, and all of them are narrow on purpose:
   the *eligible* kind.
 
 Not responsible for: judging either statement (``core/claims.qualify`` does
-that), or writing anything (``core/mutate.apply_claim`` owns the version).
+that), writing anything (``core/mutate.apply_claim`` owns the version), or what
+the slot allows: ``mutate._corroborated`` asks it only for the slot's own head,
+and never for a denial the denial rule keeps a proposal.
 """
 
 from __future__ import annotations
@@ -99,10 +101,9 @@ def independent_first_hand_sources(roots) -> set[tuple[str, int]]:
 def witness_occasions(roots) -> set[tuple[str | None, str]]:
     """Which *occasions* those sources represent: one per speaker per session.
 
-    This is the half that was missing.  Counting source events made "somebody
-    said the same thing twice in one breath" look like two witnesses -- the
-    module promised "two people, or the same person on two separate occasions"
-    and the code only checked that the two rows differed.
+    Counting source events would make "somebody said the same thing twice in
+    one breath" look like two witnesses, where the module promises "two
+    people, or the same person on two separate occasions".
 
     A different speaker in the same session is still two witnesses; the same
     speaker in two sessions is too.  The same speaker twice in one session is

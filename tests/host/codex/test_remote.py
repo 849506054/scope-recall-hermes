@@ -17,7 +17,7 @@ import time
 import urllib.error
 import urllib.request
 from contextlib import closing
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -191,7 +191,7 @@ def test_a_wrong_token_is_refused_and_nothing_is_stored(served, tmp_path):
     assert refused.value.code == 401
 
 
-def test_claude_code_prompt_and_record_reach_the_entry_once(served, tmp_path):
+def test_claude_code_prompt_and_record_reach_the_entry_once(served, tmp_path, still_clocks):
     root, _homes, ports = served
     config = _client(tmp_path, "claude-code", ports["claude-code"])
     at = _moments()
@@ -688,7 +688,7 @@ def test_a_failed_capture_s_code_reaches_the_server_log(served, tmp_path, monkey
 
 
 def test_a_failed_recall_s_cause_reaches_the_server_log(served, tmp_path, monkeypatch):
-    """The work computer's Codex server logged recall_exception three times and nothing else."""
+    """A Codex server whose recall fails logs the cause, not recall_exception and nothing else."""
     _root, homes, ports = served
     monkeypatch.setattr(
         remote_server,
@@ -755,8 +755,8 @@ def test_a_server_that_cannot_start_a_vector_helper_ahead_still_serves(store, mo
 
 
 def test_the_server_warms_its_kept_handler_when_it_starts(store, monkeypatch):
-    """Made at the first prompt, the kept handler opened the table inside that prompt's recall: the first two prompts
-    after the 3.4.0 restart recalled by words alone (2026-09-29 13:54:57 and 13:55:34)."""
+    """The kept handler is warmed when the server starts: made at the first prompt, it would open the table inside
+    that prompt's recall, and the first prompts would recall by words alone."""
     import sys as system
     import types
 
@@ -787,9 +787,9 @@ def test_the_server_warms_its_kept_handler_when_it_starts(store, monkeypatch):
 
 
 def test_the_server_shares_one_vector_store_among_its_handlers(store, monkeypatch):
-    """A prompt that came while the kept handler was busy got a handler whose store started a LanceDB helper of its
-    own: parallel sub-agents on the work computer lost their vector search to that helper's start (2026-09-30).  The
-    server shares its stores before anything builds one."""
+    """A prompt that comes while the kept handler is busy gets a handler whose store would start a LanceDB helper of
+    its own, and parallel sub-agents would lose their vector search to that helper's start.  The server shares its
+    stores before anything builds one."""
     import sys as system
     import types
 
@@ -820,8 +820,8 @@ def test_the_server_shares_one_vector_store_among_its_handlers(store, monkeypatc
 
 
 def test_a_recall_without_its_vector_search_is_named_in_the_server_log(served, tmp_path, monkeypatch):
-    """The work computer's recalls ran without their vector search for as long as anyone could tell: the packet
-    carried the gap to the model, and the server's log said nothing."""
+    """A recall without its vector search is named in the server's log, not only carried to the model as a gap in
+    the packet."""
     _root, homes, ports = served
     monkeypatch.setattr(
         remote_server,
@@ -949,7 +949,7 @@ def test_a_request_refused_for_good_neither_stays_nor_stops_the_spool(served, tm
 
 def test_a_client_clock_ahead_neither_hides_its_messages_nor_holds_back_their_work(store):
     """A recall finds nothing dated after its now, and the time a hook carried set when its work fell due: a message
-    dated a day ahead by a fast client clock was found by no recall for a day and embedded a day late.  A time more
+    dated a day ahead by a fast client clock would be found by no recall for a day and embedded a day late.  A time more
     than a minute ahead is this machine's now; within the minute it is kept as sent, so a correct client's hook sent
     again from the spool is the same source.  When a message was stored and its work are this machine's time."""
     root, homes = store
@@ -1016,17 +1016,130 @@ def test_a_client_clock_ahead_neither_hides_its_messages_nor_holds_back_their_wo
     assert parse(lines.lines[0][1].occurred_at) <= latest
 
 
-def test_a_fast_client_s_turn_keeps_its_order(store, monkeypatch):
+def test_a_fast_client_s_context_moment_is_not_used():
+    """A client whose clock runs ahead has its times moved back by leads that hold the network's delay, one for a
+    session only while the server keeps it: its in-context moment cannot be compared with them safely, and a message
+    from before the compaction could read as held.  Such a client's recall leaves nothing out."""
+    from scope_recall.adapters.clients.boundary import IN_CONTEXT_FIELD
+
+    ahead = datetime.now(UTC) + timedelta(hours=1)
+    stamp = lambda moment: moment.isoformat().replace("+00:00", "Z")  # noqa: E731
+    _observed, _record, lead = remote_server.client_times_and_lead({"observed_at": stamp(ahead)})
+    assert timedelta(minutes=59) < lead < timedelta(minutes=61)
+    since = {IN_CONTEXT_FIELD: stamp(ahead - timedelta(minutes=10)), "TEST": 1}
+    assert remote_server._context_since_kept(since, lead) == {"TEST": 1}
+    assert remote_server._context_since_kept(since, timedelta(0)) == since, "a client on time keeps it"
+    _observed, _record, on_time = remote_server.client_times_and_lead({"observed_at": stamp(datetime.now(UTC))})
+    assert on_time == timedelta(0)
+
+
+def test_an_older_client_s_reminders_are_taken_out_by_the_server(store, still_clocks):
+    """A client on another machine still on 3.10.4 sends the prompt as its hook got it and the person's messages
+    as its record has them, with the <system-reminder> Claude's desktop app put in them; the entry's server stores only
+    the person's words, and nothing for a message that is only reminders."""
+    root, homes = store
+    remote_server.write_server_config(
+        homes["claude-code"], "claude-code", listen="127.0.0.1", port=_free_port(), token_sha256="0" * 64
+    )
+    config = remote_server.load_server_config(homes["claude-code"], "claude-code")
+    at = _moments()
+    reminder = (
+        "<system-reminder>\nTEST The user started this session without choosing a project folder.\n</system-reminder>"
+    )
+    for prompt_id, text in (("TEST-p1", f"{reminder}\n\nTEST 第一问"), ("TEST-p2", reminder)):
+        remote_server.handle_request(
+            config,
+            {
+                "payload": {
+                    "hook_event_name": "UserPromptSubmit",
+                    "session_id": "TEST-work-session",
+                    "prompt_id": prompt_id,
+                    "prompt": text,
+                    "cwd": "C:/work",
+                },
+                "observed_at": at(0),
+            },
+        )
+    lines = [
+        transcript.Said("TEST-u1", "user", f"{reminder}\n\nTEST 第一问", at(0), "TEST-p1"),
+        transcript.Said("TEST-u2", "user", reminder, at(1), "TEST-p2"),
+        transcript.Said("TEST-q1", "user", f"{reminder}\nTEST 顺便一问", at(5)),
+        transcript.Said("TEST-a1", "assistant", "TEST 答了", at(9)),
+    ]
+    answer = remote_server.handle_request(
+        config,
+        {
+            "payload": {
+                "hook_event_name": "Stop",
+                "session_id": "TEST-work-session",
+                "prompt_id": "TEST-p2",
+                "cwd": "C:/work",
+                "last_assistant_message": "TEST 答了",
+            },
+            "record": {
+                "start": 0,
+                "lines": [[10 * (index + 1), transcript.said_to_wire(said)] for index, said in enumerate(lines)],
+            },
+            "observed_at": at(10),
+        },
+    )
+    assert answer["through"] == 40, "every line was read, the reminder alone among them"
+    assert sorted((role, content) for role, _origin, content, _at in _rows(root, "workpc-claude-code")) == sorted(
+        [("user", "TEST 第一问"), ("user", "TEST 顺便一问"), ("assistant", "TEST 答了")]
+    )
+
+
+def test_a_remote_prompt_s_recall_leaves_out_what_the_client_s_model_still_holds(store, tmp_path, still_clocks):
+    """The server opens no path a request names, so a Claude Code client reads since when its model holds the
+    session's turns from its own record and sends it with the prompt; the server's recall leaves those turns out.  A
+    client that cannot read its record sends nothing, and keeps nothing a payload carried of its own."""
+    from scope_recall.adapters.clients.boundary import IN_CONTEXT_FIELD
+
+    root, homes = store
+    remote_server.write_server_config(
+        homes["claude-code"], "claude-code", listen="127.0.0.1", port=_free_port(), token_sha256="0" * 64
+    )
+    config = remote_server.load_server_config(homes["claude-code"], "claude-code")
+    record = tmp_path / "TEST-work-session.jsonl"
+    record.write_text("", encoding="utf-8")
+    at = _moments()
+
+    def prompt(text, prompt_id, seconds, **extra):
+        payload = {
+            "hook_event_name": "UserPromptSubmit",
+            "session_id": "TEST-work-session",
+            "prompt_id": prompt_id,
+            "prompt": text,
+            "cwd": "C:/work",
+            "transcript_path": str(record),
+            **extra,
+        }
+        answer = remote_server.handle_request(config, {"payload": payload, "observed_at": at(seconds)})
+        return answer["result"].get("hookSpecificOutput", {}).get("additionalContext", "")
+
+    prompt("TEST 机器清单：构建机是 QX-17。", "TEST-p1", 0)
+    prompt("TEST 机器清单：部署机是 KZ-42。", "TEST-p2", 10)
+    question = "TEST 机器清单"
+    unknown = prompt(question, "TEST-p3", 20)
+    assert "QX-17。" in unknown and "KZ-42。" in unknown, "a prompt that carries nothing is recalled for as before"
+    since = remote_client._with_context_since(
+        {"session_id": "TEST-work-session", "transcript_path": str(record), IN_CONTEXT_FIELD: "TEST-forged"}
+    )
+    assert IN_CONTEXT_FIELD not in since, "an empty record says nothing, and what the payload carried is dropped"
+    record.write_text(
+        json.dumps({"type": "system", "subtype": "compact_boundary", "timestamp": at(5)}) + "\n", encoding="utf-8"
+    )
+    since = remote_client._with_context_since({"session_id": "TEST-work-session", "transcript_path": str(record)})
+    assert since[IN_CONTEXT_FIELD] == at(5).replace("+00:00", "Z")
+    held = prompt(question, "TEST-p4", 30, **{IN_CONTEXT_FIELD: since[IN_CONTEXT_FIELD]})
+    assert "QX-17。" in held and "KZ-42。" not in held, held
+
+
+def test_a_fast_client_s_turn_keeps_its_order(store, monkeypatch, still_clocks):
     """Clamped one time at a time, a client 90 s fast lost its order: a reply said 10 s into the turn kept its time
     (within the minute of the Stop that sent it), the next prompt was clamped to now, and the reply sorted after it
     and joined the next turn.  Every time a request carries moves back by the same lead."""
     root, homes = store
-    # Without a runtime config a test entry's hooks get 2 s; on a slow runner the Stop spent them on the store and the
-    # reply, and its record read stopped before the middle line this order needs.  A real entry's hooks get 6 s.
-    (homes["claude-code"] / "scope-recall").mkdir(parents=True, exist_ok=True)
-    (homes["claude-code"] / "scope-recall" / "runtime-config.json").write_text(
-        json.dumps({"hook_processing_seconds": 6, "resident_recall_minutes": 0}), "utf-8"
-    )
     remote_server.write_server_config(
         homes["claude-code"], "claude-code", listen="127.0.0.1", port=_free_port(), token_sha256="0" * 64
     )
@@ -1154,10 +1267,10 @@ def test_a_hook_the_busy_store_did_not_store_is_kept_to_send_again(store, tmp_pa
     assert len(list((config["state_dir"] / "spool").glob("*.json"))) == 1, "and the hook is kept to send again"
 
 
-def test_a_locked_database_fails_the_capture_or_the_recall_not_the_request(store, monkeypatch):
-    """SQLite's own "database is locked" (``BEGIN IMMEDIATE`` past its wait) escaped the hook: the server answered 500
-    and the prompt got no recall at all, as fifteen of the work computer's hooks did in one second on 2026-09-28
-    (rc13).  The capture fails and the hook is kept to send again; a recall that meets it fails alone."""
+def test_a_locked_database_fails_the_capture_or_the_recall_not_the_request(store, monkeypatch, still_clocks):
+    """SQLite's own "database is locked" (``BEGIN IMMEDIATE`` past its wait) does not escape the hook as a 500 that
+    leaves the prompt with no recall at all.  The capture fails and the hook is kept to send again; a recall that
+    meets it fails alone."""
     import sqlite3
 
     from scope_recall.core import MemoryCore
@@ -1194,7 +1307,7 @@ def test_a_locked_database_fails_the_capture_or_the_recall_not_the_request(store
     def broken(self, *args, **kwargs):
         raise sqlite3.DatabaseError("database disk image is malformed")
 
-    # A store broken otherwise than busy is named, where the answer said nothing of it (review of rc13).
+    # A store broken otherwise than busy is named in the answer.
     with monkeypatch.context() as patched:
         patched.setattr(MemoryCore, "record_host_event", broken)
         answer = remote_server.handle_request(server, dict(body, payload=dict(body["payload"], turn_id="TEST-l3")))
@@ -1202,8 +1315,8 @@ def test_a_locked_database_fails_the_capture_or_the_recall_not_the_request(store
 
 
 def test_a_hook_whose_message_s_key_was_deleted_is_not_sent_again(store, monkeypatch):
-    """A copy of a deleted message under that message's key is refused for good and leaves the inbox cancelled (rc13):
-    sent again, it met the same refusal on every try."""
+    """A copy of a deleted message under that message's key is refused for good and leaves the inbox cancelled; it is
+    not sent again, since it would meet the same refusal on every try."""
     from scope_recall.core import MemoryCore
     from scope_recall.core.capture import CaptureReceipt
     from scope_recall.core.capture_inbox import SOURCE_DELETED_GAP
@@ -1230,8 +1343,8 @@ def test_a_hook_whose_message_s_key_was_deleted_is_not_sent_again(store, monkeyp
 
 
 def test_a_refused_request_is_read_before_it_is_answered():
-    """Answered before its body was read, the connection closed with the request unread, and Windows resets such a
-    socket: the client got WinError 10053 instead of the 401 (CI, 2026-09-28)."""
+    """A refused request is read before it is answered: answered before its body is read, the connection closes with
+    the request unread, and Windows resets such a socket, so the client gets WinError 10053 instead of the 401."""
     import asyncio
 
     events = []
@@ -1257,8 +1370,9 @@ def test_a_refused_request_is_read_before_it_is_answered():
 
 
 def test_half_of_a_broken_emoji_reaches_the_entry(served, tmp_path):
-    """Sent as strict UTF-8, a prompt holding a lone surrogate (half of a broken emoji, which JavaScript writes)
-    failed its request, and the turn had no recall; the server refused such a payload for good (review of rc11)."""
+    """A prompt holding a lone surrogate (half of a broken emoji, which JavaScript writes) reaches the entry: sent as
+    strict UTF-8 it would fail its request, the turn would have no recall, and the server would refuse such a payload
+    for good."""
     root, homes, ports = served
     config = _client(tmp_path, "claude-code", ports["claude-code"])
     _hook(
@@ -1289,15 +1403,15 @@ def test_half_of_a_broken_emoji_reaches_the_entry(served, tmp_path):
 
 
 def test_a_hook_nested_past_the_parser_s_limit_is_answered_empty(tmp_path, past_the_parser):
-    """A payload nested past what the JSON parser takes ended the remote hook with a RecursionError (review of rc11)."""
+    """A payload nested past what the JSON parser takes does not end the remote hook with a RecursionError."""
     config = _client(tmp_path, "claude-code", _free_port())
     raw = past_the_parser(b'{"hook_event_name": "UserPromptSubmit", "prompt": ', b"}")
     assert remote_client.run_hook(config, raw) == {}
 
 
 def test_the_server_refuses_a_body_nested_past_the_parser_s_limit(served, past_the_parser):
-    """A request nested past what the parser takes raised out of the server as a 500, which a Codex client keeps to
-    send again for good (review of rc11)."""
+    """A request nested past what the parser takes is refused, not raised out of the server as a 500, which a Codex
+    client keeps to send again for good."""
     _root, _homes, ports = served
     body = past_the_parser(b'{"payload": ', b"}")
     request = urllib.request.Request(
@@ -1311,16 +1425,10 @@ def test_the_server_refuses_a_body_nested_past_the_parser_s_limit(served, past_t
     assert refused.value.code == 400
 
 
-def test_a_remote_prompt_s_recall_is_the_server_s_kept_recaller_s(store, tmp_path, monkeypatch):
-    """The work computer's prompts were recalled by a handler made for each request, which opened its vector table
-    and embedding worker every time: 3-5 s of a 5 s budget, a third of them without their vector search on
-    2026-09-29 (rc12).  A prompt's recall is asked of the server's kept recaller; the request's handler stores the
-    prompt, and recalls itself only while the kept one is busy.  This store has no runtime config, so a hook gets
-    the 2 s default, and a slow CI runner's capture left less than the second a kept recall is asked with: the
-    entries' own configs give 6 s."""
-    from scope_recall.adapters.clients import handler as handler_module
-
-    monkeypatch.setattr(handler_module, "_TOTAL_BUDGET_S", 10.0)
+def test_a_remote_prompt_s_recall_is_the_server_s_kept_recaller_s(store, tmp_path, still_clocks):
+    """A prompt's recall is asked of the server's kept recaller, not of a handler made for each request, which would
+    open its vector table and embedding worker every time (3-5 s of a 5 s budget).  The request's handler stores the
+    prompt, and recalls itself only while the kept one is busy."""
     _root, homes = store
     config = remote_server.RemoteServerConfig(
         home=homes["claude-code"], host="claude-code", listen="127.0.0.1", port=1, token_sha256="0" * 64
@@ -1407,18 +1515,15 @@ def test_the_server_log_says_how_the_kept_recall_went(served, tmp_path, monkeypa
         handler.close()
     log = (homes["codex"] / "scope-recall" / remote_server.LOG_NAME).read_text(encoding="utf-8")
     assert "hook UserPromptSubmit: None, record through None, " in log and ", warm recall answered" in log
-    # Where the time went (rc13); a runtime the handler did not attach is left out.
+    # Where the time went; a runtime the handler did not attach is left out.
     assert " ms (build 120 ms, capture 850 ms, close 40 ms), warm recall" in log
 
 
-def test_a_kept_recall_that_raised_is_named_and_the_request_recalls_itself(store, monkeypatch, caplog):
-    """A kept recall that raised was swallowed by the request's handler, and the server's log said nothing (review of
-    rc12)."""
+def test_a_kept_recall_that_raised_is_named_and_the_request_recalls_itself(store, caplog, still_clocks):
+    """A kept recall that raises is not swallowed by the request's handler: the server's log names it, and the request
+    recalls itself."""
     import logging
 
-    from scope_recall.adapters.clients import handler as handler_module
-
-    monkeypatch.setattr(handler_module, "_TOTAL_BUDGET_S", 10.0)
     _root, homes = store
     config = remote_server.RemoteServerConfig(
         home=homes["claude-code"], host="claude-code", listen="127.0.0.1", port=1, token_sha256="0" * 64
@@ -1442,7 +1547,7 @@ def test_a_kept_recall_that_raised_is_named_and_the_request_recalls_itself(store
     assert any("kept recall failed" in record.getMessage() and record.exc_info for record in caplog.records)
 
 
-def test_a_workbuddy_client_s_turn_and_record_reach_its_entry_once(store, tmp_path, monkeypatch):
+def test_a_workbuddy_client_s_turn_and_record_reach_its_entry_once(store, tmp_path, monkeypatch, still_clocks):
     """A WorkBuddy on another machine is forwarded as the claude-code host is: its Stop sends what its own session
     record shows (read with WorkBuddy's reader, the record found by its session when the hook names it wrongly), and
     the server stores each message once.  A Stop that only repeats the last reply sends nothing new."""

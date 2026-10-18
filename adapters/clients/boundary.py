@@ -6,7 +6,7 @@ import json
 import re
 from typing import Any
 
-from scope_recall.contracts import SourceEvent
+from scope_recall.contracts import ContractError, SourceEvent, utc_timestamp
 
 _SCOPE_RECALL_TOOL = re.compile(r"(?:^|__)(?:scope[-_]?recall)", re.IGNORECASE)
 _MAX_TOOL_CHARS = 65536
@@ -68,6 +68,54 @@ def is_task_notification(prompt: str) -> bool:
     return prompt.lstrip().startswith(TASK_NOTIFICATION_PREFIX)
 
 
+#: A reminder Claude's desktop app puts in the person's message, addressed to the model (a session started without a
+#: project folder, and others): a text block of its own, or ahead of what was typed in one string.  Such a block opens
+#: a line; the person's own words about one, inside a line, stay theirs.  The blank lines after one go with it.  The
+#: opening tag is matched within its line, and its end found by a plain search, so a text of many unclosed openings
+#: costs one pass, not one pass per opening.
+_CLAUDE_CODE_REMINDER_OPEN = re.compile(r"^[ \t]*<system-reminder\b[^>\n]*>", re.MULTILINE)
+_CLAUDE_CODE_REMINDER_CLOSE = "</system-reminder>"
+_BLANK_LINES = re.compile(r"(?:[ \t]*\r?\n)*")
+
+
+#: Where a prompt's payload carries since when the host's model still holds the session's own turns
+#: (``transcript.context_since``) to a recall that runs where the session record cannot be opened: the entry's resident
+#: server, or the server of a client on another machine.  Only this package's own hook and client write it (#249).
+IN_CONTEXT_FIELD = "scope_recall_in_context_since"
+
+
+def in_context_since(payload: dict[str, Any]) -> str | None:
+    """The moment a payload carries in ``IN_CONTEXT_FIELD``, as a UTC timestamp; None when it carries none or
+    not one."""
+    value = payload.get(IN_CONTEXT_FIELD)
+    if type(value) is not str:
+        return None
+    try:
+        return utc_timestamp(value)
+    except ContractError:
+        return None
+
+
+def claude_code_person_text(text: str) -> str:
+    """The person's own words in a Claude Code prompt or session-record message: without the ``<system-reminder>``
+    blocks the app put in it, or the text as it came when it holds none.  Stored as theirs, a reminder became things
+    they had said, and claims were drawn from it (#248).  A block that never closes, and what follows it, stay."""
+    kept: list[str] = []
+    position = 0
+    while (opening := _CLAUDE_CODE_REMINDER_OPEN.search(text, position)) is not None:
+        closing = text.find(_CLAUDE_CODE_REMINDER_CLOSE, opening.end())
+        if closing < 0:
+            break
+        kept.append(text[position : opening.start()])
+        position = closing + len(_CLAUDE_CODE_REMINDER_CLOSE)
+        blank = _BLANK_LINES.match(text, position)
+        position = blank.end() if blank is not None else position
+    if not kept:
+        return text
+    kept.append(text[position:])
+    return "".join(kept).strip()
+
+
 #: How WorkBuddy opens the message it hands its model, and so its prompt hook, when a Stop hook or a goal asks the
 #: turn to go on (its record marks the message ``providerData.isMeta``).
 WORKBUDDY_FEEDBACK_PREFIX = "Stop hook feedback:"
@@ -124,23 +172,35 @@ _CODEX_SUGGESTIONS_PROMPT = re.compile(r"\bhyperpersonali[sz]ed\s+suggestions?\b
 _CODEX_SUGGESTIONS_HEADINGS = re.compile(
     r"^#{1,2}[ \t]*(?:overview|rules|examples|bad examples|response format)[ \t]*$", re.IGNORECASE | re.MULTILINE
 )
+#: How the desktop app opens the shorter request it sends after each turn for one suggested next message: a frame in
+#: which Codex itself says the user did not write it.  Stored as the owner's, it would add Codex's instructions to
+#: their messages after every turn, and its answer would come back in recall.
+_CODEX_SUGGESTED_MESSAGE_PROMPT = re.compile(
+    r"This is an app-generated request for a suggested next user message\.\s+The user did not write this message\.",
+    re.IGNORECASE,
+)
 
 
 def is_codex_suggestions_prompt(prompt: str) -> bool:
     """Whether a prompt is Codex asking the model for suggestions, not the owner's words.
 
-    Told by its whole frame, not by one phrase: it opens with a heading, names its "hyperpersonalized suggestions"
-    in its first lines, runs to 11,000-15,000 characters and carries at least three of its own headings (Overview,
-    Rules, Examples, Bad examples, Response format).  A note of the owner's about it, even a long one, is their words.
+    Codex asks in two ways, each told by its own frame rather than by one phrase.  The request for one suggested next
+    message opens with the two sentences in which Codex says the user did not write it.  The request for several
+    suggestions opens with a heading, names its "hyperpersonalized suggestions" in its first lines, runs to
+    11,000-15,000 characters and carries at least three of its own headings (Overview, Rules, Examples, Bad examples,
+    Response format).  The owner's words about either, even long ones, stay theirs unless they open with that frame.
     """
     text = prompt.lstrip()
+    if _CODEX_SUGGESTED_MESSAGE_PROMPT.match(text) is not None:
+        return True
     if not text.startswith("#") or len(text) < 8000 or _CODEX_SUGGESTIONS_PROMPT.search(text[:600]) is None:
         return False
     return len({heading.strip("# \t").lower() for heading in _CODEX_SUGGESTIONS_HEADINGS.findall(text)}) >= 3
 
 
 def is_codex_suggestions_reply(message: str) -> bool:
-    """Whether a reply is the model's answer to that request: a JSON object holding only a list of suggestions."""
+    """Whether a reply is the model's answer to such a request: a JSON object holding only a list of suggestions, or
+    only the one suggested message."""
     text = message.strip()
     if not text.startswith("{") or len(text) > _MAX_TOOL_CHARS:
         return False
@@ -148,7 +208,11 @@ def is_codex_suggestions_reply(message: str) -> bool:
         value = json.loads(text)
     except (ValueError, RecursionError):
         return False
-    return isinstance(value, dict) and set(value) == {"suggestions"} and isinstance(value["suggestions"], list)
+    if not isinstance(value, dict) or len(value) != 1:
+        return False
+    if "suggestions" in value:
+        return isinstance(value["suggestions"], list)
+    return isinstance(value.get("suggestion"), str)
 
 
 def user_prompt_source_event(
@@ -192,8 +256,10 @@ def assistant_stop_source_event(
     turn_id: str,
     message: str,
     recorded_at: str,
+    occurred_at: str | None = None,
     host: str = "codex",
 ) -> tuple[SourceEvent | None, tuple[str, ...]]:
+    """A turn's reply under the turn's key, said at ``occurred_at`` when the client says when, else when recorded."""
     gaps: list[str] = []
     if not message.strip():
         gaps.append("outcome_gap:missing_assistant_body")
@@ -211,7 +277,7 @@ def assistant_stop_source_event(
         "origin": "assistant_visible",
         "role": "assistant",
         "content": message,
-        "occurred_at": recorded_at,
+        "occurred_at": recorded_at if occurred_at is None else occurred_at,
         "recorded_at": recorded_at,
         "time_precision": "instant",
         "capture_state": "complete",

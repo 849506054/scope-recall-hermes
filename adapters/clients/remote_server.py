@@ -30,7 +30,9 @@ import logging.handlers
 import os
 import re
 import sys
+import threading
 import time
+from collections import OrderedDict
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -39,7 +41,7 @@ from typing import Any, Callable
 from ..._version import __version__
 from ...runtime.worker_entry import host_process_credential_environment
 from . import transcript
-from .boundary import without_lone_surrogates
+from .boundary import IN_CONTEXT_FIELD, without_lone_surrogates
 from .config import CodexConfigError, load_shared_client
 from .handler import CodexHookHandler, SystemHookClock
 from .local_endpoint import KeptRecaller, entry_files, file_stamp
@@ -64,10 +66,40 @@ class RemoteServerError(ValueError):
 #: How far a client's clock may run ahead of this machine's.  A recall drops what is dated after its now, so a
 #: message dated a day ahead by a fast client clock would reach no recall for a day.  Within the minute a time is
 #: kept as sent, so a correct client's hook sent again is the same source.  Beyond it every time in the request
-#: moves back by the same lead, so its latest is this machine's now and the order the turn was said in holds.  (A
-#: client more than a minute fast gets a new lead each time, and a hook it sends twice may be stored twice: the
-#: lesser harm.)
+#: moves back by its client session's lead (``_SessionLeads``), so the session's latest is about this machine's now
+#: and the order its turns were said in holds.
 CLOCK_AHEAD_SECONDS = 60
+
+
+class _SessionLeads:
+    """The lead each client session's times move back by: the one its first request found ahead of this machine,
+    while a request's own is within ``CLOCK_AHEAD_SECONDS`` of it.  A request's own lead holds its delay on the way
+    here, which differs from request to request: moved back each by its own, a turn's reply that came with a quicker
+    Stop would be dated before the prompt it answers.  A lead further off is a clock set anew or a hook sent long after
+    it ran, and its request moves back by its own (a hook sent twice may then be stored twice: the lesser harm).  Past
+    ``kept`` sessions the least recent is forgotten."""
+
+    def __init__(self, kept: int = 1024) -> None:
+        self._kept = kept
+        self._leads: OrderedDict[str, timedelta] = OrderedDict()
+        self._lock = threading.Lock()
+
+    def lead(self, session: object, own: timedelta) -> timedelta:
+        if type(session) is not str or not session.strip():
+            return own
+        with self._lock:
+            first = self._leads.get(session)
+            if first is None:
+                if own > timedelta(seconds=CLOCK_AHEAD_SECONDS):
+                    self._leads[session] = own
+                    while len(self._leads) > self._kept:
+                        self._leads.popitem(last=False)
+                return own
+            self._leads.move_to_end(session)
+        return first if abs(first - own) <= timedelta(seconds=CLOCK_AHEAD_SECONDS) else own
+
+
+_SESSION_LEADS = _SessionLeads()
 
 
 def _now() -> datetime:
@@ -186,20 +218,36 @@ def _observed_at(value: object) -> datetime | None:
     return moment.astimezone(timezone.utc)
 
 
-def client_times(body: dict[str, Any]) -> tuple[str | None, RecordLines | None]:
-    """The hook's time and the record lines a request carries, moved back together if the client's clock is ahead.
+def client_times(body: dict[str, Any], host: str | None = None) -> tuple[str | None, RecordLines | None]:
+    """The hook's time and the record lines a request carries, moved back together, by the lead of the request's
+    client session (``_SessionLeads``), if the client's clock is ahead.
 
-    Clamped one at a time, a fast client's turn fell out of order: a reply said early in the turn kept its time,
-    the prompt after it was clamped to now, and the reply was joined to the next turn.
+    Clamped one at a time, a fast client's turn would fall out of order: a reply said early in the turn would keep
+    its time, the prompt after it be clamped to now, and the reply be joined to the next turn.  dsh's plugin sends
+    the turn's messages inside its Stop's payload (``RecordLines.from_dsh``), any other client its record's lines
+    beside the payload.
     """
+    observed_at, record, _lead = client_times_and_lead(body, host)
+    return observed_at, record
+
+
+def client_times_and_lead(
+    body: dict[str, Any], host: str | None = None
+) -> tuple[str | None, RecordLines | None, timedelta]:
+    """``client_times``, and how far everything was moved back (nothing when the client's clock is not ahead)."""
     observed = _observed_at(body.get("observed_at"))
-    record = record_from_wire(body.get("record"))
+    sent = body.get("payload")
+    payload: dict[str, Any] = sent if isinstance(sent, dict) else {}
+    if host == "dsh":
+        record = RecordLines.from_dsh(payload) if "record" in payload else None
+    else:
+        record = record_from_wire(body.get("record"))
     times = [observed] if observed is not None else []
     if record is not None:
         times.extend(_moment(said.occurred_at) for _offset, said in record.lines if said is not None)
-    lead = max(times) - _now() if times else timedelta(0)
+    lead = _SESSION_LEADS.lead(payload.get("session_id"), max(times) - _now() if times else timedelta(0))
     if lead <= timedelta(seconds=CLOCK_AHEAD_SECONDS):
-        return (_stamp(observed) if observed is not None else None), record
+        return (_stamp(observed) if observed is not None else None), record, timedelta(0)
     if record is not None:
         record = replace(
             record,
@@ -211,7 +259,17 @@ def client_times(body: dict[str, Any]) -> tuple[str | None, RecordLines | None]:
                 for offset, said in record.lines
             ],
         )
-    return (_stamp(observed - lead) if observed is not None else None), record
+    return (_stamp(observed - lead) if observed is not None else None), record, lead
+
+
+def _context_since_kept(payload: dict[str, Any], lead: timedelta) -> dict[str, Any]:
+    """A Claude Code prompt's in-context moment, kept only from a client whose times are stored as it sent them.
+    Moved back with this request's lead, it would be compared with messages moved back by the leads of earlier
+    requests, one lead for a session only while this server runs and keeps it (``_SessionLeads``), and a message from
+    before the compaction could read as held; such a client's recall leaves nothing out."""
+    if lead <= timedelta(0) or IN_CONTEXT_FIELD not in payload:
+        return payload
+    return {key: value for key, value in payload.items() if key != IN_CONTEXT_FIELD}
 
 
 def record_from_wire(value: object) -> RecordLines | None:
@@ -275,8 +333,9 @@ def handle_request(
     payload = {key: value for key, value in payload.items() if key != "transcript_path"}
     # The hook's own times are the client's (moved back if more than a minute ahead, see CLOCK_AHEAD_SECONDS), so a
     # hook sent again from the spool is the same source.  When it was stored, when its work falls due and a recall's
-    # now are this machine's: a client clock a day fast held back a message's embedding by a day.
-    observed_at, record = client_times(body)
+    # now are this machine's: a client clock a day fast would hold back a message's embedding by a day.
+    observed_at, record, lead = client_times_and_lead({**body, "payload": payload}, config.host)
+    payload = _context_since_kept(payload, lead)
     building = time.monotonic()
     handler = CodexHookHandler.from_home(
         str(config.home),
@@ -348,7 +407,7 @@ def build_app(config: RemoteServerConfig, *, warm: bool = False):
         host=config.listen,
         transport_security=TransportSecuritySettings(
             enable_dns_rebinding_protection=True,
-            # An IPv6 address comes in the Host header in brackets; unbracketed, every /mcp call got 421.
+            # An IPv6 address comes in the Host header in brackets; unbracketed, every /mcp call would get 421.
             allowed_hosts=[host_name, f"{host_name}:{config.port}"],
             allowed_origins=[],
         ),
@@ -419,8 +478,8 @@ _DRAIN_BYTES = 1 << 20
 
 
 async def _drain(receive) -> None:
-    """Read what a refused client sent, up to ``_DRAIN_BYTES``.  Answered first, the connection was closed with the
-    request unread, and Windows resets such a socket: the client got WinError 10053 instead of the 401."""
+    """Read what a refused client sent, up to ``_DRAIN_BYTES``.  Answered first, the connection would be closed with
+    the request unread, and Windows resets such a socket: the client would get WinError 10053 instead of the 401."""
     read = 0
     while read <= _DRAIN_BYTES:
         message = await receive()
@@ -473,7 +532,7 @@ def serve(config: RemoteServerConfig, *, env_file: Path | None = None) -> None:
         os.environ.update(host_process_credential_environment(client.runtime_config_path, env_file))
     log_to_file(config.home)
     if sys.platform == "win32":
-        # Every request builds its handler afresh, and a vector helper started for it spent the recall's budget
+        # Every request builds its handler afresh, and a vector helper started for it would spend the recall's budget
         # importing LanceDB and opening the table: every handler of this process searches one store
         # (``vector.process_store.share``), whose helper is started now (``prestart``).
         from ...vector.process_store import prestart, share
@@ -482,7 +541,7 @@ def serve(config: RemoteServerConfig, *, env_file: Path | None = None) -> None:
         try:
             prestart()
         except OSError as exc:
-            # Without it each recall starts its own helper, as before: slower, never a reason not to serve.
+            # Without it each recall starts its own helper: slower, never a reason not to serve.
             _log.warning("could not start a vector helper ahead: %s", type(exc).__name__)
 
     _log.info(

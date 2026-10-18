@@ -105,6 +105,31 @@ def _exact_evidence(item: Row | None, quote: str, scope_id: str, project: str | 
     )
 
 
+def _quoted_sources(
+    cv: Conversion, by_event: dict[str, Row], ref: str, quote: str, context: tuple[str, str | None, str | None]
+) -> list[tuple[str, str]]:
+    """Where a quote is live, as (source, its words there): the cited record's own source, or of a record stored in
+    parts, the part holding it, or for a quote running across a boundary, each part with its piece of the quote."""
+    parts = cv.record_parts.get(ref) or ([by_event[ref]] if ref in by_event else [])
+    for item in parts:
+        if _exact_evidence(item, quote, *context):
+            return [(item["event_id"], quote)]
+    text = quote[:4096]
+    start = "".join(item["content"] for item in parts).find(text) if len(parts) > 1 and text else -1
+    if start < 0:
+        return []
+    held, offset = [], 0
+    for item in parts:
+        low, high = max(start, offset), min(start + len(text), offset + len(item["content"]))
+        if low < high:
+            piece = text[low - start : high - start]
+            if not _exact_evidence(item, piece, *context):
+                return []
+            held.append((item["event_id"], piece))
+        offset += len(item["content"])
+    return held
+
+
 def _sources_by_event(cv: Conversion) -> dict[str, Row]:
     index: dict[str, Row] = {}
     for item in cv.sources:
@@ -265,9 +290,9 @@ def _fact_evidence(
             row.get("source_ref"), row.get("source_type"), cv.journal_refs, cv.memory_refs, cv.archives
         )
         quote, _ = sanitized_text(row.get("excerpt"))
-        if ref and _exact_evidence(by_event.get(ref), quote, scope_id, project, branch):
-            origin = by_event[ref].get("source_original_origin") or ""
-            evidence.append((ref, quote, text_or_none(row.get("location"))))
+        for held, words in _quoted_sources(cv, by_event, ref, quote, (scope_id, project, branch)) if ref else ():
+            origin = by_event[held].get("source_original_origin") or ""
+            evidence.append((held, words, text_or_none(row.get("location"))))
     return evidence, origin
 
 
@@ -520,8 +545,8 @@ def _procedure_evidence(
     for anchor in evidence_items(version.data.get("evidence_anchors") or playbook.get("evidence_anchors")):
         ref = resolve_evidence_ref(anchor_ref(anchor), "", cv.journal_refs, cv.memory_refs, cv.archives)
         quote, _ = sanitized_text(anchor.get("quote") or anchor.get("excerpt"))
-        if ref and _exact_evidence(by_event.get(ref), quote, scope_id, project, branch):
-            evidence.append((ref, quote, None))
+        for held, words in _quoted_sources(cv, by_event, ref, quote, (scope_id, project, branch)) if ref else ():
+            evidence.append((held, words, None))
     return evidence
 
 

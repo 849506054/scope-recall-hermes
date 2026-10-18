@@ -11,7 +11,7 @@ from __future__ import annotations
 import hashlib
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from typing import Iterable, cast
 
@@ -27,6 +27,7 @@ from .recall_policy import (
     hard_identifiers,
     meaningful_query_terms,
     query_is_relevant,
+    shares_enough,
     synonym_expansions,
 )
 from .recall_scope import says_something
@@ -52,7 +53,7 @@ _LEXICAL_DF_FRACTION = 0.10
 _LEXICAL_DF_FLOOR = 64
 #: Postings the lexical statement may group, the kept terms' document
 #: frequencies added rarest first.  It groups every posting of every term, so its
-#: time follows this sum: on the shared store a 2,000-character prompt's 80
+#: time follows this sum: on a shared store a 2,000-character prompt's 80
 #: terms held 273,000 postings and took 9 s, longer than the prompt's whole
 #: recall, which then ran without its vector search as well.  The rarest
 #: terms separate the most, and a question's own few are never cut.
@@ -89,10 +90,10 @@ def _searched_terms(tx, terms: tuple[str, ...], keep: tuple[str, ...] = ()) -> t
     Drop query terms too common to separate anything.
 
     Document frequency is read once for the query's own terms, which is a
-    clustered range scan: ``lexical_projection`` is WITHOUT ROWID keyed on
-    ``(term, event_id, source_revision)``.  If every term is that common the
-    query keeps its rarest ones: answering from a weak signal beats answering
-    from none, and the vector and recent channels still contribute.
+    clustered range scan: ``lexical_postings`` is WITHOUT ROWID keyed on
+    ``(term_id, source_id)``.  If every term is that common the query keeps
+    its rarest ones: answering from a weak signal beats answering from none,
+    and the vector and recent channels still contribute.
 
     ``keep`` is never dropped however common: the query's hard identifiers,
     which hydration requires of every source.  Without them the SQL cannot
@@ -234,17 +235,19 @@ TURN_REPLY_LIMIT = 3
 #: How long after a person's message a further message of theirs, sent before the agent's first reply, still joins
 #: its turn (``RetrievalStorage._turn``).  The person adds to what they asked while the agent works, and the reply
 #: answers both: of one person's 1,242 messages over two weeks, 141 had such a follow-up before a reply, 70 of them
-#: inside the same host turn, and without this their turns read empty, so a question asked again never reached what
-#: it had been told.  Nine in ten such follow-ups came within ten minutes; a later one may open a turn of its own.
+#: inside the same host turn, and without this their turns would read empty, so a question asked again would never
+#: reach what it was told.  Nine in ten such follow-ups came within ten minutes; a later one may open a turn of its
+#: own.
 TURN_FOLLOWUP_SECONDS = 600
-#: Rows of one named day (and entries) the scoped channel reads before it chooses (``RetrievalStorage.scoped``), in
-#: time order.  The shared store's busiest day was 861 messages of every entry, 542 of one; read only to 400 rows,
-#: it lost its evening.
+#: Rows of one named day (and entries) the scoped channel reads before it chooses (``RetrievalStorage.scoped``), in time
+#: order, one statement a day.  A shared store's busiest day was 861 messages of every entry, 542 of one: a day cut
+#: short loses its evening, so the bound sits well above that.
 _SCOPED_SCAN_ROWS = 2000
 #: Characters of a scoped message an automatic packet (4,096 units, six items) can still deliver beside others.
 _SCOPED_ITEM_CHARS = 600
 #: Characters up to which a message is read for whether it says anything of its day (``recall_scope.says_something``):
-#: "继续", "好的，继续吧", "OK 继续执行" and "按你说的做" do not, and on a day of long prompts they filled the packet.
+#: "继续", "好的，继续吧", "OK 继续执行" and "按你说的做" do not, and on a day of long prompts they would fill the
+#: packet.
 _SCOPED_SHORT_CHARS = 20
 
 
@@ -269,7 +272,7 @@ def _shares(counts: list[int], limit: int) -> list[int]:
 def _coarse_to_fine(items: list) -> list:
     """``items``, in time order, reordered so that any first part of them spreads across all of them: the first, the
     middle, the quarters, the eighths (the positions' bits read backwards).  Offered in time order, a packet of six
-    took a day's morning and left its afternoon out."""
+    would take a day's morning and leave its afternoon out."""
     bits = max(1, (len(items) - 1).bit_length())
     return [items[index] for index in sorted(range(len(items)), key=lambda index: int(f"{index:0{bits}b}"[::-1], 2))]
 
@@ -292,7 +295,18 @@ class RetrievalStorage(RetrievalHydration):
 
     # -- candidate channels ---------------------------------------------------
 
-    def lexical(self, tx, context: SearchContext, *, limit: int) -> tuple[CandidateRef, ...]:
+    def lexical(
+        self,
+        tx,
+        context: SearchContext,
+        *,
+        limit: int,
+        within: tuple[tuple[str, str], ...] = (),
+        among: frozenset[str] | None = None,
+    ) -> tuple[CandidateRef, ...]:
+        """Sources holding the query's terms, those holding most first.  With ``within``, only those said within one
+        of its UTC ``[start, end)`` windows; with ``among``, only the terms it holds of those the plain statement
+        searches (``dated``), so no posting it would not group."""
         terms = meaningful_query_terms(context.query)
         if not terms:
             return ()
@@ -304,6 +318,12 @@ class RetrievalStorage(RetrievalHydration):
         requested = hard_identifiers(context.query)
         identifiers = tuple(term for term in terms if requested.intersection(hard_identifiers(term)))
         terms, cut = _searched_terms(tx, terms, keep=identifiers)
+        if among is not None:
+            terms, cut, identifiers = (
+                tuple(term for term in group if term in among) for group in (terms, cut, identifiers)
+            )
+            if not terms:
+                return ()
         # A synonym term matches as the query term it stands in for, so hits
         # and matched terms still count the query's own terms, once each.
         # Without a synonym the statement and its parameters are unchanged.
@@ -329,6 +349,8 @@ class RetrievalStorage(RetrievalHydration):
         if context.as_of is not None:
             as_of = " AND (e.occurred_at IS NULL OR e.occurred_at<=?)"
             params.append(context.as_of)
+        said = " AND (" + " OR ".join("(e.occurred_at>=? AND e.occurred_at<?)" for _ in within) + ")" if within else ""
+        params.extend(bound for window in within for bound in window)
         # The statement starts from the query's terms.  A store keeps no planner statistics, so SQLite weighs the terms
         # against the scopes by rule of thumb, and with a long enough query it started from the scope index instead:
         # every event of the audience read one by one, 21 s for a Telegram message of 72 characters on the shared
@@ -344,7 +366,7 @@ class RetrievalStorage(RetrievalHydration):
                   AND (e.branch_id IS NULL OR e.branch_id=?)
                   AND NOT EXISTS(SELECT 1 FROM object_blocks b WHERE b.object_kind='event'
                       AND b.object_ref=e.event_id AND b.read_blocked=1)
-                  {current}{as_of}
+                  {current}{as_of}{said}
                 GROUP BY e.event_id,e.source_revision
                 ORDER BY CASE
                     WHEN e.role='tool' AND (
@@ -359,7 +381,7 @@ class RetrievalStorage(RetrievalHydration):
             .fetchall()
         )
         # The posting budget chose which rows the statement found; what a found row holds of the terms it left out
-        # still counts, as before: admission weighs a row's matches against the whole query.
+        # still counts: admission weighs a row's matches against the whole query.
         held = _held_terms(tx, [row["source_id"] for row in rows], cut) if cut and rows else {}
         candidates = []
         for index, row in enumerate(rows, 1):
@@ -378,16 +400,41 @@ class RetrievalStorage(RetrievalHydration):
             )
         return tuple(candidates)
 
+    def dated(self, tx, context: SearchContext, *, limit: int) -> tuple[CandidateRef, ...]:
+        """Sources said within the time the question names (``context.time``) that hold enough of what else it asks
+        (``shares_enough``): the lexical statement for the question, on the words of what else it asks alone, kept to
+        that time.  It searches none of the terms the plain statement leaves out, so it groups no posting that one
+        would not, and its windows drop the others before they are grouped.
+
+        Weighed against the whole question, a note said on the day asked about is short of the words that name the
+        day, which it never repeats ("September", "11"), and below the notes on its subject that hold more words; on
+        a long-lived store the newest of those fill the lexical pool before it.
+        """
+        named = context.time
+        # A question about what was said on its day is read in that day already (``scoped``).
+        if named is None or context.scope is not None or limit <= 0:
+            return ()
+        terms = frozenset(meaningful_query_terms(named.rest))
+        if not terms:
+            return ()
+        found = self.lexical(tx, context, limit=limit, within=named.windows, among=terms)
+        held = [
+            candidate
+            for candidate in found
+            if shares_enough(len(terms.intersection(candidate.matched_query_terms or ())), len(terms))
+        ]
+        return tuple(replace(candidate, source="dated", rank=index) for index, candidate in enumerate(held, 1))
+
     def claims(self, tx, context: SearchContext, *, limit: int) -> tuple[CandidateRef, ...]:
         """Claims whose own statement answers the query.
 
-        The lexical, vector and recent channels all yield events, so a fact used
-        to reach recall only through relation expansion out of an event that was
-        retrieved first.  In a benchmark, 19 of the 29 facts recall missed were
-        never reached at all: newer talk about the same subject filled the
-        lexical pool before the fact's own evidence.  A claim is short and
-        structured, so it is matched on its statement, with its own rule
-        (``_claim_answers``) instead of the event specificity bar.
+        The lexical, vector and recent channels all yield events, so without
+        this a fact reaches recall only through relation expansion out of an
+        event that was retrieved first.  In a benchmark, 19 of the 29 facts
+        recall missed that way were never reached at all: newer talk about the
+        same subject filled the lexical pool before the fact's own evidence.  A
+        claim is short and structured, so it is matched on its statement, with
+        its own rule (``_claim_answers``) instead of the event specificity bar.
 
         One candidate per claim: the version answering in this mode, chosen with
         the same selectors hydration applies, so a replaced value is never the
@@ -537,7 +584,7 @@ class RetrievalStorage(RetrievalHydration):
                 and (row["short"] is None or says_something(row["short"]))
             ]
             # A message longer than an automatic packet can hold beside others is left out of it whole (the compiler
-            # never slices content), and on the coding clients' days most messages are: offered first, they were
+            # never slices content), and on the coding clients' days most messages are: offered first, they would be
             # dropped and other days' short items delivered instead.
             days.append(
                 [
@@ -566,8 +613,8 @@ class RetrievalStorage(RetrievalHydration):
         trusted = context.trusted_context
         scopes = tuple(sorted(trusted.allowed_scope_ids))
         excluded = set(context.current_source_refs)
-        # From the queue's pending rows (``work_ready``), never from every consolidation ever made: done items are
-        # kept, and with no planner statistics SQLite read all of them by their work type (3,070 on the shared store,
+        # From the queue's pending rows (``work_ready``), never from every consolidation ever made: done items are kept,
+        # and with no planner statistics SQLite would read all of them by their work type (3,070 on a shared store,
         # growing with every consolidation) or, with one scope, every event of it.  ``+`` keeps those filters from
         # choosing an index; the rows are the same.
         rows = (
@@ -656,8 +703,8 @@ class RetrievalStorage(RetrievalHydration):
         cut at ``limit``, or with no reply or no ``now`` to judge by).
 
         Episode membership reaches a reply only through every event of its
-        episode, in id order, so a recalled question used up the relation bound
-        long before its own answer.  A turn's replies are the assistant's
+        episode, in id order, so a recalled question would use up the relation
+        bound long before its own answer.  A turn's replies are the assistant's
         visible messages in the same scope and session after the message, in
         capture order, until the person speaks again, within the first 64 rows
         and ``TURN_REPLY_SECONDS``.  A gateway can capture a whole turn under
@@ -665,25 +712,25 @@ class RetrievalStorage(RetrievalHydration):
         its end when the person spoke again within them, or when the rows ran
         out, its window has closed, and what the session says in the window
         after it, if anything, is the person's: an agent's turn of forty tool
-        calls went past the 64 rows, and its last reply read was not its answer,
-        nor is the last of a turn still going on.  That look
-        is bounded to the next window, which the scope's time index reads in
-        order: unbounded, it would read every later row of the scope.
+        calls can go past the 64 rows, and its last reply read is then not its
+        answer, nor is the last of a turn still going on.  That look is bounded
+        to the next window, which the scope's time index reads in order:
+        unbounded, it would read every later row of the scope.
 
-        The same message stored again is not the person speaking again.  A
-        Hermes provider rebuilt with its agent stored a turn's message a second
-        time in older releases, with the reply, under the host's ordinal (most
-        Hermes turns that seemed to have no reply were that), and the first copy
-        would stop at the second before reaching the answer.
-        With ``join``, neither is what the person adds before the agent's first
+        The same message stored again is not the person speaking again: a store
+        can hold a turn's message twice, the second copy with the reply under the
+        host's ordinal (a Hermes provider rebuilt with its agent stored it again),
+        and the first copy would otherwise stop at the second before reaching the
+        answer.  With
+        ``join``, neither is what the person adds before the agent's first
         reply, within ``TURN_FOLLOWUP_SECONDS``: the reply often answers both.
         Only the replies a turn offers as candidates join (``turn_replies``),
         which rank them like any other: the reply can answer a new request
         instead ("算了，先查值班表"), so it never leads an older copy to it
-        (``latest_turn``), where the last reply is raised above the rest.
-        A message the host writes into the conversation
-        (a finished background process) ends a turn as the person's does: the
-        rows do not say which turn its job began in.
+        (``latest_turn``), where the last reply is raised above the rest.  A
+        message the host writes into the conversation (a finished background
+        process) ends a turn as the person's does: the rows do not say which
+        turn its job began in.
         """
         window_end = (
             (datetime.fromisoformat(opened) + timedelta(seconds=TURN_REPLY_SECONDS))

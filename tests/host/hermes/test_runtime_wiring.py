@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import sys
 import threading
-import time
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -206,9 +205,9 @@ def configured_provider(hermes_home, initialize_kwargs):
 
 def test_every_runtime_a_hermes_process_attaches_searches_one_store_of_a_table(configured_provider):
     """A gateway attaches a runtime for every agent it makes, and Hermes does not always shut down the one it made
-    before: each runtime held a vector helper of its own, about 1.15 GB (yuheng's gateway held two on 2026-10-02, one
-    per registration of the provider).  Hermes' attach makes the process share one store of each table, as a server
-    does (``vector.process_store.share``), before the runtime builds its own."""
+    before: a runtime holding a vector helper of its own would cost about 1.15 GB each.  Hermes' attach makes the
+    process share one store of each table, as a server does (``vector.process_store.share``), before the runtime
+    builds its own."""
     import scope_recall.vector.process_store as process_store
 
     assert configured_provider._host_runtime is not None
@@ -223,7 +222,7 @@ def test_two_hermes_agents_build_views_of_one_vector_store_and_a_shutdown_leaves
     hermes_home, initialize_kwargs, monkeypatch
 ):
     """Both runtimes' stores, built through their real factories (nothing is opened, no helper starts), are views of
-    one store; a provider's shutdown leaves it to the process (review of 3.5.0rc4)."""
+    one store; a provider's shutdown leaves it to the process."""
     import scope_recall.vector.process_store as process_store
     from scope_recall.core.recall_policy import EMBEDDING_SPACE, embedding_space_id
 
@@ -271,7 +270,10 @@ def test_two_hermes_agents_build_views_of_one_vector_store_and_a_shutdown_leaves
             provider.shutdown()
 
 
-def test_session_end_detaches_bounded_worker_without_shared_drain(configured_provider, monkeypatch):
+def test_session_end_detaches_bounded_worker_without_shared_drain(configured_provider, monkeypatch, metered_store):
+    """A session's end launches the bounded worker detached and its shutdown waits for no drain: it is done within
+    half a second on a clock that counts each store transaction 0.01 s, however long the runner's store takes."""
+    clock = metered_store(0.01)
     provider = configured_provider
     host_runtime = provider._host_runtime
     runtime = host_runtime.runtime
@@ -294,9 +296,9 @@ def test_session_end_detaches_bounded_worker_without_shared_drain(configured_pro
         provider.on_session_end([])
         assert GAP_WORKER_BUSY in provider.diagnostics.capability_gaps
         provider.on_session_switch("TEST-session-2")
-        started = time.monotonic()
+        started = clock()
         provider.shutdown()
-        assert time.monotonic() - started < 0.5
+        assert clock() - started < 0.5, clock() - started
         assert not entered.is_set()
         runtime.drain.assert_not_called()
         close.assert_called_once()

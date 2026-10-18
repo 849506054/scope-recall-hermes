@@ -317,6 +317,129 @@ def test_reply_cut_off_at_output_limit_is_named_in_the_guided_retry(worker_app, 
     assert row[3] == "failed" and row[6].startswith("derivation_retry:1|")
 
 
+def test_reply_the_providers_policy_stopped_fails_the_item_at_once_as_a_terminal_failure(
+    worker_app, tmp_path, monkeypatch
+):
+    from scope_recall.core.worker import build_consolidation_model
+    from scope_recall.runtime.auxiliary import build_auxiliary_runtime
+    from scope_recall.runtime.instance import _BoundedConsolidation
+    from test_runtime_auxiliary import FakeTransport, _chat_reply, _runtime_config
+
+    core, ctx, clock = worker_app
+    source = capture(core, ctx, "TEST 输出被内容过滤停下。")
+    _mark_embed_done(core)
+    config, _, _ = _runtime_config(tmp_path)
+    monkeypatch.setenv("SCOPE_RECALL_TEST_CHAT_KEY", "test-key")
+    stopped = {"role": "assistant", "content": '{"protocol_version":"1.1","source_refs":["'}
+    transport = FakeTransport(lambda **kwargs: (200, _chat_reply(stopped, "content_filter")))
+    runtime = build_auxiliary_runtime(config, transport=transport)
+    model = _BoundedConsolidation(build_consolidation_model(runtime.consolidation), 3)
+    for attempt in range(1, 5):
+        clock.advance(seconds=65.0, iso=f"2026-09-06T12:{attempt:02d}:30Z")
+        core.drain_worker(ctx, consolidation=model, max_items=2, remaining_seconds=5)
+    # Asking again would send the same request to the same policy: it is asked once, and the failure is by design.
+    assert transport.calls == 1
+    row = next(row for row in work_rows(core) if row[1] == source.ref and row[0] == "consolidate")
+    assert row[3] == "failed" and row[4] == 1 and row[6] == "model_refused"
+    with sqlite3.connect(core.storage.path) as db:
+        assert db.execute("SELECT error_code,error_field FROM work_error_details").fetchall() == [
+            ("model_refused", None)
+        ]
+    status = core.status(ctx)
+    assert (status.failed_work, status.terminal_failed_work) == (1, 1)
+    from scope_recall.maintenance import doctor
+
+    (ctx.binding.data_directory / "installation.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(doctor, "load_binding", lambda *args: (ctx.binding, ctx.binding.data_directory))
+    monkeypatch.setattr(doctor, "_hermes_data_dir", lambda root: ctx.binding.data_directory)
+    report = doctor.run_doctor(host="hermes", instance_root=ctx.binding.data_directory)
+    # By design, so no fault; named among the failures and the recent work errors, and no advice to raise the
+    # output limit.
+    assert "work_failed_terminal_only" in report.capability_gaps
+    assert not {"work_failed", "model_output_truncated"} & set(report.capability_gaps)
+    assert report.work_error_counts == {"model_refused": 1}
+    assert [(error["error_code"], error["error_field"]) for error in report.recent_work_errors] == [
+        ("model_refused", None)
+    ]
+
+
+def test_reply_the_provider_interrupted_is_asked_again_and_is_a_fault_while_it_lasts(worker_app, tmp_path, monkeypatch):
+    from scope_recall.core.worker import build_consolidation_model
+    from scope_recall.maintenance import doctor
+    from scope_recall.runtime.auxiliary import build_auxiliary_runtime
+    from scope_recall.runtime.instance import _BoundedConsolidation
+    from test_runtime_auxiliary import FakeTransport, _chat_reply, _runtime_config
+
+    core, ctx, clock = worker_app
+    source = capture(core, ctx, "TEST 输出被提供方中断。")
+    _mark_embed_done(core)
+    config, _, _ = _runtime_config(tmp_path)
+    monkeypatch.setenv("SCOPE_RECALL_TEST_CHAT_KEY", "test-key")
+    cut = {"role": "assistant", "content": '{"protocol_version":"1.1","source_refs":["'}
+    transport = FakeTransport(lambda **kwargs: (200, _chat_reply(cut, "insufficient_system_resource")))
+    runtime = build_auxiliary_runtime(config, transport=transport)
+    model = _BoundedConsolidation(build_consolidation_model(runtime.consolidation), 3)
+
+    def consolidate():
+        return next(row for row in work_rows(core) if row[1] == source.ref and row[0] == "consolidate")
+
+    clock.advance(iso="2026-09-06T12:00:00Z")
+    core.drain_worker(ctx, consolidation=model, max_items=1, remaining_seconds=5)
+    assert (consolidate()[3], consolidate()[4], consolidate()[6]) == ("pending", 1, "model_output_interrupted")
+    assert core.status(ctx).pending_error_counts == (("model_output_interrupted", 1),)
+    for iso in ("12:00:03", "12:00:10", "12:00:20"):
+        clock.advance(iso=f"2026-09-06T{iso}Z")
+        core.drain_worker(ctx, consolidation=model, max_items=1, remaining_seconds=5)
+    assert transport.calls == 3
+    assert (consolidate()[3], consolidate()[4], consolidate()[6]) == ("failed", 3, "model_output_interrupted")
+    with sqlite3.connect(core.storage.path) as db:
+        assert (
+            db.execute("SELECT error_code,error_field FROM work_error_details").fetchall()
+            == [("model_output_interrupted", None)] * 3
+        )
+    (ctx.binding.data_directory / "installation.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(doctor, "load_binding", lambda *args: (ctx.binding, ctx.binding.data_directory))
+    monkeypatch.setattr(doctor, "_hermes_data_dir", lambda root: ctx.binding.data_directory)
+    report = doctor.run_doctor(host="hermes", instance_root=ctx.binding.data_directory)
+    # A fault, not a failure by design: the instance is degraded until the item is worked again.
+    assert report.status == "degraded" and "work_failed" in report.capability_gaps
+    assert "work_failed_terminal_only" not in report.capability_gaps and report.terminal_failed_work == 0
+    assert report.work_error_counts == {"model_output_interrupted": 1}
+    plain = core.operations.retry_failed_work(ctx, limit=64, dry_run=True)
+    assert (plain["retried"], plain["by_kind"]) == (1, {"model_output_interrupted": 1})
+
+
+@pytest.mark.parametrize("finish_reason", ["insufficient_system_resource", "aborted"])
+def test_an_outage_of_interrupted_answers_costs_one_billed_request_a_pass(
+    worker_app, tmp_path, monkeypatch, finish_reason
+):
+    """The provider ended an answer itself, so the next item meets the same outage: the pass asks once and stands the
+    work type down, as after a 429.  Unlike a 429 it was a billed answer, which is one of its item's attempts and not
+    a refund."""
+    from scope_recall.core.worker import build_consolidation_model
+    from scope_recall.runtime.auxiliary import build_auxiliary_runtime
+    from scope_recall.runtime.instance import _BoundedConsolidation
+    from test_runtime_auxiliary import FakeTransport, _chat_reply, _runtime_config
+
+    core, ctx, clock = worker_app
+    for n in range(4):
+        capture(core, ctx, f"TEST 提供方的推理资源耗尽 {n}。")
+    _mark_embed_done(core)
+    config, _, _ = _runtime_config(tmp_path)
+    monkeypatch.setenv("SCOPE_RECALL_TEST_CHAT_KEY", "test-key")
+    cut = {"role": "assistant", "content": '{"protocol_version":"1.1","source_refs":["'}
+    transport = FakeTransport(lambda **kwargs: (200, _chat_reply(cut, finish_reason)))
+    runtime = build_auxiliary_runtime(config, transport=transport)
+    model = _BoundedConsolidation(build_consolidation_model(runtime.consolidation), 3)
+    for passes in (1, 2, 3):
+        clock.advance(iso=f"2026-09-06T12:0{passes}:00Z")
+        receipt = core.drain_worker(ctx, consolidation=model, max_items=8, remaining_seconds=5)
+        assert (transport.calls, receipt.processed) == (passes, 1)
+    rows = consolidate_rows(core)
+    assert len(rows) == 4 and {row[3] for row in rows} == {"pending"}
+    assert sum(row[4] for row in rows) == 3 and {row[6] for row in rows} <= {None, "model_output_interrupted"}
+
+
 def test_consolidation_accepts_only_transport_fence_and_null_optional_location(worker_app):
     core, ctx, clock = worker_app
     source = capture(core, ctx, "TEST-project 的公开代号是 TEST-ARCHIVE-V12-FLARE。")
@@ -527,7 +650,7 @@ def test_M31_procedure_reuse_requires_accepted_method(worker_app):
 
 
 def test_M32_single_success_does_not_generalize_without_acceptance(worker_app):
-    # Since 3.2.0rc6 a tool output is no derivation root: a single observed success is not even
+    # A tool output is no derivation root: a single observed success is not even
     # proposed as a method, and the model is never asked about it.
     core, ctx, clock = worker_app
     observed = capture(core, ctx, "TEST 导出成功，exit.code=0。", origin="tool_observation")
@@ -547,8 +670,7 @@ def test_M32_single_success_does_not_generalize_without_acceptance(worker_app):
 def test_M33_counterexample_kept_in_procedure(worker_app):
     core, ctx, clock = worker_app
     source = capture(core, ctx, "TEST 导出前先检查透明背景；未安装设备时不适用。这是我认可的方法。")
-    # Reported by the person: a tool output is no derivation root since 3.2.0rc6, so the model is
-    # not shown one to cite.
+    # A tool output is no derivation root, so the model is not shown one to cite.
     counter = capture(core, ctx, "TEST 我试过，未安装设备时导出失败。", when="2026-09-02T13:00:00Z")
 
     def builder(sources, episode_ref=None):
@@ -1167,11 +1289,11 @@ def _restore(core, ctx, backup):
 def test_C10_restore_epoch_fences_late_consolidation(worker_app, tmp_path):
     """A restore during the model call that replays a suppression of the batch source.
 
-    This test used to bump ``memory_epoch`` by hand to stand in for a restore.
-    Every capture bumps it too, so a bare epoch move no longer discards a paid
-    result.  The restore is now performed for real -- backup, a suppression
-    recorded in the deletion ledger, restore and replay -- and the late result
-    is still discarded as a retryable ``memory_epoch_changed``.
+    The restore is performed for real -- backup, a suppression recorded in the
+    deletion ledger, restore and replay -- not by bumping ``memory_epoch`` by
+    hand: every capture bumps it too, so a bare epoch move does not discard a
+    paid result.  The late result is discarded as a retryable
+    ``memory_epoch_changed``.
     """
     from test_deletion import sqlite_backup
 
@@ -1225,7 +1347,7 @@ def test_restore_of_an_older_backup_during_extraction_fences_late_consolidation(
 
     Nothing the result cites changed: the source missing from the backup is in
     another project.  The rows the fence marked no longer exist, so the result
-    is still discarded as it was when any epoch move discarded it.
+    is discarded.
     """
     from dataclasses import replace
 
@@ -1481,8 +1603,8 @@ def test_deadline_expiry_returns_partial_receipt(worker_app):
 
 
 def test_a_purge_marked_obsolete_before_it_removed_anything_is_given_once_more(worker_app):
-    """Up to 3.4.0rc8 the worker read a purge's operation id at the last colon of its subject and a scope id holds
-    colons, so every delete's purge was marked obsolete and its layers stayed pending.  The next pass queues such a
+    """An earlier release read a purge's operation id at the last colon of its subject, and a scope id holds colons,
+    so every delete's purge was marked obsolete and its layers stayed pending.  The next pass queues such a
     purge once more; one that ends obsolete again stays so."""
     core, ctx, clock = worker_app
     doomed = capture(core, ctx, "TEST 一次删了没清的话。", key="TEST-requeue/doomed")
@@ -1579,7 +1701,7 @@ def test_model_work_is_claimed_only_while_the_pass_covers_one_bounded_request(wo
 
 
 def test_a_longer_model_ceiling_reserves_only_for_model_work(worker_app):
-    """#240: a consolidation model that reasons first gets its own ceiling.  A pass short of it still embeds, under
+    """A consolidation model that reasons first gets its own ceiling.  A pass short of it still embeds, under
     the ordinary ceiling, and claims consolidation only once it holds the longer request."""
     from scope_recall.core.worker import FINALIZE_MARGIN_SECONDS, WorkerConfig, drain_worker
 
@@ -1616,7 +1738,7 @@ def test_a_longer_model_ceiling_reserves_only_for_model_work(worker_app):
 
 
 def test_the_runtime_gives_consolidation_its_longer_ceiling(worker_app):
-    """#240: requests reach the model with up to ``model_request_seconds``, not the 45-second contract ceiling."""
+    """Requests reach the model with up to ``model_request_seconds``, not the 45-second contract ceiling."""
     from scope_recall.runtime.instance import RuntimeInstance
     from scope_recall.runtime.instance_config import RuntimeInstanceConfig
 
@@ -1827,9 +1949,9 @@ def test_M39_worker_expired_intention_without_valid_to_stays_proposed(worker_app
 
 
 def test_a_port_refusal_names_its_reason(worker_app):
-    """A companion without a fenced write refused every embed with
-    STORAGE_UNAVAILABLE and the field ``fenced_upsert_unsupported``; only the
-    code reached the operator (#85).  The field is recorded with it."""
+    """A companion without a fenced write refuses every embed with
+    STORAGE_UNAVAILABLE and the field ``fenced_upsert_unsupported``; the field
+    is recorded with the code, not the code alone reaching the operator."""
     core, ctx, clock = worker_app
     capture(core, ctx, "TEST 向量拒绝。")
     with sqlite3.connect(core.storage.path) as conn:
