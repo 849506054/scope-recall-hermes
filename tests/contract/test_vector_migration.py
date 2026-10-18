@@ -37,7 +37,7 @@ def _row(number):
         "scope_id": "TEST-scope",
         "source": "event",
         "target": json.dumps(metadata),
-        "content": f"TEST content {number}",
+        "content": "",
         "summary": "",
         "updated_at": "2026-09-25T00:00:00Z",
         "vector": [float(number), 1.0],
