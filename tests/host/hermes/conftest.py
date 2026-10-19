@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 
 import pytest
 from scope_recall.adapters.hermes import ScopeRecallHermesAdapter, install_hermes_scope_recall
+
+from tests.host.conftest import StoreMeteredClock
 
 
 @dataclass
@@ -17,7 +20,7 @@ class FixedClock:
         return self.now
 
     def monotonic(self) -> float:
-        return self._mono
+        return time.monotonic() if isinstance(time.monotonic, StoreMeteredClock) else self._mono
 
 
 @pytest.fixture
@@ -41,7 +44,13 @@ def initialize_kwargs(hermes_home):
 
 
 @pytest.fixture
-def installed_core(hermes_home, initialize_kwargs):
+def installed_core(hermes_home, initialize_kwargs, metered_store):
+    """Install a synthetic core with physical store latency excluded from semantic assertions.
+
+    Admission checks and the adapter read the same clock. Budget tests reconfigure its transaction charge;
+    non-store waits, including concurrent hook coordination, continue to count.
+    """
+    metered_store(0.0)
     clock = FixedClock()
     _binding, core = install_hermes_scope_recall(
         hermes_home,

@@ -1,6 +1,6 @@
 {
   "schema": "scope-recall.v11-module-allowlist.v1",
-  "package_version": "3.11.0.1",
+  "package_version": "3.11.2.1",
   "packages": [
     "scope_recall",
     "scope_recall.adapters",
@@ -21,6 +21,7 @@
     "adapters/clients/__init__.py",
     "adapters/clients/authorization.py",
     "adapters/clients/boundary.py",
+    "adapters/clients/bounded_call.py",
     "adapters/clients/config.py",
     "adapters/clients/handler.py",
     "adapters/clients/hook_answer.py",
@@ -56,6 +57,7 @@
     "adapters/hermes/hooks.py",
     "adapters/hermes/identity.py",
     "adapters/hermes/installation.py",
+    "adapters/hermes/kept_captures.py",
     "adapters/hermes/outcomes.py",
     "adapters/hermes/prefetch.py",
     "adapters/hermes/protocol.py",

@@ -31,6 +31,8 @@ from scope_recall.core import CoreConfig, MemoryCore
 from scope_recall.core.events import MAX_SEGMENT_CHARS
 from scope_recall.core.retrieval import MAX_CURRENT_SOURCE_REFS
 
+from tests.host.conftest import assert_hook_budget
+
 _MODES = ("history", "current", "auto")
 
 
@@ -615,18 +617,24 @@ def test_a_turns_retry_pass_leaves_a_tool_result_being_written_alone(adapter, he
 
 
 @pytest.mark.parametrize("switch", ["session", "audience"])
-def test_a_switch_during_a_tool_results_write_keeps_its_session_and_audience(adapter, hermes_home, monkeypatch, switch):
+@pytest.mark.parametrize("deferred", [False, True])
+def test_a_switch_during_a_tool_results_write_keeps_its_session_and_audience(
+    adapter, hermes_home, monkeypatch, switch, deferred
+):
     """The write runs without the session, so a session or audience switch can come in meanwhile: the capture
     keeps the session and scope it was said in, and stays out of the new session's fence."""
     provider, _clock = adapter
+    monkeypatch.setattr(provider._retry, "start", lambda: None)
     before = provider._identity
     real = provider._core.source_by_event_key
     entered, release = threading.Event(), threading.Event()
 
     def source_by_event_key(context, key, *args, **kwargs):
-        if "slow-call" in key:
+        if "slow-call" in key and not entered.is_set():
             entered.set()
             release.wait(10)
+            if deferred:
+                time.sleep(0.6)
         return real(context, key, *args, **kwargs)
 
     monkeypatch.setattr(provider._core, "source_by_event_key", source_by_event_key)
@@ -643,9 +651,16 @@ def test_a_switch_during_a_tool_results_write_keeps_its_session_and_audience(ada
         switch_thread.join(_PROMPTLY)
         _unregister_adapter_instance(provider)
     assert "error" not in first_box and "error" not in switch_box, (first_box, switch_box)
+    # Waiting for the switch can consume the capture's admission time. Its retry must keep the original audience
+    # even though the provider now serves another session; only committed sources satisfy the assertion below.
+    if deferred:
+        assert len(provider._retry.captures) == 1
+    provider._retry.write_observed()
     with sqlite3.connect(hermes_home / "scope-recall" / "memory.sqlite3") as conn:
         rows = conn.execute("SELECT session_id, scope_id, origin FROM source_events WHERE role='tool'").fetchall()
+        assert conn.execute("SELECT count(*) FROM capture_inbox").fetchone()[0] == 0
     assert rows == [(before.stored_session_id(), before.local_scope_id, "tool_observation")]
+    assert not provider._retry.captures
     assert provider.diagnostics.current_source_refs == ()
 
 
@@ -1040,7 +1055,16 @@ def test_a_retry_pass_writes_every_buffered_capture_it_has_time_for(adapter, her
         return real(**kwargs)
 
     monkeypatch.setattr(provider._retry, "write_buffered", recorded)
-    _busy_store(provider, monkeypatch, 2)  # the capture, and the turn's retry of it: the thread then writes it
+    record_host_event = provider._core.record_host_event
+    failures = []
+
+    def busy_tool(context, event, **kwargs):
+        if "busy-call-again" in event["source_event_key"] and len(failures) < 2:
+            failures.append(event["source_event_key"])
+            raise RuntimeError("TEST writer held")
+        return record_host_event(context, event, **kwargs)
+
+    monkeypatch.setattr(provider._core, "record_host_event", busy_tool)
     _tool_result(provider, "turn-2", "busy-call-again", "TEST tool output again")
     provider.sync_turn("TEST user words", "TEST reply words", session_id="TEST-session-1")
     monkeypatch.setattr(capture_retry, "_RETRY_EVERY_S", 0.05)
@@ -1053,7 +1077,7 @@ def test_a_retry_pass_writes_every_buffered_capture_it_has_time_for(adapter, her
 def test_a_capture_that_cannot_be_written_is_given_up_and_said(adapter, hermes_home, monkeypatch, caplog):
     """A capture of a full inbox, or of an installation whose scopes changed under a running gateway, is not kept for
     good: retried every 30 s for the life of the process, its thread would hold an evicted agent's adapter.  Past its
-    time it is dropped and logged as lost, and the thread ends."""
+    time it is kept on disk for the next start, and the thread ends."""
     provider, _clock = adapter
     monkeypatch.setattr(capture_retry, "_RETRY_EVERY_S", 3600.0)
     monkeypatch.setattr(capture_retry, "_RETRY_GIVE_UP_S", 0.2)
@@ -1165,7 +1189,7 @@ def test_a_shutdown_on_a_held_store_spends_at_most_its_short_pass(adapter, herme
     monkeypatch.setattr(provider._core, "record_host_event", held)
     started = clock()
     provider.shutdown()
-    assert clock() - started < capture_retry.SHUTDOWN_RETRY_SECONDS + 0.5, clock() - started
+    assert_hook_budget(clock() - started, capture_retry.SHUTDOWN_RETRY_SECONDS)
     assert capture_retry.SHUTDOWN_RETRY_SECONDS == 2.0
 
 
@@ -1195,7 +1219,8 @@ def test_a_turn_s_end_waits_for_a_held_capture_no_longer_than_a_capture_s_time(
     monkeypatch.setattr(provider._core, "record_host_event", record_host_event)
     started = clock()
     provider.sync_turn("TEST user words", "TEST reply words", session_id="TEST-session-1")
-    assert first_own and first_own[0] - started < capture.CAPTURE_TIMEOUT_S + 0.5, [t - started for t in first_own]
+    assert first_own
+    assert_hook_budget(first_own[0] - started, capture.CAPTURE_TIMEOUT_S)
 
 
 def test_a_shutdown_leaves_a_replay_still_in_flight_to_its_thread_and_says_its_end(
@@ -1322,8 +1347,7 @@ def test_a_shutdown_writes_the_buffer_once_more_and_says_what_it_could_not(
     assert [
         record
         for record in caplog.records
-        if "not stored (still failing at shutdown), lost" in record.getMessage()
-        and "still-busy-call" in record.getMessage()
+        if "kept on disk for the next start" in record.getMessage() and "still-busy-call" in record.getMessage()
     ]
     assert not other._retry.captures
 

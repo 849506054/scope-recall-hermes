@@ -3,6 +3,22 @@
 A line or two per release.  Each release's full notes are on its GitHub release page (tag ``v<version>``), and the
 longer text this file once held is in its history.
 
+## [3.11.2.1] - 2026-10-19
+
+**Fork release.** Incorporates upstream v3.11.2 and v3.11.1. The fork's contracts are unchanged.
+
+Capture hooks now share the time left in their budget, defer work once it is spent, and close one-shot handlers on every exit path; a finished turn writes its own capture before retrying older ones, and pending host captures survive a restart for authorization-checked replay. Current-value recall places messages whose recorded values were replaced after available current evidence, keeping historical reads and explicit references. Backups that carry pending host captures include the `kept-captures/` directory beside the store.
+
+No configuration or schema change.
+
+## [3.11.2] - 2026-10-18
+
+The README links the reproducible synthetic recall benchmark and states its limits. Installation guidance, contributor descriptions and capture and retry test documentation describe current contracts while preserving contributor credit. Host semantic fixtures share a store clock while retaining real non-store waits and explicit budget charges. Native dsh tests verify durable intake and authorized materialization of completed replies. Aggregation samples in the dev benchmark explicitly state the actions asked about, with a baseline measured on the corrected world; this is a data correction, not a retrieval improvement. Deletion replay tests cover delayed capture, checking that deleted content remains unreadable and distinct key collisions are stored once. Runtime behavior, configuration and the store schema are unchanged.
+
+## [3.11.1] - 2026-10-18
+
+Capture hooks share the time left in their budget, defer work after it expires and close one-shot handlers on every exit path. Finished turns write their own captures before retrying older ones, and Hermes keeps pending capture envelopes for authorization-checked replay after restart. Current-value recall places messages whose recorded values have been replaced after available current evidence, preserving historical reads, explicit references and the relative order of replaced messages; replacement lineage is read in batches. Test descriptions state the current capture, retry and packaging contracts. Include the `kept-captures/` directory beside the store when backing up pending host captures. No configuration or schema change is required.
+
 ## [3.11.0.1] - 2026-10-19
 
 **Fork release.** Incorporates upstream v3.11.0, together with v3.10.4 through v3.10.6 held since the last release. The fork's contracts are unchanged: the Qdrant backend behind the standard port, the embedding route's own egress proxy, the Voyage usage fallback, and the two readings of a question that names the store's owner.
