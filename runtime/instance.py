@@ -23,6 +23,7 @@ from itertools import islice
 from typing import Any, Callable, Mapping, Sequence
 
 from ..contracts import ContractError, InstanceBinding, TrustedContext
+from ..core.admission import AdmissionPolicy
 from ..core.capture_filters import redact_private_paths
 from ..core.composition import CoreConfig, MemoryCore
 from ..core.deadline import RequestDeadline, using_request_deadline
@@ -976,7 +977,13 @@ def build_runtime_instance(
         raise TypeError("config must be RuntimeInstanceConfig")
     auxiliary = build_auxiliary_runtime(config.auxiliary) if config.auxiliary is not None else None
     core = MemoryCore(
-        CoreConfig(config.binding, auto_recall_seconds=config.auto_recall_seconds),
+        CoreConfig(
+            config.binding,
+            auto_recall_seconds=config.auto_recall_seconds,
+            admission_policy=AdmissionPolicy(
+                embed_tool_outputs=config.vector.tool_output_embedding if config.vector is not None else True
+            ),
+        ),
         storage=SQLiteStorage(config.binding),
         vectors=vectors,
         consolidation=consolidation if consolidation is not None else getattr(auxiliary, "consolidation", None),

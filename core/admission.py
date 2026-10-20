@@ -29,6 +29,9 @@ class AdmissionPolicy:
     enabled: bool = True
     max_pending_work: int = 2048
     important_reserve: int = 128
+    #: When false, a tool result is still stored and lexically indexed but earns
+    #: no embed work: tool output is recalled by its words, never by meaning.
+    embed_tool_outputs: bool = True
 
     def __post_init__(self):
         if type(self.enabled) is not bool:
@@ -37,6 +40,8 @@ class AdmissionPolicy:
             raise ValueError("max_pending_work must be between 2 and 100000")
         if type(self.important_reserve) is not int or not 0 <= self.important_reserve <= 10000:
             raise ValueError("important_reserve must be between zero and 10000")
+        if type(self.embed_tool_outputs) is not bool:
+            raise ValueError("embed_tool_outputs must be boolean")
 
 
 @dataclass(frozen=True)
@@ -182,9 +187,16 @@ def classify(event, policy=None):
         # evidence refs that would otherwise raise its priority.
         return _REINJECTION
     text = event["content"]
+    withheld_reason = None
     if withheld_tool_output(event):
         # Nothing in it to search for by meaning, to derive from or to find by its words (``core/events.py``).
-        return AdmissionDecision("source_only", "tool_output_omitted")
+        withheld_reason = "tool_output_omitted"
+    elif event.get("role") == "tool" and not policy.embed_tool_outputs:
+        # Stored and lexically searchable, never embedded: the source text keeps
+        # every word it had, so keyword recall still finds it.
+        withheld_reason = "tool_output_not_embedded"
+    if withheld_reason:
+        return AdmissionDecision("source_only", withheld_reason)
     important = bool(
         event.get("artifact_refs") or event.get("evidence_refs") or event.get("segment") or _IMPORTANT.search(text)
     )

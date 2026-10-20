@@ -46,6 +46,9 @@ class VectorRuntimeConfig:
     #: 0 keeps every vector (``runtime/vector_retention.py``).  The text, the
     #: lexical index and everything derived from the source are never expired.
     tool_output_retention_days: int = 180
+    #: When false, tool results are stored and lexically indexed but never
+    #: embedded, so semantic recall covers conversation and claims only.
+    tool_output_embedding: bool = True
     qdrant: QdrantConfig | None = None
 
     def __post_init__(self) -> None:
@@ -62,6 +65,7 @@ class VectorRuntimeConfig:
         member("vector_metric", self.metric, ("cosine",))
         strict_bool("vector_test_injection_override", self.test_injection_override)
         strict_int("vector_tool_output_retention_days", self.tool_output_retention_days, minimum=0, maximum=36500)
+        strict_bool("vector_tool_output_embedding", self.tool_output_embedding)
 
     @classmethod
     def from_mapping(cls, raw: object) -> "VectorRuntimeConfig":
@@ -74,6 +78,7 @@ class VectorRuntimeConfig:
             metric=raw.get("metric", "cosine"),
             test_injection_override=raw.get("test_injection_override", False),
             tool_output_retention_days=raw.get("tool_output_retention_days", 180),
+            tool_output_embedding=raw.get("tool_output_embedding", True),
             qdrant=None if raw.get("qdrant") is None else QdrantConfig.from_mapping(raw["qdrant"]),
         )
 

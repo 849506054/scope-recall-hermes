@@ -191,6 +191,23 @@ def test_only_content_free_successful_tool_wrappers_are_cheap(text, expected):
     assert classify(source_event(content=text, role="tool", origin="tool_trusted")).disposition == expected
 
 
+def test_tool_output_embedding_can_be_withheld_without_losing_the_source(tmp_path):
+    """Tool output keeps its text and its words; only the embedding is withheld."""
+    app, ctx = app_at(tmp_path, AdmissionPolicy(embed_tool_outputs=False))
+    receipt = capture(app, ctx, "TEST-tool", "TEST tool output with a searchable needle", role="tool")
+    stored = counts(app)
+    assert stored["source_events"] == 1 and stored["lexical_postings"] > 0
+    assert stored["work_items"] == 0
+    assert receipt.admission == ("admission_source_only:tool_output_not_embedded",)
+    assert app.search_sources(ctx, "needle")
+
+
+def test_tool_output_embedding_stays_on_by_default(tmp_path):
+    app, ctx = app_at(tmp_path)
+    capture(app, ctx, "TEST-tool", "TEST tool output with a searchable needle", role="tool")
+    assert counts(app)["work_items"] == 1
+
+
 def test_backpressure_reserves_capacity_then_automatically_refills_after_drain(tmp_path):
     policy = AdmissionPolicy(max_pending_work=2, important_reserve=2)
     app, ctx = app_at(tmp_path, policy)

@@ -3,6 +3,10 @@
 A line or two per release.  Each release's full notes are on its GitHub release page (tag ``v<version>``), and the
 longer text this file once held is in its history.
 
+## [3.11.2.2] - 2026-10-20
+
+**Fork release.** Adds one capability: `vector.tool_output_embedding` (default `true`). When set to `false`, a tool result is still stored and lexically indexed, but it earns no embed work, so semantic recall covers conversation, claims and other sources while tool output is recalled by its words. The existing retention window (`vector.tool_output_retention_days`) continues to expire any tool vectors already in the store. No schema change.
+
 ## [3.11.2.1] - 2026-10-19
 
 **Fork release.** Incorporates upstream v3.11.2 and v3.11.1. The fork's contracts are unchanged.
