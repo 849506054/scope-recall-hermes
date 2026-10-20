@@ -1,10 +1,9 @@
 name: Publish GitHub Release
 
 on:
-  push:
-    tags:
-      - "v*"
-      - "!v*rc*" # RC tags run CI only; stable policy below is unchanged.
+  # This fork publishes no PyPI distribution and no GitHub release: a version is
+  # its tag, built by whoever deploys it. The workflow stays for a deliberate
+  # manual dispatch, and a tag push starts nothing.
   workflow_dispatch:
     inputs:
       release_tag:
