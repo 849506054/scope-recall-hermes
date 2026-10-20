@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import sqlite3
+import time
 from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal
 from pathlib import Path
@@ -1695,6 +1696,29 @@ def test_uncapped_policy_still_refuses_a_metered_breach(tmp_path):
         _reserve(ledger, uncapped, "deepseek-v4-flash")
 
 
+def test_concurrent_recalls_borrow_separate_query_channels(tmp_path, monkeypatch):
+    """One warm connection serialized recalls behind each other; the pool gives each its own."""
+    monkeypatch.setenv("SCOPE_RECALL_TEST_EMBED_KEY", "synthetic-local-value")
+    config, _, _ = _runtime_config(tmp_path)
+    runtime = build_auxiliary_runtime(config)
+    try:
+        adapter = runtime.query_embedding
+        barrier = Barrier(2)
+        held: list[object] = []
+
+        def hold(_index: int) -> None:
+            with adapter._query_channel(time.monotonic() + 5) as channel:
+                held.append(channel)
+                barrier.wait(timeout=5)
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            list(pool.map(hold, range(2)))
+        assert len(held) == 2
+        assert held[0] is not held[1]
+    finally:
+        runtime.close()
+
+
 def test_embedding_route_states_an_egress_proxy_for_its_helper(tmp_path, monkeypatch):
     """The proxy belongs to the route, not to the host: it reaches this route's own helpers and leaves
     the environment every other process shares alone."""
@@ -1711,7 +1735,7 @@ def test_embedding_route_states_an_egress_proxy_for_its_helper(tmp_path, monkeyp
     runtime = build_auxiliary_runtime(config)
     try:
         adapter = runtime.query_embedding
-        for transport in (adapter._transport, adapter._query_transport):
+        for transport in (adapter._transport, *adapter._query_channels):
             assert transport._worker_environment()["HTTPS_PROXY"] == "http://proxy.local:7890"
     finally:
         runtime.close()
@@ -1727,7 +1751,7 @@ def test_embedding_route_without_a_proxy_leaves_the_environment_alone(tmp_path, 
     runtime = build_auxiliary_runtime(config)
     try:
         adapter = runtime.query_embedding
-        for transport in (adapter._transport, adapter._query_transport):
+        for transport in (adapter._transport, *adapter._query_channels):
             assert transport._worker_environment() is None
     finally:
         runtime.close()

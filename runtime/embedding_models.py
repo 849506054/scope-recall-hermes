@@ -3,10 +3,12 @@ adapter that sends them through the metered transport (``models``)."""
 
 from __future__ import annotations
 
+import contextlib
 import math
+import queue
 import re
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from functools import partial
@@ -37,6 +39,11 @@ from .models import (
 )
 
 MAX_EMBED_RESPONSE_BYTES = 16 * 1024 * 1024
+#: Warm query connections.  One connection serialized every recall's embedding behind the one
+#: before it; measured on this host, four concurrent requests take 2.7 s through one warm
+#: connection and 1.3 s through four.  Turn starts observed over a week: 90% see one recall in
+#: flight, 10% see two, and a third channel leaves room for the rare burst.
+QUERY_CHANNEL_POOL = 3
 
 
 #: Embedding requests one group may have in flight.  A document request spawns its
@@ -292,16 +299,23 @@ class GeminiEmbeddingAdapter:
             if transport is not None
             else HttpsTransport(proxy_url=route.proxy_url, allow_insecure_endpoint=route.allow_insecure_endpoint)
         )
-        self._query_transport = (
-            transport
-            if transport is not None
-            else HttpsTransport(
-                persistent=True,
-                proxy_url=route.proxy_url,
-                allow_insecure_endpoint=route.allow_insecure_endpoint,
-            )
-        )
         self._owns_transport = transport is None
+        if transport is not None:
+            self._query_transport: HttpsTransport | None = transport
+            self._query_pool: queue.LifoQueue[HttpsTransport] | None = None
+        else:
+            self._query_transport = None
+            self._query_pool = queue.LifoQueue()
+            self._query_channels = [
+                HttpsTransport(
+                    persistent=True,
+                    proxy_url=route.proxy_url,
+                    allow_insecure_endpoint=route.allow_insecure_endpoint,
+                )
+                for _ in range(QUERY_CHANNEL_POOL)
+            ]
+            for channel in self._query_channels:
+                self._query_pool.put(channel)
         space = route.space()
         self._space = space
         self._endpoint = space["endpoint"]
@@ -315,7 +329,9 @@ class GeminiEmbeddingAdapter:
         # the cut went out in part.  A query is the owner's message as typed, screened by nothing before this.
         reject_secrets(text)
         encoded = encode_embedding_text(text, kind="query")
-        return self._embed(encoded, remaining_seconds=remaining_seconds, transport=self._query_transport)
+        deadline = time.monotonic() + validate_timeout_seconds(remaining_seconds)
+        with self._query_channel(deadline) as channel:
+            return self._embed(encoded, remaining_seconds=seconds_left(deadline), transport=channel)
 
     def embed_queries(self, texts: Sequence[str], *, remaining_seconds: float) -> tuple[tuple[float, ...], ...]:
         """Several queries in one request on the query connection, answered in the order they were sent.
@@ -330,18 +346,38 @@ class GeminiEmbeddingAdapter:
         if not encoded:
             return ()
         deadline = time.monotonic() + validate_timeout_seconds(remaining_seconds)
-        return self._send(
-            self._request_body(encoded),
-            deadline,
-            self._query_transport,
-            partial(_embedding_vectors, dialect=self._dialect, dimensions=self._dimensions, count=len(encoded)),
-        )
+        with self._query_channel(deadline) as channel:
+            return self._send(
+                self._request_body(encoded),
+                deadline,
+                channel,
+                partial(_embedding_vectors, dialect=self._dialect, dimensions=self._dimensions, count=len(encoded)),
+            )
+
+    @contextlib.contextmanager
+    def _query_channel(self, deadline: float) -> Iterator[HttpsTransport]:
+        """Borrow one warm query connection, waiting no longer than *deadline*."""
+        if self._query_pool is None:
+            assert self._query_transport is not None
+            yield self._query_transport
+            return
+        try:
+            channel = self._query_pool.get(timeout=max(0.0, deadline - time.monotonic()))
+        except queue.Empty:
+            raise AuxiliaryModelError("timeout") from None
+        try:
+            yield channel
+        finally:
+            self._query_pool.put(channel)
 
     def close(self):
         """Release only transports created by this adapter, not injected ports."""
-        if self._owns_transport:
-            self._query_transport.close()
-            self._transport.close()
+        if not self._owns_transport:
+            return
+        if self._query_pool is not None:
+            for channel in self._query_channels:
+                channel.close()
+        self._transport.close()
 
     def embed_source(self, source: StoredSource, *, remaining_seconds: float) -> Sequence[float]:
         encoded = encode_embedding_text(source.event["content"], kind="document")

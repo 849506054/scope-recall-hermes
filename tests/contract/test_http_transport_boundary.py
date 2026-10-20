@@ -229,14 +229,26 @@ def test_query_adapter_uses_persistent_helper_but_source_does_not(persistent_tra
     runtime = build_auxiliary_runtime(config)
     adapter = runtime.query_embedding
     # Never let a stale imported model class escape the loopback harness.
-    assert adapter._query_transport._post.__globals__["_HTTP_WORKER_PATH"] == models._HTTP_WORKER_PATH
+    for channel in adapter._query_channels:
+        assert channel._post.__globals__["_HTTP_WORKER_PATH"] == models._HTTP_WORKER_PATH
     assert adapter._transport._post.__globals__["_HTTP_WORKER_PATH"] == models._HTTP_WORKER_PATH
     try:
         first = adapter.embed_query("TEST first query", remaining_seconds=2)
-        process = adapter._query_transport._session._process
+        live = [
+            ch._session._process
+            for ch in adapter._query_channels
+            if ch._session is not None and ch._session._process is not None
+        ]
+        assert len(live) == 1
+        process = live[0]
         second = adapter.embed_query("TEST second query", remaining_seconds=2)
         assert len(first) == len(second) == 3072
-        assert adapter._query_transport._session._process is process
+        live = [
+            ch._session._process
+            for ch in adapter._query_channels
+            if ch._session is not None and ch._session._process is not None
+        ]
+        assert live == [process]
         assert len(connections) == 1
         assert len(adapter.embed_source(_source("TEST source"), remaining_seconds=2)) == 3072
         assert adapter._transport._session is None and len(connections) == 2

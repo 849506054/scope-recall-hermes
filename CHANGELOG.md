@@ -3,6 +3,15 @@
 A line or two per release.  Each release's full notes are on its GitHub release page (tag ``v<version>``), and the
 longer text this file once held is in its history.
 
+## [3.11.2.3] - 2026-10-20
+
+**Fork release.** A recall's query embedding had one warm connection, so two recalls in flight
+serialized behind each other: measured on this host, four concurrent requests take 2.7 s through
+one connection and 1.3 s through four, while a single request is 0.6-1.1 s. Query embeddings now
+borrow from a pool of three warm connections, which covers every concurrent start observed over a
+week (90% see one recall, 10% see two, one start in a thousand sees four). No schema or
+configuration change.
+
 ## [3.11.2.2] - 2026-10-20
 
 **Fork release.** Adds one capability: `vector.tool_output_embedding` (default `true`). When set to `false`, a tool result is still stored and lexically indexed, but it earns no embed work, so semantic recall covers conversation, claims and other sources while tool output is recalled by its words. The existing retention window (`vector.tool_output_retention_days`) continues to expire any tool vectors already in the store. No schema change.
