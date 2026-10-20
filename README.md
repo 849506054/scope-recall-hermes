@@ -1,6 +1,6 @@
 # Scope Recall
 
-本仓库是 [`410979729/scope-recall-hermes`](https://github.com/410979729/scope-recall-hermes) 的 fork，仓库名 `849506054/scope-recall-hermes`，当前版本 `3.11.2.3`，跟版基线上游 `v3.11.2`。每次发版的说明在本仓库的 [CHANGELOG.md](CHANGELOG.md) 和 Releases 里。
+本仓库是 [`410979729/scope-recall-hermes`](https://github.com/410979729/scope-recall-hermes) 的 fork，仓库名 `849506054/scope-recall-hermes`，当前版本 `3.11.2.3`，跟版基线上游 `v3.11.2`。每次发版的说明在本仓库的 [CHANGELOG.md](CHANGELOG.md) 里，每个版本对应一个 fork tag。
 
 这个 fork 只为一类环境准备：**机器跑不了 LanceDB 的本地向量检索，但能连到一台 Qdrant 和外部 embedding 服务**。典型是 N5100 / N5105 这类没有 AVX2 的 NAS、软路由主板 —— `import lancedb` 直接 SIGILL（退出码 132），上游自带的 `sqlite-bruteforce` 后端是纯 Python 逐条扫描，我们在 N5105 上量到 2.7 万条 2048 维向量单次查询 17–22 秒，召回窗口装不下。
 
