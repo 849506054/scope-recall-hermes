@@ -89,14 +89,20 @@ networks:
 
 ### 2. 装包
 
+这个 fork 不往 PyPI 发包，也不往 GitHub Release 挂附件；一个版本就是一个 tag，包从 tag 自己构建：
+
 ```bash
-uv pip install "hermes_scope_recall-3.11.2.3-py3-none-any.whl"
+git clone https://github.com/849506054/scope-recall-hermes.git
+cd scope-recall-hermes
+git checkout v3.11.2.3
+uv build --wheel      # 产物落在 dist/
+uv pip install dist/hermes_scope_recall-3.11.2.3-py3-none-any.whl
 ```
 
 宿主用独立目录加载（`PYTHONPATH` 或 `.pth` 注入）时，装进目标目录，别装进解释器 site-packages：
 
 ```bash
-uv pip install --target /path/to/scope-recall-pkg "hermes_scope_recall-3.11.2.3-py3-none-any.whl"
+uv pip install --target /path/to/scope-recall-pkg dist/hermes_scope_recall-3.11.2.3-py3-none-any.whl
 ```
 
 走 `qdrant` 后端不会导入 `lancedb`，不需要 `lancedb` extra。装完先确认导入落在安装包、不在源码 checkout：
@@ -228,13 +234,13 @@ scope-recall doctor --host hermes --instance-root "$INSTANCE"
 - **版本号 = 上游版本号加一位**：上游 `v3.11.2` → fork `3.11.2.1`、`3.11.2.2`、`3.11.2.3`。裸 tag 空间只属于 fork，上游 tag 收在 `refs/tags/upstream/*`。
 - **只跟稳定 tag，不跟 rc**。小版本前移必跟；同一小版本内的补丁版按「问题有多严重、修复有多急」决定，其余攒到下一个要跟的版本一起做。
 - **跟版即销项**：上游已经修了同一处，就删掉我们的改动，不留双份。
-- 发版前跑完整门禁（unit / contract / packaging / host / migration），tag 只打在门禁验过的提交上，wheel 与提交逐字节自验后才发布。
+- 发版前跑完整门禁（unit / contract / packaging / host / migration），tag 只打在门禁验过的提交上；wheel 从该提交构建、与提交逐字节核对后再打 tag。
 
 ---
 
 # 上游原版 README
 
-下面是上游 `410979729/scope-recall-hermes` 的 README 原文，只把一级标题降到这里，其余保持原样；上游文档里的 `pip install -U`、`lancedb` 等说法针对上游自己的后端。
+下面是上游 `410979729/scope-recall-hermes` 的 README 原文，只把一级标题降到这里，其余保持原样；上游文档里的 `pip install -U`、PyPI 发包、GitHub Release 和 `lancedb` 等说法针对上游自己的仓库与后端，本 fork 不发布包，只出 tag。
 
 Scope Recall v3 is a bounded local memory core with SQLite as the authority and rebuildable vector companions. It provides host adapters for Hermes, and for Codex, Claude Code, WorkBuddy and DeepSeek Harness (dsh), which share one adapter of hooks and an MCP server (the MCP tools need the optional `codex` extra; dsh runs the hooks through a plugin). The public package is `hermes-scope-recall`; the Python import is `scope_recall`; the host wrapper identity remains `scope-recall`.
 
