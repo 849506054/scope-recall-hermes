@@ -667,6 +667,39 @@ class QdrantVectorStore(VectorStore):
             output[_text(item, "id")] = None
         return list(output)
 
+    def _present_ids(self, ids: list[str], deadline: float) -> set[str]:
+        """Which of these records still exist; asks for neither payload nor vector.
+
+        A delete confirmation only needs absence.  Reading whole records back
+        (payload plus a 2048-dim vector, 64 per page) costs seconds per page: a
+        2000-id batch blew its request budget mid-verification, left its gate
+        marker behind and refused every later write until an operator cleared
+        it (2026-10-21).  Identity alone answers the same question cheaply.
+        """
+        wanted = {self.point_id(item): item for item in ids}
+        present: set[str] = set()
+        keys = list(wanted)
+        for offset in range(0, len(keys), _BATCH_SIZE):
+            batch = keys[offset : offset + _BATCH_SIZE]
+            result = self._request(
+                "POST",
+                self._path + "/points/scroll",
+                {
+                    "limit": len(batch),
+                    "filter": {"must": [{"has_id": batch}]},
+                    "with_payload": False,
+                    "with_vector": False,
+                },
+                deadline,
+            )
+            if type(result) is not dict or type(result.get("points")) is not list:
+                raise _invalid()
+            for point in result["points"]:
+                if type(point) is not dict or point.get("id") not in wanted:
+                    raise _invalid()
+                present.add(wanted[point["id"]])
+        return present
+
     def _delete_batches(self, ids: list[str], deadline: float) -> None:
         for offset in range(0, len(ids), _BATCH_SIZE):
             batch = ids[offset : offset + _BATCH_SIZE]
@@ -676,7 +709,7 @@ class QdrantVectorStore(VectorStore):
                 {"points": [self.point_id(item) for item in batch]},
                 deadline,
             )
-        if self._retrieve(ids, deadline):
+        if self._present_ids(ids, deadline):
             raise _invalid()
 
     def delete_by_ids(self, ids: list[str]) -> None:

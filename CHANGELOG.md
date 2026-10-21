@@ -3,6 +3,15 @@
 A line or two per release.  Each release's full notes are on its GitHub release page (tag ``v<version>``), and the
 longer text this file once held is in its history.
 
+## [3.11.2.4] - 2026-10-21
+
+**Fork release.** Confirming a delete read every record back whole to prove absence: payload plus a
+2048-dim vector, 64 per page. A 2000-id retention batch spent its request budget in that read-back,
+so the batch's gate marker stayed behind and refused every later write — the embed lane stopped for
+eleven hours until an operator cleared the marker. A delete now confirms identity only (`has_id`
+scrolls, no payload, no vector): the same judgement at a fraction of the traffic. No schema or
+configuration change.
+
 ## [3.11.2.3] - 2026-10-20
 
 **Fork release.** A recall's query embedding had one warm connection, so two recalls in flight

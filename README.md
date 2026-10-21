@@ -1,6 +1,6 @@
 # Scope Recall
 
-本仓库是 [`410979729/scope-recall-hermes`](https://github.com/410979729/scope-recall-hermes) 的 fork，仓库名 `849506054/scope-recall-hermes`，当前版本 `3.11.2.3`，跟版基线上游 `v3.11.2`。每次发版的说明在本仓库的 [CHANGELOG.md](CHANGELOG.md) 里，每个版本对应一个 fork tag。
+本仓库是 [`410979729/scope-recall-hermes`](https://github.com/410979729/scope-recall-hermes) 的 fork，仓库名 `849506054/scope-recall-hermes`，当前版本 `3.11.2.4`，跟版基线上游 `v3.11.2`。每次发版的说明在本仓库的 [CHANGELOG.md](CHANGELOG.md) 里，每个版本对应一个 fork tag。
 
 这个 fork 只为一类环境准备：**机器跑不了 LanceDB 的本地向量检索，但能连到一台 Qdrant 和外部 embedding 服务**。典型是 N5100 / N5105 这类没有 AVX2 的 NAS、软路由主板 —— `import lancedb` 直接 SIGILL（退出码 132），上游自带的 `sqlite-bruteforce` 后端是纯 Python 逐条扫描，我们在 N5105 上量到 2.7 万条 2048 维向量单次查询 17–22 秒，召回窗口装不下。
 
@@ -94,15 +94,15 @@ networks:
 ```bash
 git clone https://github.com/849506054/scope-recall-hermes.git
 cd scope-recall-hermes
-git checkout v3.11.2.3
+git checkout v3.11.2.4
 uv build --wheel      # 产物落在 dist/
-uv pip install dist/hermes_scope_recall-3.11.2.3-py3-none-any.whl
+uv pip install dist/hermes_scope_recall-3.11.2.4-py3-none-any.whl
 ```
 
 宿主用独立目录加载（`PYTHONPATH` 或 `.pth` 注入）时，装进目标目录，别装进解释器 site-packages：
 
 ```bash
-uv pip install --target /path/to/scope-recall-pkg dist/hermes_scope_recall-3.11.2.3-py3-none-any.whl
+uv pip install --target /path/to/scope-recall-pkg dist/hermes_scope_recall-3.11.2.4-py3-none-any.whl
 ```
 
 走 `qdrant` 后端不会导入 `lancedb`，不需要 `lancedb` extra。装完先确认导入落在安装包、不在源码 checkout：
@@ -231,7 +231,7 @@ scope-recall doctor --host hermes --instance-root "$INSTANCE"
 
 ## 发版与跟版
 
-- **版本号 = 上游版本号加一位**：上游 `v3.11.2` → fork `3.11.2.1`、`3.11.2.2`、`3.11.2.3`。裸 tag 空间只属于 fork，上游 tag 收在 `refs/tags/upstream/*`。
+- **版本号 = 上游版本号加一位**：上游 `v3.11.2` → fork `3.11.2.1`、`3.11.2.2`、`3.11.2.4`、`3.11.2.4`。裸 tag 空间只属于 fork，上游 tag 收在 `refs/tags/upstream/*`。
 - **只跟稳定 tag，不跟 rc**。小版本前移必跟；同一小版本内的补丁版按「问题有多严重、修复有多急」决定，其余攒到下一个要跟的版本一起做。
 - **跟版即销项**：上游已经修了同一处，就删掉我们的改动，不留双份。
 - 发版前跑完整门禁（unit / contract / packaging / host / migration），tag 只打在门禁验过的提交上；wheel 从该提交构建、与提交逐字节核对后再打 tag。
@@ -244,7 +244,7 @@ scope-recall doctor --host hermes --instance-root "$INSTANCE"
 
 Scope Recall v3 is a bounded local memory core with SQLite as the authority and rebuildable vector companions. It provides host adapters for Hermes, and for Codex, Claude Code, WorkBuddy and DeepSeek Harness (dsh), which share one adapter of hooks and an MCP server (the MCP tools need the optional `codex` extra; dsh runs the hooks through a plugin). The public package is `hermes-scope-recall`; the Python import is `scope_recall`; the host wrapper identity remains `scope-recall`.
 
-This checkout is `3.11.2.3`. Hermes, Codex, Claude Code, WorkBuddy and dsh can keep one memory: each attaches to a shared
+This checkout is `3.11.2.4`. Hermes, Codex, Claude Code, WorkBuddy and dsh can keep one memory: each attaches to a shared
 store as an entry, what the owner tells one of them another can recall, and each memory says
 which agent it came in through ([docs/shared-store.md](docs/shared-store.md)). An agent that is not
 attached keeps its own store. A tool's output is kept and found, but not turned into facts. Each release's notes

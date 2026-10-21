@@ -116,7 +116,12 @@ class Server:
             assert body["with_payload"] is True and body["with_vector"] is True
             return self.ok([deepcopy(points[key]) for key in body["ids"] if key in points])
         if parts[2:] == ["points", "scroll"]:
-            assert "filter" not in body
+            if "filter" in body:
+                # A delete confirmation asks for identity only.
+                assert body["with_payload"] is False and body["with_vector"] is False
+                wanted = set(body["filter"]["must"][0]["has_id"])
+                page = [{"id": key} for key in sorted(points) if key in wanted][: body["limit"]]
+                return self.ok({"points": page, "next_page_offset": None})
             assert body["with_payload"] is True and body["with_vector"] is True
             keys = sorted(key for key in points if body.get("offset") is None or key >= body["offset"])
             size = min(body["limit"], self.page_size)
@@ -648,6 +653,20 @@ def test_every_mutation_requires_completion_and_readback(setup, operation):
         else:
             store.open()
     assert server.gate.status() is not None
+
+
+def test_delete_confirmation_reads_identity_only(setup):
+    """Deleting a batch must not read whole records back to prove absence."""
+    store, server, _, _ = setup
+    store.open()
+    store.upsert_records([row(1), row(2)])
+    server.calls.clear()
+    store.delete_by_ids([row(1)["id"], row(2)["id"]])
+    probes = [call for call in server.calls if call[1].endswith("/points/scroll")]
+    assert probes
+    assert all(call[2]["with_payload"] is False and call[2]["with_vector"] is False for call in probes)
+    assert store.count_rows() == 0
+    assert server.gate.status() is None
 
 
 @pytest.mark.parametrize("damage", ["metric", "named", "index", "alias"])
