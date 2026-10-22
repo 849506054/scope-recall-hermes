@@ -614,13 +614,58 @@ def _check_worker_status(report: DoctorReport, binding, data_directory: Path) ->
         report.capability_gaps.append("worker_status_unreadable")
         return
     report.worker_status = {key: value for key, value in status.items() if key in _WORKER_STATUS_KEYS}
-    # A pass that yielded failed nothing: another writer held the store, or another pass the worker lock, and the
-    # supervisor tries again after a pause (runtime/worker_entry.py, exit 75 with status busy).  It was reported as
-    # a failed exit (yuheng's audit of 3.4.2); its status says busy, and only other exits are failures.
+    # Exit 75 with status busy indicates contention: another writer holds the store or another pass holds the
+    # worker lock.  The supervisor retries after a pause; only other nonzero exits count as worker failures.
     if status.get("exit_code", 0) != 0 and not (status.get("exit_code") == 75 and status.get("status") == "busy"):
         report.capability_gaps.append("worker_last_exit_failed")
     if report.pending_work and status.get("unavailable_work_types"):
         report.capability_gaps.append("worker_capability_unavailable")
+
+
+#: Passes in a row that may leave a work type the config enables unavailable before the doctor says so.  One
+#: pass can miss its port for a passing reason; three with the work still queued are a pattern.
+UNAVAILABLE_PASSES_REPORTED = 3
+
+
+def _check_unavailable_work(report: DoctorReport, path: Path, control: dict[str, Any]) -> None:
+    """Each work type one audience's supervisor recorded as unavailable for ``UNAVAILABLE_PASSES_REPORTED`` passes
+    in a row or more (``runtime/scheduling.py`` ``_unavailable_streaks``).
+
+    The audience is named by its control file's key, because its scope ids carry chat and account ids.  Raises
+    ``ValueError`` for a record that is not the shape the supervisor writes.
+    """
+    streaks = control.get("unavailable_streaks", {})
+    if not isinstance(streaks, dict):
+        raise ValueError("supervisor_streaks_invalid")
+    key = path.stem.removeprefix("runtime-supervisor-")
+    for kind, entry in streaks.items():
+        if not isinstance(entry, dict) or type(entry.get("passes")) is not int:
+            raise ValueError("supervisor_streak_invalid")
+        if entry["passes"] < UNAVAILABLE_PASSES_REPORTED:
+            continue
+        detail = _unavailable_detail(entry)
+        gap = f"work_type_unavailable:{kind}"
+        if gap not in report.capability_gaps:
+            report.capability_gaps.append(gap)
+        record_check(report, "unavailable_work", "stalled", f"supervisor {key}: {kind} {detail}")
+
+
+def _unavailable_detail(entry: dict[str, Any]) -> str:
+    """The run of passes one entry records, in one bounded line.
+
+    Raises ``ValueError`` for a field of another shape: the record is the supervisor's, and what else a file at its
+    name holds is not reported as if the supervisor had written it.
+    """
+    since, last_at, worker_error = entry.get("since"), entry.get("last_at"), entry.get("worker_error", "")
+    gaps, codes = entry.get("capability_gaps", []), entry.get("error_codes", [])
+    lists_ok = all(isinstance(values, list) and all(isinstance(v, str) for v in values) for values in (gaps, codes))
+    if not (lists_ok and isinstance(since, str) and isinstance(last_at, str) and isinstance(worker_error, str)):
+        raise ValueError("supervisor_streak_invalid")
+    reasons = [reason[:200] for reason in (*gaps[:16], *codes[:4], *([worker_error] if worker_error else []))]
+    return (
+        f"could not run in {entry['passes']} passes in a row, from {since[:40]} to {last_at[:40]}; "
+        f"last pass: {', '.join(reasons) or 'no reason recorded'}"
+    )
 
 
 def _check_supervisor(report: DoctorReport, data_directory: Path) -> None:
@@ -629,12 +674,25 @@ def _check_supervisor(report: DoctorReport, data_directory: Path) -> None:
     A supervisor stands down after consecutive hard worker failures, not one, and
     stays down until the next autostart wake; nothing else says so, and a stopped
     loop leaves its queue waiting.  Either state is reported here: a loop that stood down
-    is a finding, and so is one that is limping.
+    is a finding, and so is one that is limping.  The state is the newest supervisor's; the
+    work each audience's passes kept leaving unavailable is read from every file, and one
+    file that cannot be read does not hide the others.
     """
     newest: dict[str, Any] | None = None
     try:
         for path in sorted(data_directory.glob("runtime-supervisor-*.json")):
-            control = _read_control_file(path)
+            try:
+                control = _read_control_file(path)
+            except (OSError, ValueError):
+                if "supervisor_state_unreadable" not in report.capability_gaps:
+                    report.capability_gaps.append("supervisor_state_unreadable")
+                continue
+            if control is not None:
+                try:
+                    _check_unavailable_work(report, path, control)
+                except (ValueError, TypeError):
+                    if "supervisor_state_unreadable" not in report.capability_gaps:
+                        report.capability_gaps.append("supervisor_state_unreadable")
             if control is None or control.get("finished_at") is not None and control.get("state") == "paused":
                 continue  # An operator pause is not a failure.
             if newest is None or str(control.get("started_at") or "") > str(newest.get("started_at") or ""):

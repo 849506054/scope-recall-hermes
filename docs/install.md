@@ -36,8 +36,8 @@ older database is a separate, explicit operation — see
   manager reads a `pyproject.toml` before `plugin.yaml`'s `pip_dependencies`, and one written
   there by hand without `[lancedb]` builds an environment in which every recall runs without
   vectors. A gateway that starts on an environment older than the declaration may build it
-  again itself, with its own rights and Hermes's whole update tail (one took 13 minutes before it
-  answered), and a failure there turns memory off without a word. So after `apply-install`,
+  again itself, with its own rights and Hermes's whole update tail, and a failure there turns
+  memory off without a word. So after `apply-install`,
   rebuild it with Hermes's own sync before the restart (section 4), then run `doctor`, which
   reads the environment Hermes really runs (`hermes_runtime`). A plugin whose core is missing
   says so when Hermes loads it.
@@ -331,29 +331,31 @@ With a dashboard login (`hermes serve` with `dashboard.basic_auth`, or the Deskt
 app connected to such a host from another machine) the host passes the login to
 the adapter as the session's user, `basic:<name>`, and names no chat. Its local
 session transport names a login `auth:v1:["<provider>","<issuer>","<name>"]`
-(`auth:v1:["basic","","alice"]`) and the conversation as a chat of its own. The
+(`auth:v1:["basic","","nameone"]`) and the conversation as a chat of its own. The
 adapter routes either session as a one-to-one chat with the login: `chat_type`
 `private`, `chat_id` the login, `thread_id` `main`. A login is not the local
 owner. Until it is approved it binds no scope, nothing said there is captured or
 recalled, and the host log says so once per session:
 
 ```
-scope-recall: session bound to no memory scope: a desktop session for basic:alice (capability_gap:audience_unmapped, capability_gap:owner_private_denied, capability_gap:no_allowed_scope); nothing in it is captured or recalled; if this login is the owner's own, approve it with apply-install --owner-login desktop=basic:alice
+scope-recall: session bound to no memory scope: a desktop session for basic:nameone (capability_gap:audience_unmapped,
+capability_gap:owner_private_denied, capability_gap:no_allowed_scope); nothing in it is captured or recalled; if this
+login is the owner's own, approve it with apply-install --owner-login desktop=basic:nameone
 ```
 
 Approve your own login with `--owner-login <platform>=<login>`, repeatable,
 `desktop` or `tui` only, with the login exactly as the host sends it, which that
 line names. Windows PowerShell 5.1 drops the double quotes inside an argument
-unless each is written `\"`: `--owner-login 'desktop=auth:v1:[\"basic\",\"\",\"alice\"]'`.
+unless each is written `\"`: `--owner-login 'desktop=auth:v1:[\"basic\",\"\",\"nameone\"]'`.
 
 ```powershell
 scope-recall apply-install --host hermes `
   --target-plugin-dir $Plugin --instance-root $Instance `
   --project-root $Project --agent-id default --python $Python `
-  --owner-login desktop=basic:alice
+  --owner-login desktop=basic:nameone
 ```
 
-It adds the owner principal `(desktop, basic:alice)` and one grant of the owner's
+It adds the owner principal `(desktop, basic:nameone)` and one grant of the owner's
 private scope on that route, the way `--local-platform` does for a session that
 names no user, with the same backup, and approves nothing else: not that login on
 `tui`, not another login, not a session that names no user. Whoever holds that
@@ -404,7 +406,7 @@ memory:
   provider: scope-recall
 ```
 
-Do not edit a sibling or production home to do it. Until that key is set,
+Set the provider in the target Hermes home's configuration. Until that key is set,
 `doctor` reports `host_registration_status: "host_config_missing"` or
 `"not_selected"` and the gap `host_registration_incomplete`.
 
@@ -679,7 +681,8 @@ Things that look wrong in a healthy report and are not:
 | `work_failed` | At least one item failed for a reason that is not by design: any code but `derivation_invalid`, `input_invalid`, `model_refused` and `sensitive_request`, such as an embedding its provider answered with vectors of another width (`vector_dimension_mismatch`). | Fix the cause, then `scope-recall retry-failures --config <file> --apply`, which re-opens every such item. |
 | `work_failed_terminal_only` / `work_needs_review` | All failures are by design, or were already retried once. `attention`. A `model_refused` failure is the provider's policy stopping or refusing the answer for that source (a content filter, a refusal): it is not asked again, and the recent work errors name it. | Inspect them; `--include-terminal` re-runs them only if you mean to, once the model, the route or the provider's policy has changed. |
 | `work_backlog_stalled` | Work is pending and the worker has not succeeded for more than twice `supervisor_seconds`. | The worker is not running. See the next section. |
-| `worker_capability_unavailable` | Work is pending and the last pass reported work types it could not do. `attention`. | Usually a missing model route, credential or budget. |
+| `worker_capability_unavailable` | Work is pending and the last pass of any audience reported work types it could not do. `attention`. | Usually a missing model route, credential or budget. |
+| `work_type_unavailable:<work_type>` | A work type the runtime config enables was unavailable, with its work queued, in three or more passes in a row of one audience's supervisor; a busy, cut-short or failed pass, or one that only purged because the daily item cap was spent, neither counts nor ends the run. `degraded`. The `unavailable_work` check names the supervisor file's key, the number of passes, the first and last of them, and the gaps, error codes and worker error of the last. | Read those reasons: a vector store that does not open (`vector_unavailable:<label>`), a missing credential (`credential_missing`), an exhausted budget. The entry clears at the first pass that works its queue without listing the work type as unavailable: the work ran, or none of it was queued. |
 | `capture_ingress_blocked` | Inbox rows carry a real error code, or wait for their next try. Always `degraded`. | Read `capture_inbox_blocked` and the recent work errors. A row whose stored capture a replay could not check again is tried after a minute, doubling to an hour; when its 24th try again fails it is given up and counted in `capture_inbox_given_up`. `retry-failures` without `--apply` counts them by what gave them up (`inbox_by_kind`); fix that, then `retry-failures --apply` returns them to the replay. |
 | `embedding_backlog_aged` | An external embedding route is configured, and embeddings have waited more than 24 hours. Recall goes on answering, but finds what came in since then by its words alone. The check's detail names the provider's hold and its refusals over the last day when there are any (`embedding_health`). Without a route nothing embeds, by choice, and the gap is not raised. | With a hold or refusals: a quota, a spend cap or a credential at the provider; fix it there and the queue drains by itself. Without them no worker has reached the embeddings: read `worker_status`, and where each project has a worker of its own, check that it runs. |
 | `due_work_unreached` | Work, or a candidate still marked with new first-hand evidence, has waited more than 24 hours in some partition of the store, including work whose worker's lease ran out. A partition is worked only by a worker of its own audience. Work no configured route can do, and work a provider holds, is left out; a queue longer than its passes reach in a day is named too. `unreached` names each partition (scope ids carry chat and account ids, so share it with care). `attention`. | Give that audience a wake: on Windows `autostart enable`, elsewhere a timer (section 7). On a shared store the shared worker's wake works every scope its config lists. A channel no one uses any more is drained when a session of it opens; a long queue drains by itself. |
@@ -834,13 +837,12 @@ config reaches only that entry's scopes. Run it after going back to an earlier
 release and forward again: a capture the earlier release could not read may have
 been given up meanwhile.
 
-Since 3.7.5 it also brings back the vector work of claim heads. Before 3.7.5 the
-automatic recovery made a claim's failed embedding obsolete instead of retrying
-it, and an earlier conversion left some heads without one. The command reopens
-the first (`claim_embeds_reopened`) and queues the second
-(`claim_embeds_queued`), a page at a time up to `--limit`. It does this only for
-heads that are readable in its config's scopes. A claim found by its words alone
-is then found by meaning too.
+With `--apply`, the command requeues obsolete embedding work for readable claim
+heads only when its error is `authority_revoked` (`claim_embeds_reopened`), and
+queues work for heads with no embedding work item (`claim_embeds_queued`). Each
+batch contains at most `--limit` heads in the configuration's scopes and exact
+project/branch partition. Those claims become available to semantic search after
+the worker successfully publishes their vectors.
 
 After changing the embedding model (see [configuration.md](configuration.md),
 "Changing the embedding model rebuilds the vector store"), re-embed what was
@@ -931,9 +933,6 @@ can be stopped and run again at any time; without `--until-done`, carry the
 printed `next_after_id` into `--after-id` while `more` is true. The sources stay,
 and so does the index of their error text. In a shared store, run it with the
 shared worker's config (`<root>\runtime-config.json`), which reaches every scope.
-On the shared store's copy it dropped 1,945,720 postings of 212,773 placeholders
-in 426 pages, the slowest 0.12 s, and kept the error text of the 4,348 that carry
-one.
 
 To re-frame the claims an earlier release stored in a frame this release would
 not write, among them a name given for the first time ("my cat is called ...")
@@ -1204,19 +1203,16 @@ session ends (a day at most). The MCP server serves the tools that read the stor
 `propose_memory`, `revise` or `forget`: WorkBuddy names no conversation with a call
 ([shared-store.md](shared-store.md)).
 
-The prompt's recall comes from a resident recall server (from 3.6.0), which keeps the entry's
-vector search and embedding connection warm. WorkBuddy 5.6.2 runs its MCP servers inside a
+The prompt's recall comes from a resident recall server, which keeps the entry's
+vector search and embedding connection warm. WorkBuddy runs its MCP servers inside a
 conversation's agent process: it starts one when a conversation opens or a prompt comes to a
-conversation without one, and stops it at its own time. A server started there met the prompt
-that started it still opening its vector store, and a cold server answered with its vector search
-only 12.7 s after its start, past the hook's 6 s. The resident server is a process of its own,
-started apart from the MCP server. It still lives only as long as the conversation's agent process
-that started it: WorkBuddy's agent puts itself and every process it starts in a Windows job that
-ends them all when the agent's process ends, and the server cannot leave that job (agent 2.147.0,
-measured 2026-10-04). While one conversation's process runs, another conversation's first prompt
-finds the server warm (1.48 s, with its vector search, measured the same day); the first
-conversation after WorkBuddy starts, and a prompt right after the conversation holding the server
-ended, are recalled without it (see Known limits):
+conversation without one, and stops it at its own time. Cold vector and embedding startup can
+exceed the prompt hook's budget. The resident server is a process of its own, started apart
+from the MCP server. On Windows, the resident server may still belong to the launching
+conversation's job if that job prevents breakaway, in which case closing the job also ends
+the resident server. Another conversation can reuse a running warm server. A prompt that
+finds no usable resident server uses the hook's fallback recall and can start the server
+for later prompts (see Known limits):
 
 - The prompt hook starts it after its answer when none runs, at most once a minute. The MCP
   server WorkBuddy runs with a conversation starts it too, and looks again every 30 s while that

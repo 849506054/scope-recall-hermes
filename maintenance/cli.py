@@ -82,7 +82,14 @@ def _restore(argv: list[str]) -> int:
     return main(argv[1:])
 
 
+def _memory(argv: list[str]) -> int:
+    from .memory import main
+
+    return main(argv[1:])
+
+
 _DELEGATED: dict[str, tuple[str, Callable[[list[str]], int]]] = {
+    "memory": ("browse, correct, mute or forget memories as the local store owner", _memory),
     "setup": ("agent-operated fresh install/update/migration routing", _upgrade_cli),
     "migrate": ("prepare, resume, verify and index a legacy migration job", _upgrade_cli),
     "package-upgrade": ("offline wheel replacement after stopping all target writers", _package_upgrade),
@@ -571,7 +578,7 @@ def _add_install_arguments(parser: argparse.ArgumentParser) -> None:
         action="append",
         default=[],
         metavar="PLATFORM=LOGIN",
-        help="Hermes only, repeatable: approve a dashboard login on a local surface (desktop=basic:alice) as the "
+        help="Hermes only, repeatable: approve a dashboard login on a local surface (desktop=basic:nameone) as the "
         "owner's own. The host passes the login as the session's user; without this such a session binds no "
         "memory. Whoever holds that login gets the owner's private memory there, from any machine that reaches "
         "the host.",

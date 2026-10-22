@@ -1,7 +1,31 @@
 # Changelog
 
-A line or two per release.  Each release's full notes are on its GitHub release page (tag ``v<version>``), and the
-longer text this file once held is in its history.
+A line or two per release.  Each release's full notes are on its GitHub release page (tag ``v<version>``).
+
+## [3.12.0.1] - 2026-10-22
+
+**Fork release.** Follows upstream `v3.12.0`. The fork's three-connection query pool (#297) is
+retired: upstream ships the same design as `HttpsTransportPool`, so only the fork's proxy support
+stays — `HttpsTransportPool` now takes `proxy_url` and hands it to every helper, and the embedding
+route keeps passing `proxy_url` for both document and query requests. The Voyage `total_tokens`
+usage fallback stays. New from upstream: the owner management API and CLI (`memory` commands) with
+its audit table, `scope-recall-export/1` export, suppressed-row exclusion in lexical and
+claim-prefilter candidates, and `work_type_unavailable` in `doctor`. Schema moves 1110 -> 1111:
+snapshot the store, then `upgrade-store` before restarting the host.
+
+## [3.12.0] - 2026-10-19
+
+The contributor rules move from AGENTS.md into CONTRIBUTING.md: what a change needs, the design and code rules, the checks before a merge and how releases are cut. Examples in the documentation and code comments use generic names; comments and documents state their constraints and reasons without measurements from particular stores or review history; the evaluation notes under `verification/G0/` are removed. Nothing changes for an installation.
+
+Query embeddings use up to three reusable connections, so up to three recalls can embed their queries at the same time instead of queuing on one connection; a further request waits for a free connection within its own deadline, and shutdown wakes waiting callers and closes every connection. When two recalls open the vector store for the first time together, one helper is kept and the other is closed, and an open that finishes after shutdown releases its helper. Thanks to 849506054 for reporting the queued query requests in #297 and for the pooled design in their fork.
+
+Local owners can browse, search, inspect history, correct derived facts, mute or unmute memories and preview source-aware deletion through a shared management API and command line; a migrated SQLite audit records management actions separately from conversations. The same owner interface can export the visible store as a portable `scope-recall-export/1` directory or zip with original sources, current facts and their history, episodes, readable Markdown, optional retained attachments, per-artifact SHA-256 hashes and a manifest.
+
+Automatic lexical and claim-prefilter candidates now exclude suppressed rows before their bounded limits, so a more specific suppressed memory can no longer take the last candidate slot, hydrate to nothing, and leave a visible lower-ranked memory unreachable. Explicit current, method, history and as-of reads still include suppressed memory.
+
+When a work type the runtime config enables stays unavailable for three passes in a row of one audience's supervisor while its work waits (embedding, for example, while the vector store does not open), `doctor` reports `work_type_unavailable:<work_type>` as degraded, with the number of passes, when they began and what the last one recorded. The record lives in that audience's supervisor file and survives supervisor restarts, so a healthy pass of another audience, which rewrites the store's shared worker status, does not hide it. Thanks to 849506054 for reporting the silent embed backlog in #299.
+
+Tests no longer depend on the speed of the machine's disk. Host tests and the restart and recovery contract tests share one clock, in `tests/store_clock.py`, that leaves physical SQLite transaction time out of capture and hook budgets while every transaction still runs; the tests that measure real storage latency opt out with the `real_store_time` marker. A capture that a slow runner held in the durable inbox for a later replay had failed tests that read the source rows at once. The query pool tests count each waiting caller once, since a timed wait can end early on Windows. Runtime behavior is unchanged.
 
 ## [3.11.2.4] - 2026-10-21
 
@@ -216,7 +240,7 @@ HTTP keeps `allow_insecure_endpoint: true` in its config block.
 
 ## [3.10.0] - 2026-10-11
 
-An agent that asks its memory about the owner by name ("Joy 对动画的运镜有什么要求？") finds the owner's own words, which say "I" and never the name. Recall searches such a question by meaning both as asked and as the owner would ask it ("我对…"), and by its words also without the name. The names are the one a host attests for the person asking (a Hermes gateway passes the user's name) and an optional `owner_names` list in an entry's runtime config; none is built in. Both readings are embedded in one request. On a copy of the shared store, of 52 questions agents ask about the owner, each answered by one of the owner's own messages, 16 came back in the top five before and 27 after, none lost; the owner's own 173 questions came back exactly as before.
+An agent that asks its memory about the owner by name ("NameOne 对动画的运镜有什么要求？") finds the owner's own words, which say "I" and never the name. Recall searches such a question by meaning both as asked and as the owner would ask it ("我对…"), and by its words also without the name. The names are the one a host attests for the person asking (a Hermes gateway passes the user's name) and an optional `owner_names` list in an entry's runtime config; none is built in. Both readings are embedded in one request. On a copy of the shared store, of 52 questions agents ask about the owner, each answered by one of the owner's own messages, 16 came back in the top five before and 27 after, none lost; the owner's own 173 questions came back exactly as before.
 
 A Hermes gateway that restarts puts the messages that waited for a busy agent back into the conversation without opening a turn for them, and the person's next message opens one after them: they were never stored (two of the owner's on 2026-10-05). In a chat of the person's own they are now stored as the person's words, once, whichever hook reads them first; in a group nothing says whose they were.
 
@@ -226,7 +250,7 @@ Four tests that failed on slow Windows runners wait for what they test instead o
 
 ### Upgrading from 3.9.7
 
-Install the package, run `plan-install` and `apply-install` for each upgraded entry, then restart the Hermes gateways and the clients' MCP servers. The schema is unchanged (1110). An entry whose host attests no name (Claude Code, Codex, WorkBuddy, dsh, a remote client) finds the owner by name once its runtime config lists it: `"owner_names": ["Joy"]` (`docs/configuration.md`).
+Install the package, run `plan-install` and `apply-install` for each upgraded entry, then restart the Hermes gateways and the clients' MCP servers. The schema is unchanged (1110). An entry whose host attests no name (Claude Code, Codex, WorkBuddy, dsh, a remote client) finds the owner by name once its runtime config lists it: `"owner_names": ["NameOne"]` (`docs/configuration.md`).
 
 ## [3.9.7.1] - 2026-10-11
 
@@ -247,7 +271,6 @@ block; a route without it is held to HTTPS and loopback.
 
 What the owner sends to a Hermes agent while it works (a steer) is stored as their words. Most were lost: they were read only at a turn's end and only after the last other row, and were gone once a compression or a turn without a reply came first. A steer is the owner's only when the gateway's origin names them; a parent agent's message to the agent it delegated to, a notice Hermes delivers the same way, and anything after another person's words in a row Hermes joined are not. A steer a compression carries into the next session is not stored a second time, and a deleted one stays deleted.
 
-From an audit by one of the agents (yuheng):
 - The worker's status counts only failed work as failed. A queued item keeps its last attempt's error, and counted among the failures it hid as many that need a look. The queued items' errors are reported apart, as `pending_error_counts`.
 - An everyday first-person statement (我不吃辣, I do not eat spicy food) is bound to the person who said it; someone else's words around a first person (a named speaker, a quote, a pasted transcript) are not.
 - A candidate's name the evaluating model writes differently is restored only when it is the same name: 不吃辣 no longer stands for 吃辣, nonprod for prod, nor "allow delete if approved" for "allow delete".

@@ -17,8 +17,7 @@ from test_directories import TestDirectory
 from tier_allows import TIER_ALLOWS
 
 ROOT = Path(__file__).resolve().parents[1]
-#: No default path: a machine without uv says so, rather than asserting that
-#: one operator's directory exists on it.
+#: No default path: with neither ``SCOPE_RECALL_UV`` nor a uv on ``PATH``, no helper root is authorized.
 _DEFAULT_PACKAGING_UV = ""
 DEFAULT_WATCHDOG_SECONDS = 180
 RELEASE_WATCHDOG_SECONDS = 600
@@ -56,10 +55,9 @@ def pytest_watchdog_seconds(
 ) -> int:
     """Bounded suite watchdog, scaled to how much this run selected.
 
-    Release and integration keep their own fixed budgets: release's 600s,
-    integration's 2700s sized to the GitHub Windows runner's measured need for
-    the 118-file baseline. Every other tier keeps 180s as a floor and adds
-    twenty seconds a file it runs, capped at the release budget so no run --
+    Release and integration keep fixed budgets of 600s and 2700s respectively.
+    Every other tier keeps 180s as a floor and adds twenty seconds per selected
+    file, capped at the release budget so no run --
     hung or merely large -- waits forever; each of ``selected_paths`` that
     builds a whole store then adds its own allowance (``HEAVY_FILE_SECONDS``),
     which the cap does not cut.
@@ -156,6 +154,9 @@ SUITES = {
         "tests/unit/test_dsh_record.py",
     ],
     "contract": [
+        "tests/contract/test_memory_admin.py",
+        "tests/contract/test_memory_cli.py",
+        "tests/contract/test_memory_export.py",
         "tests/contract/test_fragment_quote_recovery.py",
         "tests/contract/test_protocol.py",
         "tests/contract/test_synthetic_inputs.py",

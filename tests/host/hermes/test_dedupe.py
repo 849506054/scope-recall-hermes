@@ -506,9 +506,8 @@ def test_the_turn_s_own_message_says_whether_hermes_opened_it():
 
 
 def test_a_compression_mid_turn_keeps_the_turn(adapter, hermes_home):
-    """A compression gives the conversation a new session id in the middle of a turn that goes on.  The switch
-    cleared the turn: its post_llm_call no longer matched, so what it said on the way was never stored, and
-    sync_turn stored the opening message a second time under the new session."""
+    """Compression preserves the active turn across a session switch without losing replies
+    or duplicating the opening message."""
     provider, _clock = adapter
     provider.observe_pre_llm(session_id="TEST-session-1", turn_id="turn-6", user_message="TEST 开始长任务")
     provider.on_turn_start(6, "TEST 开始长任务", turn_id="turn-6")
@@ -680,9 +679,7 @@ def test_replayed_turn_keeps_its_first_witnessed_time(installed_core, initialize
     assert times["TEST 整理好了。"] == ("2026-09-06T13:15:04Z", "2026-09-06T13:15:04Z")
 
 
-def test_a_busy_store_met_by_a_session_s_capture_retry_says_pending(
-    adapter, installed_core, monkeypatch, retry_passes_have_time
-):
+def test_a_busy_store_met_by_a_session_s_capture_retry_says_pending(adapter, installed_core, monkeypatch):
     """A busy store met by a Hermes session's retry of its captures (at its end, before a compression) stops the
     replay with a receipt that says so, and does not raise; the session's gap comes from the receipt, not from a
     raise."""

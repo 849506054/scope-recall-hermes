@@ -33,6 +33,7 @@ from .schema import (
     upgrade_1107,
     upgrade_1108,
     upgrade_1109,
+    upgrade_1110,
 )
 from .source_records import SOURCE_COLUMNS, StoredSource, source_size, stored_source
 from .source_storage import Sources
@@ -86,9 +87,8 @@ class StoreStatus:
 
 #: Source versions ``Transaction.prefetch_sources`` loads per statement.
 _PREFETCH_PAGE = 400
-#: What one read transaction keeps (``Transaction.remember``), its text counted in characters, which Python holds in
-#: a little over twice the room.  Over 483 recalls on a copy of the shared store: median 24 answers and 22,000 characters,
-#: the largest 7,595 and 13 million.
+#: Read-transaction memo limits (``Transaction.remember``): entry count and total text size, counted in characters
+#: rather than encoded bytes.  Values beyond either bound are used without being cached.
 _MEMO_ENTRIES = 16384
 _MEMO_BYTES = 32 << 20
 
@@ -108,6 +108,18 @@ class Transaction:
         #: transaction.
         self.__memo: dict | None = None if writable else {}
         self.__memo_bytes = 0
+        self.__parent: Transaction | None = None
+
+    def with_context(self, context: TrustedContext, *, writable: bool = False) -> Transaction:
+        """Borrow this transaction for an authorized partition, without widening its scopes or lifetime."""
+        connection = self._check(write=writable)
+        if context.binding != self.context.binding or not context.allowed_scope_ids <= self.context.allowed_scope_ids:
+            raise ContractError("ACCESS_DENIED", "transaction_scope")
+        view = Transaction(connection, context, writable=writable)
+        view.__parent = self
+        if self.__writable:
+            view.__memo = None
+        return view
 
     def entry_label(self, entry_id: str) -> dict[str, str] | None:
         """The ``{id, name}`` a reader is shown for a source's entry, or None.
@@ -125,6 +137,8 @@ class Transaction:
         return dict(label) if label is not None else None
 
     def _check(self, *, write: bool = False) -> sqlite3.Connection:
+        if self.__parent is not None:
+            self.__parent._check(write=write)
         if not self.__active or self.__poisoned:
             raise ContractError("STORAGE_UNAVAILABLE", "transaction_closed")
         if write and not self.__writable:
@@ -370,8 +384,7 @@ class Transaction:
         ]
 
         scopes = sorted(self.context.allowed_scope_ids)
-        # The ``+`` keeps SQLite on the primary key: with a few scopes it started from the scope index, and read every
-        # source of them, 0.24 s for a single pair on tianji's.
+        # Unary ``+`` prevents the scope predicates from selecting a scope-index scan instead of primary-key lookups.
         for start in range(0, len(wanted), _PREFETCH_PAGE):
             page = wanted[start : start + _PREFETCH_PAGE]
             admitted = allowed_refs(self, "event", (ref for ref, _revision in page))
@@ -399,12 +412,11 @@ class Transaction:
                     self.remember(("head", ref, revision), bool(item["head"]))
 
     def remembered(self, key: tuple, load, *, size=None):
-        """``load()``'s answer for ``key``, loaded once in a read transaction.
+        """``load()``'s answer for ``key``, memoized within a read transaction.
 
-        A read transaction reads one snapshot, so what it loaded stays true until it ends.  A recall loaded each of its
-        evidence sources up to five times, three statements each: 16,222 statements for one of yuheng's questions, and
-        in a busy Hermes gateway every statement waited for the GIL, so the recall ran past its deadline in every stage
-        (3.7.7).  A write transaction changes what it reads and remembers nothing.
+        A read transaction reads a fixed snapshot, so its loaded values remain valid
+        until it ends.  Cached values can be reused within the memo's size bounds.
+        Write transactions bypass memoization because their reads can change.
         """
         memo = self.__memo
         if memo is None:
@@ -455,14 +467,10 @@ def _store_bytes(conn: sqlite3.Connection) -> int:
     return conn.execute("PRAGMA page_count").fetchone()[0] * conn.execute("PRAGMA page_size").fetchone()[0]
 
 
-#: How much of the store a connection reads through a memory map.  Each operation opens its own connection, and on a
-#: shared store another process writes between any two recalls, so SQLite's own page cache never carries over: a hook
-#: recall read every page it touched with a read call of its own, 151,000 of them (586 MiB) for a 3,800-character
-#: prompt.  Through the map those pages come straight from the system's file cache.  On a copy of the shared store that
-#: recall took 0.73-0.76 s instead of 1.20-1.76 s with the cache warm, and 1.64-1.69 s instead of 2.68-3.11 s with it
-#: cold, the state meant to model a server's first recall after an idle stretch.  SQLite maps no more than the file
-#: holds and at most its build's limit (2,147,418,112 bytes in Python's builds); the rest is read as before, and
-#: writes are unchanged.  An I/O error on a mapped page ends the process, and a mapped file cannot shrink.
+#: Requested memory-map size.  Operations open separate connections, so they do not share SQLite's page cache.
+#: Mapped reads use the system's file cache.  SQLite maps no more than the file holds or its build supports;
+#: remaining pages use ordinary reads, and writes are unchanged.  An I/O error on a mapped page ends the process,
+#: and a mapped file cannot shrink.
 STORE_MMAP_BYTES = 8 << 30
 
 
@@ -657,6 +665,14 @@ class SQLiteStorage:
                 raise
             _cleanup_error(original, cleanup, "close")
 
+    def _upgrade_schema(self, conn: sqlite3.Connection) -> None:
+        """Apply each supported migration in order after checking its input identity."""
+        migrations = (upgrade_1105, upgrade_1106, upgrade_1107, upgrade_1108, upgrade_1109, upgrade_1110)
+        for version, migrate in zip(UPGRADE_CHAIN, migrations, strict=True):
+            if conn.execute("PRAGMA user_version").fetchone()[0] == version:
+                self.verify(conn, expected_schema=version)
+                migrate(conn)
+
     def initialize(self) -> StoreStatus:
         conn = self._open("rwc")
         original = None
@@ -671,21 +687,7 @@ class SQLiteStorage:
             conn.execute("BEGIN IMMEDIATE")
             exists = conn.execute("SELECT 1 FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' LIMIT 1").fetchone()
             if exists:
-                if conn.execute("PRAGMA user_version").fetchone()[0] == 1105:
-                    self.verify(conn, expected_schema=1105)
-                    upgrade_1105(conn)
-                if conn.execute("PRAGMA user_version").fetchone()[0] == 1106:
-                    self.verify(conn, expected_schema=1106)
-                    upgrade_1106(conn)
-                if conn.execute("PRAGMA user_version").fetchone()[0] == 1107:
-                    self.verify(conn, expected_schema=1107)
-                    upgrade_1107(conn)
-                if conn.execute("PRAGMA user_version").fetchone()[0] == 1108:
-                    self.verify(conn, expected_schema=1108)
-                    upgrade_1108(conn)
-                if conn.execute("PRAGMA user_version").fetchone()[0] == 1109:
-                    self.verify(conn, expected_schema=1109)
-                    upgrade_1109(conn)
+                self._upgrade_schema(conn)
                 self.verify(conn)
             else:
                 if (
