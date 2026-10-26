@@ -8,7 +8,7 @@ Follows upstream v3.15.1, absorbing 3.13.0, 3.14.0, 3.14.1, 3.15.0 and 3.15.1 in
 
 Kept from this fork: the query prefetch that starts the vector search beside the SQLite channels (`_QuerySearch`), now taking its embedding route through upstream's private-mode check; the vector-loss timeline a recall reports when the semantic channel comes back empty, with the adapter's one-line warning and the query-route warm-up; and the remote maintenance commands (`snapshot-remote`, `recover-remote`, `plan-vector-migration`, `run-vector-migration`, `clear-pending-remote`) with the Qdrant backend they drive.
 
-Retired with the merge: this fork's `backup --database/--output` command. Upstream's `backup` is a subcommand group now (create, verify, restore, relocation), and the store's own snapshot helper stays for `upgrade-store`.
+Retired with the merge: this fork's own copy of the `backup` command. Upstream now owns that entry point and keeps the `--database/--output` snapshot form this install's scripts already call, alongside new `backup create`, `backup verify` and restore paths; the store's snapshot helper stays for `upgrade-store`.
 
 Schema moves 1111 → 1112 (the content-free interval table and source project metadata). Keep a store snapshot before installing; an older executable cannot open the upgraded store.
 
