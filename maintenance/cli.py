@@ -6,8 +6,10 @@ import argparse
 import json
 import sys
 import time
+from collections.abc import Callable
+from datetime import UTC
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 from scope_recall.core.failure_retry import TERMINAL_FAILURES
 from scope_recall.core.schema import SCHEMA_VERSION, STATEMENTS, UPGRADE_CHAIN, stale_header_schema
@@ -82,14 +84,37 @@ def _restore(argv: list[str]) -> int:
     return main(argv[1:])
 
 
+def _backup_cli_entry(argv: list[str]) -> int:
+    from .backup_cli import main
+
+    return main(argv)
+
+
 def _memory(argv: list[str]) -> int:
     from .memory import main
 
     return main(argv[1:])
 
 
+def _private(argv: list[str]) -> int:
+    from .private import main
+
+    return main(argv[1:])
+
+
+def _ui(argv: list[str]) -> int:
+    from .ui import main
+
+    return main(argv[1:])
+
+
 _DELEGATED: dict[str, tuple[str, Callable[[list[str]], int]]] = {
+    "ui": ("open the local owner's memory management page", _ui),
     "memory": ("browse, correct, mute or forget memories as the local store owner", _memory),
+    "private": (
+        "turn private full or read-only capture and recall on or off for a session, project or the whole store",
+        _private,
+    ),
     "setup": ("agent-operated fresh install/update/migration routing", _upgrade_cli),
     "migrate": ("prepare, resume, verify and index a legacy migration job", _upgrade_cli),
     "package-upgrade": ("offline wheel replacement after stopping all target writers", _package_upgrade),
@@ -105,6 +130,7 @@ _DELEGATED: dict[str, tuple[str, Callable[[list[str]], int]]] = {
     "entries": ("list a shared store's entries and when each was last heard from", _shared),
     "import-entry": ("copy an entry's own store, moved aside at attach, into its shared store", _shared),
     "resident": ("see or stop an entry's resident prompt recall server, as before a package upgrade", _resident),
+    "backup": ("create or verify consistent snapshot or full backup bundle", _backup_cli_entry),
     "restore": ("go back to a snapshot backup took, keeping every deletion made since", _restore),
 }
 
@@ -294,19 +320,6 @@ def _respace_embeddings(args: argparse.Namespace) -> int:
             remaining_seconds=config.request_seconds,
         ),
     )
-
-
-def _add_backup_arguments(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--database", required=True)
-    parser.add_argument("--output", required=True)
-    parser.add_argument("--manifest")
-
-
-def _backup(args: argparse.Namespace) -> int:
-    target = _path(args.output, "output")
-    manifest = _path(args.manifest, "manifest") if args.manifest else target.with_suffix(target.suffix + ".json")
-    _emit(backup_sqlite(_path(args.database, "database"), target, manifest=manifest))
-    return 0
 
 
 #: One bounded budget for a maintenance command's remote work. A snapshot of a
@@ -709,7 +722,7 @@ def _upgrade_store(args: argparse.Namespace) -> int:
     """
     import sqlite3
     import time
-    from datetime import datetime, timezone
+    from datetime import datetime
 
     from scope_recall.contracts import ContractError
 
@@ -737,7 +750,7 @@ def _upgrade_store(args: argparse.Namespace) -> int:
         )
         _emit(result)
         return 2
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     snapshot = _path(args.backup_dir, "backup_dir") / f"memory-{before}-{stamp}.sqlite3"
     backup_sqlite(database, snapshot, manifest=snapshot.with_suffix(".json"))
     result["backup"] = str(snapshot)
@@ -911,7 +924,6 @@ _COMMANDS: tuple[
         _add_respace_arguments,
         _respace_embeddings,
     ),
-    ("backup", "create a new consistent SQLite snapshot and manifest", _add_backup_arguments, _backup),
     (
         "snapshot-remote",
         "take one server-side Qdrant snapshot inside the write boundary",

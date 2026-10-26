@@ -10,10 +10,11 @@ import time
 from typing import TYPE_CHECKING
 
 from scope_recall.contracts import RecallPacket, RecallRequest
+from scope_recall.core.private import notice_for_mode
 from scope_recall.core.retrieval import AUTOMATIC_PACKET_BUDGET_UNITS
 
 from ..runtime_wiring import render_host_recall_context
-from .gating import is_trivial_prompt
+from .gating import automatic_recall_skip_reason
 from .tool_surface import display_zone
 
 if TYPE_CHECKING:
@@ -54,8 +55,6 @@ class Prefetch:
         try:
             identity = self._adapter._require_identity()
             effective_session = self._adapter._effective_session_id(session_id)
-            if is_trivial_prompt(query):
-                return ""
             if not identity.runtime_audience.allowed_scope_ids:
                 self._adapter._diagnostics.capability_gaps = identity.runtime_audience.capability_gaps
                 return ""
@@ -71,6 +70,17 @@ class Prefetch:
             turn = self._adapter._active_turn_id
         finally:
             self._adapter._lock.release()
+        read_mode = getattr(core, "private_mode", None)
+        mode = read_mode(context) if callable(read_mode) else None
+        notice = notice_for_mode(mode) or ""
+        if mode == "full":
+            return notice
+        reason = automatic_recall_skip_reason(query)
+        if reason is not None:
+            with self._adapter._lock:
+                if self._adapter._active_turn_id == turn:
+                    self._adapter._diagnostics.last_prefetch_skip_reason = reason
+            return notice
         timed = time.monotonic()
         packet = core.recall_packet(
             context,
@@ -88,13 +98,19 @@ class Prefetch:
                 # A turn begun meanwhile, after Hermes gave up on this call, keeps its own state.
                 self._adapter._diagnostics.last_prefetch_request_id = packet["request_id"]
                 self._adapter._diagnostics.last_render_ref = preparation.render_ref
+                self._adapter._diagnostics.last_prefetch_skip_reason = next(
+                    (gap.split(":", 1)[1] for gap in packet["gaps"] if gap.startswith("auto_recall_skipped:")), None
+                )
                 self._adapter._pre_llm_pending = False
-        return render_host_recall_context(
+        rendered = render_host_recall_context(
             preparation.canonical_text,
             context=preparation.context,
             entry=(identity.entry_id, identity.manifest.entry_name) if identity.entry_id is not None else None,
             zone=display_zone(),
         )
+        if notice:
+            return f"{rendered}\n\n{notice}" if rendered else notice
+        return rendered
 
     def _log_vector_loss(self, packet: RecallPacket, recall_seconds: float) -> None:
         """Record a lost semantic channel once, with the Core pipeline's failure timeline."""

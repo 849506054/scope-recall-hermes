@@ -101,6 +101,47 @@ def _hook(client):
     return CodexHookHandler.from_home(str(client), "claude-code")
 
 
+def test_a_shared_entry_status_with_a_newline_uses_its_stored_session(store, tmp_path, monkeypatch):
+    root, _homes, _client, capture_scope = store
+    client = tmp_path / "TEST-status-client"
+    attach_shared_record(
+        root,
+        client_entry_record(
+            host="codex",
+            home=client,
+            entry_id="test-status-entry",
+            display_name="Test status entry",
+            attached_at=NOW,
+            allowed_scope_ids=[capture_scope],
+            writable_scope_ids=[capture_scope],
+            capture_scope_id=capture_scope,
+        ),
+        now=NOW,
+    )
+    hook = CodexHookHandler.from_home(str(client), "codex")
+    monkeypatch.setattr(hook, "ensure_runtime", lambda *a, **k: None)
+    try:
+        payload = dict(
+            hook_event_name="UserPromptSubmit",
+            session_id="TEST-status-session",
+            turn_id="TEST-first",
+            cwd="C:/TEST/project",
+            prompt="Prepare a synthetic poster.",
+        )
+        hook.handle_payload(payload)
+        monkeypatch.setattr(
+            hook.core.recall_pipeline.storage_reader,
+            "lexical",
+            lambda *a, **k: pytest.fail("status requested a search"),
+        )
+        assert not hook.handle_payload(dict(payload, turn_id="TEST-second", prompt="删除了吗\n"))
+        assert hook.diagnostics.last_reason == "auto_recall_skipped:session_status"
+    finally:
+        hook.close()
+    rows = _rows(root, "SELECT entry_id,session_id FROM source_events WHERE entry_id='test-status-entry'")
+    assert rows == [("test-status-entry", "test-status-entry:TEST-status-session")] * 2
+
+
 def _rows(root, sql):
     with closing(sqlite3.connect(root / "memory.sqlite3")) as connection:
         return connection.execute(sql).fetchall()
@@ -1293,29 +1334,19 @@ def test_the_doctor_names_codex_s_requests_stored_as_the_owner_s_words(store, tm
 
 
 def test_a_prompt_longer_than_a_recall_query_is_still_recalled_for(store):
-    """A recall request carries at most 8,192 characters of query.  A longer prompt went whole, the request was
-    refused, and the turn had no recall at all: three of the work computer's Codex prompts in one morning."""
+    """A long prompt recalls its bounded prefix when the source clears the lexical floor."""
     _root, homes, client, _capture = store
+    attachment = "".join(chr(0x4E00 + index) for index in range(180))
+    remembered = "TEST 白鹭项目的负责人是 KZ-42。"
     told = _hermes(homes["agent2"])
     try:
-        told.on_turn_start(1, "TEST 白鹭项目的负责人是 KZ-42。", turn_id="TEST-turn-1", session_id="TEST-session-1")
-        told.observe_pre_llm(
-            session_id="TEST-session-1", turn_id="TEST-turn-1", user_message="TEST 白鹭项目的负责人是 KZ-42。"
-        )
-        told.sync_turn("TEST 白鹭项目的负责人是 KZ-42。", "好的。", session_id="TEST-session-1")
+        told.on_turn_start(1, remembered, turn_id="TEST-turn-1", session_id="TEST-session-1")
+        told.observe_pre_llm(session_id="TEST-session-1", turn_id="TEST-turn-1", user_message=remembered)
+        told.sync_turn(remembered, "好的。", session_id="TEST-session-1")
     finally:
         told.shutdown()
     # Distinct characters, so the prompt has far more than 128 distinct terms as a real one would.
-    prompt = (
-        "白鹭项目的负责人 KZ-42 是谁？下面是附件：\n"
-        + (
-            "天地玄黄宇宙洪荒日月盈昃辰宿列张寒来暑往秋收冬藏闰余成岁律吕调阳云腾致雨露结为霜金生丽水玉出昆冈剑号巨阙珠称夜光果珍李柰菜重芥姜"
-            "海咸河淡鳞潜羽翔龙师火帝鸟官人皇始制文字乃服衣裳推位让国有虞陶唐吊民伐罪周发殷汤坐朝问道垂拱平章爱育黎首臣伏戎羌遐迩一体率宾归王鸣凤在竹白驹食场化被草木赖及万方"
-        )
-        * 3
-        + "\n"
-        + "TEST 附件里的一行字。\n" * 800
-    )
+    prompt = "白鹭项目的负责人 KZ-42 是谁？下面是附件：\n" + attachment * 3 + "\n" + "TEST 附件里的一行字。\n" * 800
     assert len(prompt) > 8192
     hook = _hook(client)
     try:
@@ -4684,30 +4715,33 @@ def test_a_stop_that_stores_part_of_its_lines_is_followed_by_the_next_without_wa
 
 
 @_NEEDS_NODE
-def test_a_hook_that_fails_says_why_in_the_status_and_keeps_the_turn(dsh, tmp_path):
-    """An interpreter that cannot import the package (a venv moved, say) exits 1: the recall's outcome and the store's
-    error say so with the end of its stderr, instead of reading as nothing recalled."""
+def test_a_hook_that_fails_says_why_and_retains_no_unverified_turn(dsh, tmp_path):
+    """An interpreter that cannot import the package reports the recall failure and keeps no unverified words."""
     _root, home = dsh
+    spool = tmp_path / "TEST-spool"
+    spool.mkdir()
+    (spool / "private-rules.json").write_text('{"private_rules":true}', encoding="utf-8")
     result = _run_plugin(
         {"python": sys.executable, "home": str(home), "spool": str(tmp_path / "TEST-spool"), "expectBacklog": True},
         env={"SR_FAKE_HOOK": str(DSH_HARNESS / "fake_hook.mjs"), "SR_FAKE_HOOK_MODE": "broken"},
     )
     assert result["status"]["lastRecall"]["outcome"].startswith("exit 1: ")
     assert "No module named 'scope_recall'" in result["status"]["lastRecall"]["outcome"]
-    assert "exit 1: " in result["status"]["lastStore"]["error"] and result["status"]["backlog"] == 3
+    assert result["status"]["backlog"] == 0 and result["spool"] == []
 
 
 @_NEEDS_NODE
-def test_a_hook_that_cannot_run_keeps_the_turn_on_disk_and_the_step_goes_on(dsh, tmp_path):
+def test_a_hook_that_cannot_run_discards_unverified_words_and_the_step_goes_on(dsh, tmp_path):
     _root, home = dsh
     spool = tmp_path / "TEST-spool"
+    spool.mkdir()
+    (spool / "private-rules.json").write_text('{"private_rules":true}', encoding="utf-8")
     result = _run_plugin(
         {"python": str(tmp_path / "TEST-no-python.exe"), "home": str(home), "spool": str(spool), "expectBacklog": True}
     )
     assert result["injected"] is None and result["decisionKept"], "no recall, and the turn is not failed"
-    assert sorted(result["spool"]) == ["assistant", "assistant", "turn_end", "user"], "kept to store later"
-    assert result["status"]["lastStore"]["error"] and result["status"]["backlog"] == 3
-    assert any("kept to store later" in warning for warning in result["warnings"])
+    assert result["spool"] == []
+    assert result["status"]["backlog"] == 0
 
 
 @_NEEDS_NODE
@@ -4795,9 +4829,11 @@ def test_the_plugin_stores_what_a_dsh_that_is_gone_left_and_leaves_a_running_one
 
 @_NEEDS_NODE
 def test_a_sweep_that_fails_stops_at_the_first_session_and_waits_longer(dsh, tmp_path):
-    """Two dsh processes that are gone left a file each.  The store cannot be reached (here: no interpreter), so the
-    pass stops at the first session it tried, keeps that one's messages, leaves the other file as it was and says
-    when it tries again: a backlog after an outage is not sent to the store all at once, nor every minute."""
+    """Core permits the records but their content store fails: recovery stops at the first session and backs off.
+
+    Public messages verified before a content failure stay queued; an unavailable
+    privacy check is covered by the refusal cases rather than this store outage.
+    """
     _root, home = dsh
     spool = tmp_path / "TEST-spool"
     spool.mkdir()
@@ -4832,7 +4868,7 @@ def test_a_sweep_that_fails_stops_at_the_first_session_and_waits_longer(dsh, tmp
         names.append(name)
     result = _run_plugin(
         {
-            "python": str(tmp_path / "TEST-no-python.exe"),
+            "python": sys.executable,
             "home": str(home),
             "spool": str(spool),
             "expectBacklog": True,
@@ -4840,6 +4876,7 @@ def test_a_sweep_that_fails_stops_at_the_first_session_and_waits_longer(dsh, tmp
             "waitStatus": "retryAfter",
         },
         "sweep",
+        env={"SR_FAKE_HOOK": str(DSH_HARNESS / "fake_hook.mjs"), "SR_FAKE_HOOK_MODE": "store-broken"},
     )
     untouched = [name for name in names if name in result["files"]]
     taken = [name for name in result["files"] if name not in names]

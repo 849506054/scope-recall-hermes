@@ -221,15 +221,15 @@ def test_dsh_remote_record_recall_identity_and_bounds(remote):
         host="codex",
         transcript_path="TEST-never-open-this-path",
     )
-    assert _hook(client, **payload) == {"through": 2}
+    assert _hook(client, **payload) == {"through": 2, "private_rules": False}
     assert bodies[-1]["payload"]["record"] == record and "record" not in bodies[-1]
     assert records[-1] == record, "the existing dsh_lines parser consumed the nested record"
     before = _rows(root)
-    assert _hook(client, **payload) == {"through": 2} and _rows(root) == before
+    assert _hook(client, **payload) == {"through": 2, "private_rules": False} and _rows(root) == before
     assert {row[0] for row in before} == {"remote-dsh"}, "payload cannot rebind the entry/host"
     captured = [row for row in before if "TEST-capture" in row[1]]
     assert {(row[2], row[3]) for row in captured} == {("user", "human_direct"), ("assistant", "assistant_visible")}
-    assert _hook(client, **{**payload, "session_id": "TEST-other"}) == {"through": 2}
+    assert _hook(client, **{**payload, "session_id": "TEST-other"}) == {"through": 2, "private_rules": False}
     assert len(_rows(root)) == len(before) + 2, "record ids are session-bound"
     before = _rows(root)
     assert _hook(client, **{**payload, "session_id": ""}) == {}
@@ -274,8 +274,8 @@ def test_a_fast_client_s_turn_is_stored_once_and_its_reply_sent_again_is_the_one
             {"id": "a1", "role": "assistant", "text": "TEST 快钟那边的回答。", "time": said},
         ],
     )
-    assert _hook(client, **stop) == {"through": 2}
-    assert _hook(client, **stop) == {"through": 2}, "sent again"
+    assert _hook(client, **stop) == {"through": 2, "private_rules": False}
+    assert _hook(client, **stop) == {"through": 2, "private_rules": False}, "sent again"
     latest = datetime.now(UTC) + timedelta(seconds=remote_server.CLOCK_AHEAD_SECONDS)
     with closing(sqlite3.connect(root / "memory.sqlite3")) as db:
         kept = db.execute(
@@ -482,13 +482,202 @@ def _plugin(home, config, scenario="turn"):
     return json.loads(result.stdout.strip().splitlines()[-1])
 
 
+def _plugin_rules(spool, value):
+    """Seed the metadata answer independently of a live store's state."""
+    spool.mkdir(parents=True, exist_ok=True)
+    (spool / "private-rules.json").write_text(json.dumps({"private_rules": value}), encoding="utf-8")
+
+
+@pytest.mark.skipif(not _node_runs(), reason="node 20.6 or later is required")
+@pytest.mark.parametrize("cached", [False, None], ids=["stored-false", "fresh"])
+def test_plugin_without_known_rules_appends_without_check_spawns(remote, tmp_path, monkeypatch, cached):
+    _root, _server_home, client, _bodies, _records = remote
+    home, rows = _installed(client, tmp_path)
+    spool = tmp_path / "TEST-spool"
+    if cached is not None:
+        _plugin_rules(spool, cached)
+    log = tmp_path / "TEST-hook-calls.jsonl"
+    monkeypatch.setenv("SR_FAKE_HOOK", str(HARNESS / "fake_hook.mjs"))
+    monkeypatch.setenv("SR_FAKE_HOOK_MODE", "broken")
+    monkeypatch.setenv("SR_FAKE_HOOK_LOG", str(log))
+    result = _plugin(
+        home, {**rows["scope-recall"]["config"], "spool": str(spool), "expectBacklog": True, "waitMs": 1000}
+    )
+    calls = [json.loads(line)["hook_event_name"] for line in log.read_text(encoding="utf-8").splitlines()]
+    assert calls == ["UserPromptSubmit", "Stop"], "keeping each message must start no hook"
+    assert result["spool"] == ["user", "assistant", "assistant", "turn_end"]
+    assert result["diskSnapshots"], "ordinary messages are appended during the event callback"
+
+
+@pytest.mark.skipif(not _node_runs(), reason="node 20.6 or later is required")
+def test_plugin_without_known_rules_adopts_old_spool_without_checks(remote, tmp_path, monkeypatch):
+    _root, _server_home, client, _bodies, _records = remote
+    home, rows = _installed(client, tmp_path)
+    spool = tmp_path / "TEST-spool"
+    _plugin_rules(spool, False)
+    old = spool / "session-TEST-plugin.999999.jsonl"
+    old.write_text(
+        json.dumps(
+            dict(
+                k="TEST-line",
+                sessionId="session-TEST-plugin",
+                id="TEST-1",
+                role="user",
+                text="TEST public old body",
+                time=int(time.time() * 1000),
+                cwd="C:/TEST/work",
+            )
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    os.utime(old, (time.time() - 130, time.time() - 130))
+    log = tmp_path / "TEST-hook-calls.jsonl"
+    monkeypatch.setenv("SR_FAKE_HOOK", str(HARNESS / "fake_hook.mjs"))
+    monkeypatch.setenv("SR_FAKE_HOOK_MODE", "broken")
+    monkeypatch.setenv("SR_FAKE_HOOK_LOG", str(log))
+    result = _plugin(
+        home, {**rows["scope-recall"]["config"], "spool": str(spool), "expectBacklog": True, "waitMs": 6500}, "sweep"
+    )
+    assert not old.exists(), "ordinary recovery adopts the orphan even while the server is unreachable"
+    assert result["spool"] == ["user"]
+    assert [json.loads(line)["hook_event_name"] for line in log.read_text(encoding="utf-8").splitlines()] == ["Stop"]
+
+
+@pytest.mark.skipif(not _node_runs(), reason="node 20.6 or later is required")
+def test_plugin_hook_answer_updates_rule_cache_before_keeping(remote, tmp_path, monkeypatch):
+    _root, _server_home, client, _bodies, _records = remote
+    home, rows = _installed(client, tmp_path)
+    spool = tmp_path / "TEST-spool"
+    _plugin_rules(spool, False)
+    log = tmp_path / "TEST-hook-calls.jsonl"
+    monkeypatch.setenv("SR_FAKE_HOOK", str(HARNESS / "fake_hook.mjs"))
+    monkeypatch.setenv("SR_FAKE_HOOK_MODE", "private")
+    monkeypatch.setenv("SR_FAKE_PRIVATE_RULES", "true")
+    monkeypatch.setenv("SR_FAKE_HOOK_LOG", str(log))
+    result = _plugin(
+        home, {**rows["scope-recall"]["config"], "spool": str(spool), "expectBacklog": True, "waitMs": 1000}
+    )
+    assert result["spool"] == []
+    assert json.loads((spool / "private-rules.json").read_text(encoding="utf-8")) == {"private_rules": True}
+    assert result["diskSnapshots"] == []
+    checks = [
+        call
+        for line in log.read_text(encoding="utf-8").splitlines()
+        if (call := json.loads(line))["hook_event_name"] == "PrivateCheck"
+    ]
+    assert len(checks) == 1 and len(checks[0]["times"]) == 4
+
+
+@pytest.mark.skipif(not _node_runs(), reason="node 20.6 or later is required")
+@pytest.mark.parametrize("mode", ["private", "broken"])
+def test_plugin_never_writes_unverified_or_private_plaintext(remote, tmp_path, monkeypatch, mode):
+    _root, _server_home, client, _bodies, _records = remote
+    home, rows = _installed(client, tmp_path)
+    config = rows["scope-recall"]["config"]
+    config.update(spool=str(tmp_path / "TEST-spool"), prompt="TEST private disk body", expectBacklog=True, waitMs=1500)
+    _plugin_rules(tmp_path / "TEST-spool", True)
+    monkeypatch.setenv("SR_FAKE_HOOK", str(HARNESS / "fake_hook.mjs"))
+    monkeypatch.setenv("SR_FAKE_HOOK_MODE", mode)
+    result = _plugin(home, config)
+    assert "TEST private disk body" not in "".join(result["diskSnapshots"])
+    assert result["spool"] == []
+
+
+@pytest.mark.skipif(not _node_runs(), reason="node 20.6 or later is required")
+@pytest.mark.parametrize("mode", ["private", "broken"])
+def test_plugin_checks_old_spool_before_copying_plaintext(remote, tmp_path, monkeypatch, mode):
+    _root, _server_home, client, _bodies, _records = remote
+    home, rows = _installed(client, tmp_path)
+    config = rows["scope-recall"]["config"]
+    spool = tmp_path / "TEST-spool"
+    spool.mkdir()
+    _plugin_rules(spool, True)
+    old = spool / "session-TEST-plugin.999999.jsonl"
+    old.write_text(
+        json.dumps(
+            dict(
+                k="TEST-line",
+                sessionId="session-TEST-plugin",
+                id="TEST-1",
+                role="user",
+                text="TEST private old body",
+                time=int(time.time() * 1000),
+                cwd="C:/TEST/work",
+            )
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    os.utime(old, (time.time() - 130, time.time() - 130))
+    config.update(spool=str(spool), expectBacklog=True, waitMs=8000)
+    monkeypatch.setenv("SR_FAKE_HOOK", str(HARNESS / "fake_hook.mjs"))
+    monkeypatch.setenv("SR_FAKE_HOOK_MODE", mode)
+    result = _plugin(home, config, "sweep")
+    if mode == "broken":
+        assert old.exists()
+        assert "TEST private old body" in old.read_text(encoding="utf-8")
+        assert list(spool.glob("*.jsonl")) == [old]
+    else:
+        assert result["spool"] == []
+        assert not any("TEST private old body" in path.read_text(encoding="utf-8") for path in spool.glob("*.jsonl"))
+
+
 @pytest.mark.skipif(not _node_runs(), reason="node 20.6 or later is not installed, or this tier may not start it")
-def test_installed_remote_plugin_recalls_and_replays_unacknowledged_stop(remote, tmp_path):
+def test_plugin_shutdown_waits_for_private_writes_and_their_store(tmp_path, monkeypatch):
+    """Shutdown sees handed-off writes before disk exists and awaits a store beyond three seconds."""
+    home = tmp_path / "TEST-plugin-home"
+    plugin = install_dsh.plugin_path(home)
+    plugin.parent.mkdir(parents=True)
+    plugin.write_bytes(install_dsh.plugin_source())
+    spool = home / "scope-recall" / "dsh-spool"
+    _plugin_rules(spool, True)
+    monkeypatch.setenv("SR_FAKE_HOOK", str(HARNESS / "fake_hook.mjs"))
+    monkeypatch.setenv("SR_FAKE_PRIVATE_RULES", "true")
+    monkeypatch.setenv("SR_FAKE_PRIVATECHECK_DELAY", "100")
+    monkeypatch.setenv("SR_FAKE_STOP_DELAY", "1100")
+    log = tmp_path / "TEST-hook-calls.jsonl"
+    monkeypatch.setenv("SR_FAKE_HOOK_LOG", str(log))
+    result = _plugin(home, dict(home=str(home), python=sys.executable, spool=str(spool), storeTimeoutMs=60_000))
+    assert result["spool"] == []
+    assert result["status"]["lastStore"]["stored"] == 3
+    assert result["status"]["lastStore"]["error"] is None
+    calls = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
+    assert any(call.get("fresh_observation") and len(call["times"]) == 4 for call in calls)
+
+
+@pytest.mark.skipif(not _node_runs(), reason="node 20.6 or later is not installed, or this tier may not start it")
+def test_plugin_shutdown_deadline_includes_pending_private_writes(tmp_path, monkeypatch):
+    """A private decision that cannot finish shares the shutdown bound with every queued write."""
+    home = tmp_path / "TEST-plugin-home"
+    plugin = install_dsh.plugin_path(home)
+    plugin.parent.mkdir(parents=True)
+    plugin.write_bytes(install_dsh.plugin_source())
+    spool = home / "scope-recall" / "dsh-spool"
+    _plugin_rules(spool, True)
+    monkeypatch.setenv("SR_FAKE_HOOK", str(HARNESS / "fake_hook.mjs"))
+    monkeypatch.setenv("SR_FAKE_PRIVATE_RULES", "true")
+    monkeypatch.setenv("SR_FAKE_PRIVATECHECK_DELAY", "60000")
+    started = time.monotonic()
+    result = _plugin(home, dict(home=str(home), python=sys.executable, spool=str(spool), storeTimeoutMs=2_000))
+    assert time.monotonic() - started < 30
+    assert result["spool"] == []
+
+
+@pytest.mark.skipif(not _node_runs(), reason="node 20.6 or later is not installed, or this tier may not start it")
+def test_installed_remote_plugin_recalls_and_replays_unacknowledged_stop(remote, tmp_path, monkeypatch):
+    from scope_recall.adapters.clients.config import load_shared_client
+    from scope_recall.contracts import TrustedContext
+    from scope_recall.core import CoreConfig, MemoryCore
+    from scope_recall.core.management import MemoryManagement
+    from scope_recall.core.restore import InstallationMaintenance
+
     root, _home, client, bodies, records = remote
     home, rows = _installed(client, tmp_path)
     config = rows["scope-recall"]["config"]
     spool = client["state_dir"] / "scope-recall" / "dsh-spool"
     config["spool"] = str(spool)
+    _plugin_rules(spool, True)
     _hook(
         client,
         hook_event_name="UserPromptSubmit",
@@ -496,12 +685,28 @@ def test_installed_remote_plugin_recalls_and_replays_unacknowledged_stop(remote,
         turn_id="1",
         prompt="TEST 我的猫叫 Mochi，最爱吃金枪鱼。",
     )
-    client["token_file"].write_text("TEST-wrong-token", encoding="utf-8")
+    entry = load_shared_client(_home, "dsh")
+    context = TrustedContext(entry.to_binding(), "TEST-other", entry.scope_ids, "human_direct")
+    core = MemoryCore(CoreConfig(entry.to_binding()))
+    MemoryManagement(core, InstallationMaintenance(context)).private_on(target="session", session=context.session_id)
+    handle = remote_server.handle_request
+    monkeypatch.setattr(
+        remote_server,
+        "handle_request",
+        lambda *args, **kwargs: dict(retry=True, result={}, reason="TEST retry", through=0),
+    )
     failed = _plugin(home, {**config, "expectBacklog": True, "waitStatus": "lastStore", "waitMs": 15000})
     assert failed["spool"] == ["user", "assistant", "assistant", "turn_end"]
     assert failed["status"]["lastStore"]["error"] and failed["decisionKept"]
+    queued = [
+        json.loads(line)
+        for file in spool.glob("*.jsonl")
+        for line in file.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert queued and all(isinstance(row.get("clock"), dict) and "received_at" in row["clock"] for row in queued)
     assert not any("session-TEST-plugin" in row[1] for row in _rows(root))
-    client["token_file"].write_text(TOKEN, encoding="utf-8")
+    monkeypatch.setattr(remote_server, "handle_request", handle)
     for file in spool.glob("*.jsonl"):
         os.utime(file, (time.time() - 130, time.time() - 130))
     replayed = _plugin(home, config, "sweep")
@@ -511,7 +716,7 @@ def test_installed_remote_plugin_recalls_and_replays_unacknowledged_stop(remote,
     # what this test measures.
     successful = _plugin(home, {**config, "recallTimeoutMs": 30_000})
     assert successful["decisionKept"] and "Mochi" in successful["injected"]["text"]
-    assert successful["spool"] == [] and successful["status"]["lastStore"]["error"] is None
+    assert successful["spool"] == [] and successful["status"]["lastStore"]["error"] is None, successful
     assert any(body["payload"].get("record") for body in bodies)
     assert records and all(len(json.dumps(body).encode()) <= 65536 for body in bodies)
     assert not any("runtime context" in row[4] for row in _rows(root))

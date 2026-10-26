@@ -9,10 +9,13 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import tomllib
 import zipfile
+from email.parser import Parser
 from pathlib import Path
 
 import pytest
+from packaging.requirements import Requirement
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 ALLOWLIST_PATH = REPO_ROOT / "packaging" / "v11-module-allowlist.json"
@@ -33,8 +36,19 @@ def _expected_wheel_members(allowlist: dict) -> set[str]:
 def _build_wheel(dist_dir: Path) -> Path:
     dist_dir.mkdir(parents=True, exist_ok=True)
     uv = os.environ.get("SCOPE_RECALL_UV") or shutil.which("uv")
+    # The gate interpreter supplies the declared build tools; isolated test homes have no package cache.
     completed = subprocess.run(
-        [uv, "build", "--wheel", "--out-dir", str(dist_dir)],
+        [
+            uv,
+            "build",
+            "--offline",
+            "--no-build-isolation",
+            "--python",
+            sys.executable,
+            "--wheel",
+            "--out-dir",
+            str(dist_dir),
+        ],
         cwd=REPO_ROOT,
         capture_output=True,
         text=True,
@@ -97,21 +111,32 @@ def installed_venv(built_wheel: Path, tmp_path_factory: pytest.TempPathFactory) 
     python = _venv_python(venv_dir)
     install_env = dict(os.environ)
     # The wrapper exposes test helper directories on PYTHONPATH for
-    # --import-mode=importlib compatibility.  pip must not see the source
+    # --import-mode=importlib compatibility. The installer must not see the source
     # tree's generated egg-info, or it can mistake the wheel for an already
     # installed distribution and skip copying scope_recall into this clean
     # venv.  The child probes below stay -I and therefore remain source-free.
     install_env.pop("PYTHONPATH", None)
     install_env.pop("PYTHONHOME", None)
     install_env.pop("VIRTUAL_ENV", None)
-    subprocess.run(
-        [str(python), "-m", "pip", "install", str(built_wheel)],
-        check=True,
-        capture_output=True,
-        timeout=_SUBPROCESS_TIMEOUT_SECONDS,
-        creationflags=_CREATE_FLAGS,
-        env=install_env,
+    install_env["UV_PROJECT_ENVIRONMENT"] = str(venv_dir)
+    uv = os.environ.get("SCOPE_RECALL_UV") or shutil.which("uv")
+    # Use the lock for runtime dependencies; the tested project enters only through its built wheel.
+    commands = (
+        [uv, "sync", "--locked", "--no-install-project", "--no-dev", "--python", str(python)],
+        [uv, "pip", "install", "--no-deps", "--python", str(python), str(built_wheel)],
     )
+    for command in commands:
+        completed = subprocess.run(
+            command,
+            cwd=REPO_ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=_SUBPROCESS_TIMEOUT_SECONDS,
+            creationflags=_CREATE_FLAGS,
+            env=install_env,
+        )
+        assert completed.returncode == 0, completed.stdout + completed.stderr
     return {
         "python": python,
         "venv_dir": venv_dir,
@@ -139,6 +164,32 @@ def test_clean_v11_wheel_exact_allowlist(built_wheel: Path) -> None:
         metadata = archive.read(metadata_name).decode("utf-8")
     assert "Name: hermes-scope-recall" in metadata
     assert f"Version: {allowlist['package_version']}" in metadata
+
+
+def test_vector_extra_dependencies_exclude_android(built_wheel: Path) -> None:
+    """The wheel keeps its dependency bounds and excludes only the vector extra on Android."""
+    with zipfile.ZipFile(built_wheel) as archive:
+        name = next(name for name in archive.namelist() if name.endswith(".dist-info/METADATA"))
+        metadata = Parser().parsestr(archive.read(name).decode("utf-8"))
+    requirements = {Requirement(raw) for raw in metadata.get_all("Requires-Dist", [])}
+    project = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))["project"]
+    expected = {Requirement(raw) for raw in project["dependencies"]}
+    for extra, dependencies in project["optional-dependencies"].items():
+        for raw in dependencies:
+            dependency, separator, marker = raw.partition(";")
+            conditions = f"({marker}) and " if separator else ""
+            expected.add(Requirement(f'{dependency}; {conditions}extra == "{extra}"'))
+    assert requirements == expected
+    vectors = {
+        requirement.name: requirement for requirement in requirements if requirement.name in {"lancedb", "pyarrow"}
+    }
+    assert set(vectors) == {"lancedb", "pyarrow"}
+    for requirement in vectors.values():
+        assert requirement.marker is not None
+        assert not requirement.marker.evaluate({"sys_platform": "android", "extra": "lancedb"})
+        for platform in ("win32", "linux", "darwin"):
+            assert requirement.marker.evaluate({"sys_platform": platform, "extra": "lancedb"})
+            assert not requirement.marker.evaluate({"sys_platform": platform, "extra": ""})
 
 
 def test_clean_v11_wheel_has_no_private_or_legacy_artifacts(built_wheel: Path) -> None:

@@ -14,7 +14,7 @@ from ..contracts import ContractError
 from .delete_storage import OBJECT_TABLES, canonical
 from .management_query import MemoryFilter, browse, partition, session_refs, source_metadata, witnesses
 from .management_revision import correct
-from .restore import InstallationMaintenance, _maintenance_context
+from .restore import InstallationMaintenance, maintenance_context
 from .suppression import release
 
 
@@ -27,11 +27,17 @@ class MemoryManagement:
         self._context()
 
     def _context(self):
-        return _maintenance_context(self.core.storage, self.authority)
+        return maintenance_context(self.core.storage, self.authority)
 
     def list(self, filters: MemoryFilter | None = None, *, limit=30, cursor=None):
         """Return one inventory page, with an opaque cursor for the next page."""
         return browse(self.core, self._context(), filters or MemoryFilter(), limit=limit, cursor=cursor)
+
+    def secrets(self):
+        """Find stored secret-bearing versions for the local owner, without content or writes."""
+        from .management_secrets import find_secrets
+
+        return find_secrets(self.core.storage, self._context())
 
     def _location(self, tx, ref):
         kind = str(ref).split("-", 1)[0]
@@ -56,7 +62,7 @@ class MemoryManagement:
             scoped = replace(context, project_id=row["project_id"], branch_id=row["branch_id"])
             if revision is None:
                 revision = row["revision"]
-        return asdict(self.core.inspect_object(scoped, ref, revision))
+        return asdict(self.core.inspect_object(scoped, ref, revision, owner_authority=self.authority))
 
     def history(self, ref, *, before=None, limit=30):
         """Return a bounded newest-first history page, checked by normal inspection."""
@@ -90,6 +96,71 @@ class MemoryManagement:
         from .management_export import MemoryExport
 
         return MemoryExport(self.core, self._context(), filters)
+
+    # -- private intervals -------------------------------------------------
+    #
+    # These are local owner operations, like the inventory above.  Agent tools
+    # never expose them: a model writing the same words is not the operator's
+    # command.
+
+    def private_on(
+        self,
+        *,
+        target: str,
+        session: str | None = None,
+        project: str | None = None,
+        mode: str = "full",
+        duration_seconds: int | None = None,
+    ) -> dict:
+        """Open a private interval for one session, project path or the whole store."""
+        from . import private
+
+        return private.open_interval(
+            self.core.storage,
+            self.core.clock,
+            self._context(),
+            target=target,
+            session=session,
+            project=project,
+            mode=mode,
+            duration_seconds=duration_seconds,
+        )
+
+    def private_off_preview(self, *, target: str, session: str | None = None, project: str | None = None) -> dict:
+        """Read the exact target rules required by a later reviewed confirmation."""
+        from . import private
+
+        return private.preview_close_interval(
+            self.core.storage, self.core.clock, self._context(), target=target, session=session, project=project
+        )
+
+    def private_off(
+        self, *, target: str, session: str | None = None, project: str | None = None, expected_rules=None
+    ) -> dict:
+        """Close only this target, atomically checking an optional reviewed rule snapshot."""
+        from . import private
+
+        return private.close_interval(
+            self.core.storage,
+            self.core.clock,
+            self._context(),
+            target=target,
+            session=session,
+            project=project,
+            expected_rules=expected_rules,
+        )
+
+    def private_status(self, *, session: str | None = None, project: str | None = None) -> dict:
+        """The current effective mode and active rules for a target or the store."""
+        from . import private
+
+        return private.status(self.core.storage, self.core.clock, self._context(), session=session, project=project)
+
+    def private_list(self, *, active_only: bool = True) -> dict:
+        """Every stored private interval, metadata only."""
+        from . import private
+
+        return private.list_intervals(self.core.storage, self.core.clock, self._context(), active_only=active_only)
 
     def _plan(self, tx, refs, mode, expected=None):
         groups = {}

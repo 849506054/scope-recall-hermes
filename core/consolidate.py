@@ -18,6 +18,7 @@ from .episodes import source_origin, source_watermark
 from .evidence_quote import resolve_evidence_quotes
 from .failure_retry import validation_feedback as safe_feedback
 from .mutate import Mutation, MutationReceipt, apply_claim_frames, validate_claims
+from .secret_patterns import cut_between_runs
 from .worker_outcomes import DerivationFence, claim_versions_mark, claims_changed, derivation_changed
 
 if TYPE_CHECKING:
@@ -128,8 +129,9 @@ def consolidation_messages(sources, *, episode_ref=None, budget=CONSOLIDATION_IN
         "claim 的 subject、predicate、value_text 必须逐字出自其 evidence_spans 的 quote（可取连续片段），不得改写、翻译或概括这些帧字段；"
         "subject、predicate、value_text 必须在同一有序断言中形成完整关系；分别找到名称和数值、文件名和哈希不证明二者所属关系；"
         "偏好中的“X使用Y”应提取主体X、谓词使用、值Y，不以“我的长期偏好”等说明性标签替代X，不把整个关系重复塞入value_text。"
-        "明确的项目、版本和使用场景写入conditions；同一段里的不同条件偏好应各自提取，不因有一次性要求或未确认猜测而遗漏其他明确的长期偏好。"
-        "conditions 必须由支持该 value_text 的同一断言明确表达，不得从别句拼接或自行补条件；"
+        "conditions限定值在什么情况下成立：项目/版本/环境/场景/时间/说话者处境或如果/当/除非等前提，逐字取值所在同句连续原文，不跨句、不丢任何一个条件；"
+        "只交代原因、后果、其他要求或步骤而不限定值是否成立的不是条件：步骤入procedure.method，其他长期要求另立claim或省略；"
+        "不同条件偏好分别提取，不因临时要求或猜测漏提长期偏好。"
         "当前执行请求、问句、猜测、传闻、假设和他人转述不得输出为当前长期事实；statement_kind=request 不得用于 claim_proposals；"
         "origin=human_direct 只说明来源类型，不证明具体人物；不得仅因原文使用“我”或把 subject 写成 user/current_user/用户/我就猜测 owner 身份；"
         "未知 valid_from/valid_to 使用 null，不得为填字段猜日期；其余可选字段（如 evidence_spans 的 location）未知时省略该字段本身，不要输出 null；"
@@ -256,6 +258,11 @@ def evidence_window(source: StoredSource, needles, evidence_spans=()) -> StoredS
     if anchor is not None:
         start = max(0, anchor[0] - EVIDENCE_WINDOW_RADIUS)
         end = min(total, anchor[1] + EVIDENCE_WINDOW_RADIUS)
+    # Each edge moves inward, never past what the window is built around, to where the request guard reads the window
+    # as the source reads: cut inside a value or a key's name, the evaluation would be refused every time it is asked.
+    keep = anchor or (start, start)
+    start = cut_between_runs(content, start, toward=keep[0])
+    end = cut_between_runs(content, end, toward=keep[1])
     return ChunkedSource(
         **dict(source.__dict__, event=dict(source.event, content=content[start:end])),
         consolidation_window=ConsolidationChunk(start, end, total),

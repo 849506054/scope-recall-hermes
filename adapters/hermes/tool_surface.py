@@ -329,7 +329,7 @@ class HermesToolSurface:
             # mode is still clamped by the trusted CoreConfig budget.
             deadline_seconds=5.0,
             zone=display_zone(),
-            # A lookup that finds nothing says so; prefetch keeps background.
+            # Lookup intent remains explicit even when the requested mode is auto.
             background_without_evidence=False,
         )
         packet = fence_epoch(
@@ -355,6 +355,8 @@ class HermesToolSurface:
             "value": inspected.value,
             "memory_epoch": inspected.memory_epoch,
         }
+        if inspected.gaps:
+            result["gaps"] = list(inspected.gaps)
         return self._reply(body["request_id"], result)
 
     def _handle_profile(self, args: object) -> str:

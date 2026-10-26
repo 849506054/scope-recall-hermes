@@ -49,10 +49,16 @@ WATCHDOG_SECONDS_PER_FILE = 20
 #: meets.  Its 600 s are that and half as much again.  The memory export file
 #: captures stores of a hundred and a thousand sources to show that export
 #: memory stays bounded, about 30 s on the same SSD; its 300 s follow the same
-#: rule.
+#: rule.  The shared-client and dsh-plugin host files start real hook
+#: interpreters, and the dsh file also the Node plugin, for nearly every case:
+#: about 170 s and 100 s on that SSD.  Together they make up most of the host
+#: tier, which passed its 600 s cap on a slow GitHub Windows runner; each adds
+#: 300 s.
 HEAVY_FILE_SECONDS = {
     "tests/recall_bench/test_recall_bench.py": 600,
     "tests/contract/test_memory_export.py": 300,
+    "tests/host/codex/test_shared_client.py": 300,
+    "tests/host/codex/test_dsh_remote.py": 300,
 }
 
 
@@ -115,6 +121,7 @@ def packaging_helper_env(tier: str) -> dict[str, str]:
 
     A uv named by ``SCOPE_RECALL_UV`` goes into the run too: the tests take that one before they search ``PATH``, and
     a ``PATH`` with another uv first would hand them one outside the root authorized here.
+    Explicit cache and offline settings also reach build helpers, whose isolated homes have no dependency cache.
     """
 
     if "build" not in TIER_ALLOWS.get(tier, frozenset()):
@@ -126,6 +133,9 @@ def packaging_helper_env(tier: str) -> dict[str, str]:
     env = {"SCOPE_RECALL_TEST_PACKAGING_HELPER_ROOTS": str(Path(packaging_uv).resolve().parent)}
     if declared:
         env["SCOPE_RECALL_UV"] = declared
+    for name in ("UV_CACHE_DIR", "UV_OFFLINE"):
+        if value := os.environ.get(name):
+            env[name] = value
     return env
 
 
@@ -160,9 +170,13 @@ SUITES = {
         "tests/unit/test_dsh_record.py",
     ],
     "contract": [
+        "tests/contract/test_backup_relocation.py",
+        "tests/contract/test_full_backup.py",
         "tests/contract/test_memory_admin.py",
         "tests/contract/test_memory_cli.py",
+        "tests/contract/test_memory_ui_api.py",
         "tests/contract/test_memory_export.py",
+        "tests/contract/test_private_mode.py",
         "tests/contract/test_fragment_quote_recovery.py",
         "tests/contract/test_protocol.py",
         "tests/contract/test_synthetic_inputs.py",
@@ -214,6 +228,7 @@ SUITES = {
         "tests/contract/test_retrieval_pipeline.py",
         "tests/contract/test_evidence_followup.py",
         "tests/contract/test_recall_admission.py",
+        "tests/contract/test_auto_recall_gate.py",
         "tests/contract/test_retrieval_history_state.py",
         "tests/contract/test_vector_timeout_fallback.py",
         "tests/contract/test_auto_query_echo.py",
@@ -239,6 +254,11 @@ SUITES = {
         "tests/test_lance_fanout_deadline.py",
     ],
     "host": [
+        "tests/host/test_memory_ui.py",
+        "tests/host/test_memory_ui_http.py",
+        "tests/host/test_memory_ui_assets.py",
+        "tests/host/codex/test_client_private_mode.py",
+        "tests/host/hermes/test_hermes_private_mode.py",
         "tests/host/test_endpoint_credentials.py",
         "tests/host/hermes/test_attachments_shutdown.py",
         "tests/host/hermes/test_audience_isolation.py",
@@ -451,6 +471,7 @@ CORE_RELEASE_CONTRACTS = [
     "tests/contract/test_retrieval_pipeline.py",
     "tests/contract/test_evidence_followup.py",
     "tests/contract/test_auto_query_echo.py",
+    "tests/contract/test_auto_recall_gate.py",
     "tests/contract/test_vector_timeout_fallback.py",
     "tests/contract/test_recall_admission.py",
     "tests/contract/test_worker.py",
@@ -481,6 +502,7 @@ CORE_RELEASE_CONTRACTS += [
     "tests/contract/test_vector_failure.py",
     "tests/contract/test_audit_lifecycle.py",
     "tests/contract/test_audit_maintenance.py",
+    "tests/contract/test_private_mode.py",
     "tests/contract/test_autonomous_admission.py",
     "tests/contract/test_autonomous_context.py",
     "tests/contract/test_autonomous_corrections.py",
@@ -492,6 +514,7 @@ CORE_RELEASE_CONTRACTS += [
     "tests/contract/test_recall_packet_compiler.py",
     "tests/contract/test_quality_audit.py",
     "tests/contract/test_candidate_lifecycle.py",
+    "tests/contract/test_unresolved_candidates.py",
     "tests/contract/test_host_recall_boundaries.py",
     "tests/contract/test_host_principal_injection.py",
     "tests/contract/test_runtime_cross_component.py",

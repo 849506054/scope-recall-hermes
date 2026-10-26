@@ -244,17 +244,17 @@ scope-recall doctor --host hermes --instance-root "$INSTANCE"
 
 Scope Recall v3 is a bounded local memory core with SQLite as the authority and rebuildable vector companions. It provides host adapters for Hermes, and for Codex, Claude Code, WorkBuddy and DeepSeek Harness (dsh), which share one adapter of hooks and an MCP server (the MCP tools need the optional `codex` extra; dsh runs the hooks through a plugin). The public package is `hermes-scope-recall`; the Python import is `scope_recall`; the host wrapper identity remains `scope-recall`.
 
-This checkout is `3.12.2.1`. Hermes, Codex, Claude Code, WorkBuddy and dsh can keep one memory: each attaches to a shared
+This checkout is `3.15.1.1`. Hermes, Codex, Claude Code, WorkBuddy and dsh can keep one memory: each attaches to a shared
 store as an entry, what the owner tells one of them another can recall, and each memory says
 which agent it came in through ([docs/shared-store.md](docs/shared-store.md)). An agent that is not
 attached keeps its own store. A tool's output is kept and found, but not turned into facts. Each release's notes
 are a line or two in [CHANGELOG.md](CHANGELOG.md) and in full on its
-[GitHub release](https://github.com/410979729/scope-recall-hermes/releases). Upgrading from `3.2.x` or later is
-`pip install -U`, `apply-install` and a host restart; the first store open adds the local management audit table. Back up
+[GitHub release](https://github.com/410979729/scope-recall-hermes/releases). Upgrading from `3.2.x` or later to `3.15.1` is
+`pip install -U`, `apply-install` and a host restart; the first store open adds the local management audit and private-interval tables. Back up
 before upgrading and follow the [management migration and rollback guide](docs/manage.md#migration-and-rollback).
 On a shared store in
 the shipped embedding space, set `vector_threshold` from 0.653 to 0.70 by hand
-([docs/configuration.md](docs/configuration.md#vector_threshold)). Older supported stores migrate in order to schema 1111;
+([docs/configuration.md](docs/configuration.md#vector_threshold)). Older supported stores migrate in order to schema 1112;
 an earlier release cannot open the upgraded store. Section 9 of the
 [3.1.0 release notes](https://github.com/410979729/scope-recall-hermes/releases/tag/v3.1.0) is the
 migration procedure for a 2.0.1 memory database.
@@ -262,6 +262,14 @@ Facts are drawn from accumulated evidence rather than judged one sentence on
 sight; only the owner's explicit correction or confirmation changes a fact as it
 is captured. SQLite is the only fact authority; host adapters share the same
 contracts.
+
+Automatic recall injects zero to six items that clear a lexical coverage or
+vector similarity floor. Background preferences and tasks accompany passing
+query evidence; a session's first resume request can recover its current task.
+Acknowledgments, approvals, praise, bare continuation and session status prompts
+within an existing session start no search or query embedding. Explicit recall
+keeps its admission behavior. The thresholds and diagnostic counts are described
+in [the recall configuration](docs/configuration.md#vector_threshold).
 
 **Recall-quality checks.** The [synthetic recall benchmark](CONTRIBUTING.md#the-recall-benchmark)
 provides reproducible development and held-out splits for retrieval, answerability,
@@ -272,12 +280,27 @@ also check contracts, storage and host integration.
 
 ## Manage your memories
 
+Use `scope-recall ui` with the same store selection to open the [local management page](docs/ui.md).
+It provides Chinese and English browsing, reviewed actions, private rules, export and backup status in your browser.
+
 Use `scope-recall memory` to browse, search, inspect history, correct a fact, mute it or delete a conversation.
 It runs as the local store owner and makes no model request. Deletion shows the dependent sources and facts before
 `--yes` applies it. `scope-recall memory export --out <new directory or .zip>` writes the visible store as a portable
 package with original sources, facts, history, episodes, readable Markdown and optional retained attachments.
+`scope-recall memory secrets` lists stored credential matches by reference, provenance, time and pattern names.
+After upgrading, review its findings, remove them with `scope-recall memory forget <refs>` and change any credential found.
 [The management guide](docs/manage.md) covers store selection, filters, version checks and receipts; the
 [export guide](docs/export.md) covers package layout, hashes and filtering.
+
+Use `scope-recall private on --session <id> | --project <path> | --all` to stop keeping a session,
+directory or the whole store. `--mode full` refuses capture, recall and background model work;
+`--mode read-only` refuses capture while recall continues; `--all --for 2h` sets a duration and `off`
+closes a rule. Rules are stored as metadata only, overlap takes the stricter mode, and an event is
+refused by its own occurrence time even when a later retry or transcript read arrives after the
+rule ends. Undated events are refused when earlier private history could cover them. Directory
+identity follows junctions and symbolic links on the owning machine; recalls and outbound
+requests check again before release. [The private-mode guide](docs/private-mode.md) lists every host path, injection notice,
+migration and what is stored or sent in each mode.
 
 ## For agents: install or upgrade on the user's behalf
 
@@ -390,7 +413,8 @@ entry, every memory is marked with the agent it came in through, and a deletion 
 any of them applies to all. Moving the memory to another machine is copying one directory.
 Hermes homes attach as entries, and so do Codex and Claude Code
 (`attach --host codex|claude-code`). See [docs/shared-store.md](docs/shared-store.md).
-WorkBuddy and dsh attach the same way (`attach --host workbuddy|dsh`).
+WorkBuddy and dsh attach the same way (`attach --host workbuddy|dsh`). Full backup bundles
+and disaster recovery restore to fresh destinations are in [docs/backup-restore.md](docs/backup-restore.md).
 
 ## Agent-operated migration
 

@@ -18,8 +18,12 @@ FORMAT = "scope-recall-management/1"
 _FILTERS = ("kind", "scope", "agent", "session", "since", "until")
 
 
-def open_management(args):
-    """Bind the explicit local installation without registering an agent entry."""
+def open_management(args, *, initialize: bool = True):
+    """Bind the explicit local installation without registering an agent entry.
+
+    ``args`` needs only the store selection (``root``, ``host``, ``instance_root``), which every caller's parser
+    defines. ``initialize`` is false for a read-only listing, which must neither migrate nor write the store.
+    """
     binding = store_to_restore(
         host=args.host,
         instance_root=Path(args.instance_root).resolve() if args.instance_root else None,
@@ -28,7 +32,8 @@ def open_management(args):
     if not (binding.data_directory / "memory.sqlite3").is_file():
         raise ContractError("SOURCE_MISSING", "database")
     core = MemoryCore(CoreConfig(binding))
-    core.initialize()
+    if initialize:
+        core.initialize()
     context = TrustedContext(binding, "local-management", binding.scope_ids, "host_generated")
     return MemoryManagement(core, InstallationMaintenance(context))
 
@@ -60,6 +65,7 @@ def parser():
         "forget",
         "forget-session",
         "export",
+        "secrets",
     ):
         command = commands.add_parser(action)
         _common(command)
@@ -112,6 +118,8 @@ def _preview(api, args):
 
 def execute(api, args):
     """Translate one parsed command to the same methods used by the local UI."""
+    if args.action == "secrets":
+        return api.secrets()
     if args.action in {"list", "search"}:
         filters = MemoryFilter(**{key: getattr(args, key) for key in _FILTERS}, query=getattr(args, "query", ""))
         return api.list(filters, limit=args.limit, cursor=args.cursor)
@@ -132,9 +140,12 @@ def execute(api, args):
     return _preview(api, args)
 
 
-def _table(rows, columns):
+def table(rows, columns, *, max_width: int | None = 72):
+    """Print a plain-text table, optionally retaining every metadata character."""
     values = [[str(row.get(key, "")) for key in columns] for row in rows]
-    widths = [min(72, max([len(key), *(len(row[i]) for row in values)])) for i, key in enumerate(columns)]
+    widths = [max([len(key), *(len(row[i]) for row in values)]) for i, key in enumerate(columns)]
+    if max_width is not None:
+        widths = [min(max_width, width) for width in widths]
     print("  ".join(key.upper().ljust(widths[i]) for i, key in enumerate(columns)))
     for row in values:
         print("  ".join(value.replace("\n", " ")[: widths[i]].ljust(widths[i]) for i, value in enumerate(row)))
@@ -171,7 +182,7 @@ def _render_items(data):
         )
         for item in data["items"]
     ]
-    _table(rows, ("kind", "ref", "revision", "content"))
+    table(rows, ("kind", "ref", "revision", "content"))
     _render_scan(data)
     if data.get("next_before") is not None:
         print("Next history page: --before " + str(data["next_before"]))
@@ -188,7 +199,7 @@ def render(payload, *, as_json):
     data = payload["data"]
     if "preview" in data:
         plan = data["preview"]
-        _table(plan["affected"], ("kind", "ref", "revision", "scope_id"))
+        table(plan["affected"], ("kind", "ref", "revision", "scope_id"))
         entries = sorted({s["entry_id"] for s in plan["sources"]})
         print(f"Sources: {len(plan['sources'])}; entries: {', '.join(entries)}; preview: {plan['preview_id']}")
         if not data["applied"]:
@@ -202,6 +213,14 @@ def render(payload, *, as_json):
             f"{counts['fact_history']} historical versions, {counts['episodes']} episodes and "
             f"{counts['attachments']} attachments to {data['out']}."
         )
+    elif "rows_read" in data:
+        table(
+            data["items"], ("ref", "revision", "kind", "origin", "entry", "session", "time", "patterns"), max_width=None
+        )
+        print(
+            f"Read {data['rows_read']} rows; scanned {data['candidates_scanned']} candidates; "
+            f"found {len(data['items'])} secret-bearing versions."
+        )
     elif "items" in data:
         _render_items(data)
     else:
@@ -212,7 +231,8 @@ def main(argv=None):
     """Run a local owner command; refused inputs or stale selections exit with code 2."""
     args = parser().parse_args(argv)
     try:
-        payload = dict(format=FORMAT, action=args.action, status="ok", data=execute(open_management(args), args))
+        api = open_management(args, initialize=args.action != "secrets")
+        payload = dict(format=FORMAT, action=args.action, status="ok", data=execute(api, args))
         code = 0
     except ContractError as exc:
         payload = dict(format=FORMAT, action=args.action, status="error", code=exc.code, field=exc.field)

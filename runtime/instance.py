@@ -34,6 +34,7 @@ from ..vector.lance_native import helper_start_failure
 from ..vector.process_store import NativeVectorPathError
 from ..vector.store import build_vector_store
 from .auxiliary import build_auxiliary_runtime
+from .backup_upkeep import mirror_if_due
 from .codex_cli import CodexCliConsolidationAdapter
 from .embedding_retry import embed_with_one_retry
 from .instance_config import RuntimeInstanceConfig, VectorRuntimeConfig
@@ -252,6 +253,13 @@ class _LazyVectorPort:
         adapter = self._embedding_adapter()
         return None if adapter is None else adapter._embed_query
 
+    def _checked_query(self, context, route, texts, seconds):
+        """Check the current conversation at each actual query embedding request."""
+        from ..core.private import using_outbound_check
+
+        with using_outbound_check(lambda: self._instance.core.private_mode(context.trusted_context) == "full"):
+            return route(texts, seconds)
+
     def prefetch_query(self, context: SearchContext, *, also: tuple[str, ...] = ()) -> _QuerySearch | None:
         """Start the query's vector search now, beside the SQLite channels: the embedding in one thread, the store's
         open and the search in another, which overlaps the two as ``search`` does.  The round that asks for the same
@@ -279,13 +287,18 @@ class _LazyVectorPort:
             queries = queries[:1]
             one = adapter._embed_query
             many = lambda texts, seconds: (one(texts[0], seconds),)  # noqa: E731
+        route = many
+
+        def checked(texts, seconds):
+            return self._checked_query(context, route, texts, seconds)
+
         embedding = _QueryEmbedding(queries, now + window * QUERY_EMBEDDING_SHARE)
         # The most any round asks for (``SearchLimits.vector_limit``); a round's own allowance is its first ones.
         # The recall's deadline is the search's cap, and its share is measured inside the search from the moment the
         # embedding lands (``_QuerySearch.deadline_for``): a cold provider round trip is not the collection's to pay.
         pending = _QuerySearch(context.query, limit, context.deadline, share_seconds=window * QUERY_SEARCH_SHARE)
         pending.embedding = embedding
-        threading.Thread(target=embedding.run, args=(many,), name="scope-recall-query-embedding", daemon=True).start()
+        threading.Thread(target=embedding.run, args=(checked,), name="scope-recall-query-embedding", daemon=True).start()
         search = partial(
             self._search, context, limit=limit, prefetched=embedding, opened=pending.opened, search=pending
         )
@@ -359,11 +372,12 @@ class _LazyVectorPort:
                 embedding_remaining = deadline.remaining()
                 if embedding_remaining <= 0:
                     raise TimeoutError("query embedding stage deadline exhausted")
+
                 prepared.append(
                     (
                         context.query,
                         embed_with_one_retry(
-                            lambda seconds: embed(context.query, seconds),
+                            lambda seconds: self._checked_query(context, embed, context.query, seconds),
                             budget_seconds=embedding_remaining,
                             remaining=deadline.remaining,
                         ),
@@ -493,6 +507,8 @@ class RuntimeInstance:
     embed_backfill: dict | None = None
     #: Receipt of the page of a re-embed run this drain reopened (``respace_if_due``), or ``None`` without a run.
     embed_respace: dict | None = None
+    #: Snapshot or mirror outcome from this drain, independent of model budgets.
+    backup_upkeep: dict | None = None
     #: Work types this drain left alone, each with the held model and when its
     #: hold ends (runtime/model_budget.py ``provider_holds``).
     provider_holds: dict = field(default_factory=dict)
@@ -629,8 +645,19 @@ class RuntimeInstance:
         now = time.monotonic()
         deadline = RequestDeadline.from_absolute(now + float(seconds), now=now)
         with using_request_deadline(deadline):
+            from ..core.private import outbound_blocked, using_outbound_check
+
+            if outbound_blocked(self.core.storage, self.core.clock, self.config.context()):
+                return False
+
+            def checked(budget):
+                with using_outbound_check(
+                    lambda: outbound_blocked(self.core.storage, self.core.clock, self.config.context())
+                ):
+                    return embed("scope recall warm-up", budget)
+
             embed_with_one_retry(
-                lambda budget: embed("scope recall warm-up", budget),
+                checked,
                 budget_seconds=deadline.remaining(),
                 remaining=deadline.remaining,
             )
@@ -704,6 +731,7 @@ class RuntimeInstance:
         budget = self.config.drain_seconds if remaining_seconds is None else remaining_seconds
         strict_float("remaining_seconds", budget, minimum=0.001, maximum=self.config.drain_seconds)
         deadline = time.monotonic() + budget
+        self.backup_upkeep = mirror_if_due(self.core.storage, self.config, available_seconds=budget)
         ingress_gaps = self._replay_ingress(budget)
         vector_gaps = self._open_vector_for_drain(deadline, budget)
         self.background_gaps = (*ingress_gaps, *vector_gaps)
@@ -735,6 +763,11 @@ class RuntimeInstance:
                 available_seconds=max(0.0, deadline - time.monotonic()),
             )
         )
+        if (self.backup_upkeep or {}).get("outcome") == "failed":
+            self.background_gaps = (
+                *self.background_gaps,
+                f"deletion_mirror_failed:{(self.backup_upkeep or {}).get('error', 'unknown')}",
+            )
         from ..core.worker import WorkerConfig, drain_worker  # only a process that drains loads the worker
 
         model, candidate = self._consolidation_ports(consolidation)

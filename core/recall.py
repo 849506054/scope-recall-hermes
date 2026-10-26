@@ -10,12 +10,14 @@ from itertools import islice
 from typing import Protocol
 
 from ..contracts import ContractError, utc_timestamp
+from .auto_recall import automatic_recall_skip_reason
 from .background_context import background_candidates, current_task_candidate
 from .claim_storage import parse_source_ref
 from .claims import canonical_time
 from .coverage import note_truncation
 from .duplicate_collapse import DistinctContent, note_duplicates
 from .events import lexical_terms
+from .model_content import withhold_secret_items
 from .owner_view import OwnerView, owner_names, owner_view
 from .recall_budget import estimate_tokens, event_admission_order
 from .recall_needs import (
@@ -108,6 +110,16 @@ _VECTOR_REJECTION_GAPS = {
     "vector_threshold_unconfigured": "vector_threshold_unconfigured",
 }
 _VECTOR_SILENT_REJECTIONS = frozenset({"vector_below_threshold", "vector_id_missing", "vector_score_invalid"})
+
+
+def _note_below_floor(gaps: list[str], channel: str) -> None:
+    """Accumulate content-free counts of channel candidates below automatic admission."""
+    prefix = f"auto_relevance_below_floor:{channel}:"
+    for index, gap in enumerate(gaps):
+        if gap.startswith(prefix):
+            gaps[index] = prefix + str(int(gap[len(prefix) :]) + 1)
+            return
+    gaps.append(prefix + "1")
 
 
 def _takes_also(prefetch) -> bool:
@@ -387,6 +399,9 @@ class RetrievalPipeline:
             if accepted:
                 admitted.append(candidate)
                 continue
+            if context.automatic_injection and reason == "vector_below_threshold":
+                _note_below_floor(gaps, "vector")
+                continue
             gap = _VECTOR_REJECTION_GAPS.get(reason)
             if gap is None and reason not in _VECTOR_SILENT_REJECTIONS:
                 gap = f"vector_rejected:{reason}"
@@ -429,6 +444,53 @@ class RetrievalPipeline:
             seeds.append(replace(representative, fusion_score=fusion))
         return tuple(seeds)
 
+    def _automatic_floor(self, tx, candidate: CandidateRef, context: SearchContext, gaps: list[str]) -> bool:
+        """Apply the channel floor before fusion and relation expansion.
+
+        Storage reports lexical matches, including credited synonyms. Ports
+        without those matches are checked against their hydrated statement.
+        Rejections count channel candidates, once per collection round.
+        """
+        question = self._admission_query(context)
+        if candidate.source == "dated" and context.time is not None:
+            question = context.time.rest
+        if candidate.source not in {"vector", "exact_ref", "scoped", "relation"}:
+            if candidate.matched_query_terms is None:
+                obj = self.storage_reader.hydrate(tx, candidate, context)
+                hits = meaningful_query_terms(question)
+                matched = set(hits).intersection(lexical_terms(statement_text(obj))) if obj is not None else set()
+                candidate = replace(candidate, matched_query_terms=tuple(sorted(matched)))
+        if self.policy.automatic_admission(candidate, question):
+            return True
+        _note_below_floor(gaps, candidate.source)
+        return False
+
+    def _qualified_candidates(self, tx, raw: list[CandidateRef], context: SearchContext, gaps: list[str]):
+        """Require a passing channel per object, retaining its admitted ranking signals.
+
+        A strong semantic hit can also have a weak lexical signal. Its position
+        still uses both ranks; that weak signal cannot qualify another object.
+        Each object with no legacy-admitted channel uses its passing signals
+        directly, so an unrelated candidate cannot suppress that fallback.
+        For a named time window, the dated channel owns relaxed lexical
+        admission; ordinary fallback would bypass that window.
+        """
+        admitted = [candidate for candidate in raw if self._admit(candidate, context)]
+        if not context.automatic_injection:
+            return admitted
+        passing = [
+            candidate
+            for candidate in raw
+            if f"{candidate.ref}@{candidate.revision}" not in context.current_source_refs
+            and self._automatic_floor(tx, candidate, context, gaps)
+        ]
+        keys = {candidate.key for candidate in passing}
+        qualified = [candidate for candidate in admitted if candidate.key in keys]
+        if context.time is not None:
+            return qualified
+        qualified_keys = {candidate.key for candidate in qualified}
+        return qualified + [candidate for candidate in passing if candidate.key not in qualified_keys]
+
     def _collect(
         self,
         tx,
@@ -448,7 +510,8 @@ class RetrievalPipeline:
         def admitted() -> tuple[CandidateRef, ...]:
             # Deadline exits still pass every collected candidate through the
             # same current-source and channel qualification gate.
-            return self._fuse_candidates([candidate for candidate in raw if self._admit(candidate, context)], seen)
+            accepted = self._qualified_candidates(tx, raw, context, gaps)
+            return self._fuse_candidates(accepted, seen)
 
         channels = (
             # First, so a slow statement after it cannot cost the one channel that reads what the question names.
@@ -597,8 +660,54 @@ class RetrievalPipeline:
     #: A relation hit receives half the smaller of its own reciprocal-rank score and its seed's fusion score.
     #: With the default ``rrf_k=60`` and 48-candidate pool, its score is at most 1/124, below a direct hit at rank 48.
     #: Related hits can differ in their own ranks, so their final order need not match seed order.  Turn replies are
-    #: collected before relation hops and do not receive this weight.
+    #: collected before relation hops and capped at their seed's score. Echoes
+    #: retain the reply's own score to reach an earlier answer to the same question.
     RELATION_WEIGHT = RELATION_WEIGHT
+
+    def _expand_turns(self, tx, context, seeds, *, echoes, candidates, seen) -> tuple[int, bool]:
+        """Append turn replies with their strongest seed path; return inspections and deadline exhaustion."""
+        turn_replies = getattr(self.storage_reader, "turn_replies", None)
+        if not callable(turn_replies):
+            return 0, False
+        # Replies precede other relations so a low-ranked question can reach
+        # its answer. Half the bound leaves room for claims and episodes.
+        # Echoes lead only to their turn: over repeated real questions, 42 of
+        # 46 otherwise missed answers were reached only through such a copy.
+        turn_bound = max(1, context.limits.relation_objects // 2)
+        echo_keys = {candidate.key for candidate in echoes}
+        turn_at = {}
+        inspected = 0
+        for seed in sorted((*seeds, *echoes), key=lambda item: (-item.fusion_score, item.key)):
+            if inspected >= turn_bound:
+                break
+            # A seed without replies still costs its bounded turn lookups.
+            if self._remaining(context) <= 0:
+                return inspected, True
+            for candidate in turn_replies(tx, seed):
+                if inspected >= turn_bound:
+                    break
+                if self._remaining(context) <= 0:
+                    return inspected, True
+                inspected += 1
+                own = rrf_score((candidate.rank + 1,), k=self.policy.rrf_k)
+                score = own if seed.key in echo_keys else min(own, seed.fusion_score)
+                if candidate.key in turn_at:
+                    # Several seeds can share a reply. An echo's path retains
+                    # its own score even when an ordinary seed reached it first.
+                    index = turn_at[candidate.key]
+                    prior = candidates[index]
+                    candidates[index] = replace(prior, fusion_score=max(prior.fusion_score, score))
+                    continue
+                if candidate.key in seen:
+                    continue
+                seen.add(candidate.key)
+                if f"{candidate.ref}@{candidate.revision}" in context.current_source_refs:
+                    continue
+                if self._hydrate_admit(tx, candidate, context) is None:
+                    continue
+                turn_at[candidate.key] = len(candidates)
+                candidates.append(replace(candidate, fusion_score=score))
+        return inspected, False
 
     def _expand(
         self,
@@ -620,48 +729,14 @@ class RetrievalPipeline:
         all_candidates = list(seeds)
         seen = {candidate.key for candidate in (*seeds, *echoes)}
         frontier = list(seeds)
-        inspected = 0
 
         def stopped(gap: str) -> tuple[CandidateRef, ...]:
             gaps.append(gap)
             return tuple(all_candidates)
 
-        # The replies a recalled message received come before any other
-        # relation, for every seed: spent seed by seed they would go to
-        # whichever seeds ranked first, and a lower-ranked question would
-        # never reach its answer.  Half the bound is the most they may take,
-        # because a query that recalls many messages would otherwise leave
-        # nothing for the claims and episodes an answer is just as often
-        # reached through.  A question asked again word for word is refused
-        # as an echo of the current message, and it is the only way to what
-        # it was told: over the owner's real questions asked again on a
-        # shared store, 42 of the 46 answers never reached were behind such a
-        # copy.
-        turn_replies = getattr(self.storage_reader, "turn_replies", None)
-        if callable(turn_replies):
-            turn_bound = max(1, limits.relation_objects // 2)
-            for seed in sorted((*frontier, *echoes), key=lambda item: (-item.fusion_score, item.key)):
-                if inspected >= turn_bound:
-                    break
-                # Checked per seed as well: a seed whose turn has no reply still costs its two look-ups.
-                if self._remaining(context) <= 0:
-                    return stopped("deadline_exceeded_relation")
-                for candidate in turn_replies(tx, seed):
-                    if inspected >= turn_bound:
-                        break
-                    if self._remaining(context) <= 0:
-                        return stopped("deadline_exceeded_relation")
-                    inspected += 1
-                    if candidate.key in seen:
-                        continue
-                    seen.add(candidate.key)
-                    if f"{candidate.ref}@{candidate.revision}" in context.current_source_refs:
-                        continue
-                    if self._hydrate_admit(tx, candidate, context) is None:
-                        continue
-                    all_candidates.append(
-                        replace(candidate, fusion_score=rrf_score((candidate.rank + 1,), k=self.policy.rrf_k))
-                    )
+        inspected, expired = self._expand_turns(tx, context, seeds, echoes=echoes, candidates=all_candidates, seen=seen)
+        if expired:
+            return stopped("deadline_exceeded_relation")
 
         for _hop in range(limits.relation_hops):
             next_frontier: list[CandidateRef] = []
@@ -784,8 +859,18 @@ class RetrievalPipeline:
         return selected
 
     def _apply_budget(
-        self, ranked: list[tuple[CandidateRef, RetrievedObject]], limits: SearchLimits
+        self,
+        ranked: list[tuple[CandidateRef, RetrievedObject]],
+        limits: SearchLimits,
+        gaps: list[str] | None = None,
+        *,
+        context: SearchContext | None = None,
     ) -> list[tuple[CandidateRef, RetrievedObject]]:
+        """Scan only candidates that can take a slot; withheld items consume no budget.
+
+        Admitted ordinary hits survive a collection deadline. The optional oversized fallback uses only time left.
+        """
+        gaps = [] if gaps is None else gaps
         kept: list[tuple[CandidateRef, RetrievedObject]] = []
         oversized: list[tuple[CandidateRef, RetrievedObject]] = []
         total_tokens = 0
@@ -801,12 +886,24 @@ class RetrievalPipeline:
                 # One large candidate must not starve smaller useful evidence
                 # later in the ranking. The compiler budgets the whole packet.
                 continue
+            if not withhold_secret_items([item], gaps):
+                continue
             total_tokens += tokens
             kept.append((candidate, item))
         # An item that alone exceeds the whole budget cannot fit in what is
         # left of it, so it is worth returning only when there is nothing else
         # to show: the expandable hint is a fallback, not a suffix.
-        return (kept or oversized)[: limits.max_items]
+        if kept:
+            return kept
+        for pair in oversized:
+            if len(kept) >= limits.max_items:
+                break
+            if context is not None and self._remaining(context) <= 0:
+                gaps.append("deadline_exceeded")
+                break
+            if withhold_secret_items([pair[1]], gaps):
+                kept.append(pair)
+        return kept
 
     # -- the search itself ----------------------------------------------------
 
@@ -823,12 +920,23 @@ class RetrievalPipeline:
             return _empty_result(working, "deadline_exceeded")
         gaps: list[str] = []
         self.last_vector_failure = None
-        prefetched = self._prefetch_query(working)
         try:
             with self.storage.read(
                 working.trusted_context, remaining_seconds=max(self._remaining(working), 0.001)
             ) as tx:
                 epoch = self.storage_reader.epoch(tx)
+                if working.automatic_injection and not working.focus_refs:
+                    reason = automatic_recall_skip_reason(
+                        working.query,
+                        tx=tx,
+                        context=working.trusted_context,
+                        current_source_refs=working.current_source_refs,
+                        deadline=working.deadline,
+                        clock=self.clock,
+                    )
+                    if reason is not None:
+                        return _empty_result(working, f"auto_recall_skipped:{reason}")
+                prefetched = self._prefetch_query(working)
                 working = self._scoped(tx, working, gaps)
                 aside = _Aside()
                 hydrated, seed_count = self._collect_rounds(tx, working, gaps, prefetched=prefetched, aside=aside)
@@ -1058,18 +1166,19 @@ class RetrievalPipeline:
         # background cannot repeat the evidence either.
         distinct = DistinctContent()
         ordered = self._behind_replacements(self._rank_hydrated(hydrated, working), working)
-        ranked = self._apply_budget(distinct.filtered(ordered), working.limits)
+        ranked = self._apply_budget(distinct.filtered(ordered), working.limits, gaps, context=working)
         query_items = tuple(obj for _candidate, obj in ranked)
         if working.mode == "auto" and self._remaining(working) > 0:
             if ranked and all(estimate_tokens(obj.content) > working.limits.budget_tokens for _c, obj in ranked):
                 # Nothing that fits answered (as when the only hit that fits is a message the model still holds): one
-                # hit too large for any packet stays, as the hint that it can be expanded, and the background takes
-                # the other slots.  Six such hits would take all of them, the compiler would refuse each, and the
-                # packet would come back empty.
+                # hit too large for any packet stays as an expansion hint. The
+                # compiler requires query evidence to survive before background
+                # can share the final packet.
                 ranked = ranked[:1]
             background = background_candidates(
                 tx, working, self.storage_reader, self.clock, gaps, query_evidence=bool(query_items)
             )
+            background = withhold_secret_items(background, gaps, content=lambda pair: pair[1])
             present = {candidate.key for candidate, _obj in ranked}
             # Query evidence comes first; background shares the final byte
             # budget and can only consume remaining packet slots.  What the

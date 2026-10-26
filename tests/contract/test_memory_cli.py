@@ -10,10 +10,64 @@ from jsonschema import validate
 from scope_recall.core import management_query
 from scope_recall.core.management import MemoryManagement
 from scope_recall.core.restore import InstallationMaintenance
+from scope_recall.core.schema import SCHEMA_VERSION
 from scope_recall.maintenance import cli, memory
 from test_claims import app, capture, initial
 from test_restore import backup, run, store
 from v11_support import downgrade_store
+
+
+def test_secret_command_has_metadata_only_in_json_and_plain_output(app, monkeypatch, capsys):
+    from test_memory_admin import legacy_secret
+
+    core, context = app
+    flagged = legacy_secret(core, context, monkeypatch)
+    api = MemoryManagement(core, InstallationMaintenance(context))
+    monkeypatch.setattr(memory, "open_management", lambda args, **_: api)
+    for options in (["--json"], []):
+        assert cli.main(["memory", "secrets", *options]) == 0
+        output = capsys.readouterr().out
+        assert flagged.ref in output and "Xk9mP2qa" not in output
+        if options:
+            result = json.loads(output)
+            assert result["action"] == "secrets" and result["data"]["rows_read"] >= 1
+            validate(
+                result,
+                json.loads(
+                    (Path(__file__).resolve().parents[2] / "contracts" / "memory_management.schema.json").read_text(
+                        encoding="utf-8"
+                    )
+                ),
+            )
+        else:
+            assert "Read " in output and "PATTERNS" in output and "REVISION" in output
+
+
+def test_secret_command_opens_an_existing_store_without_initialization(store, monkeypatch, capsys):
+    from scope_recall.core import MemoryCore
+
+    store.say("NameOne uses green.")
+
+    def forbidden(self):
+        raise AssertionError("a read-only inventory cannot initialize or migrate a store")
+
+    monkeypatch.setattr(MemoryCore, "initialize", forbidden)
+    assert cli.main(["memory", "secrets", *store.target(), "--json"]) == 0
+    result = json.loads(capsys.readouterr().out)
+    assert result["data"]["items"] == [] and result["data"]["rows_read"] >= 1
+
+
+def test_the_page_parser_opens_and_initializes_a_store(store, monkeypatch):
+    """The management page's parser defines no memory action; the shared entry still binds and initializes."""
+    from scope_recall.core import MemoryCore
+    from scope_recall.maintenance import ui
+
+    store.say("NameOne uses green.")
+    initialized = []
+    initialize = MemoryCore.initialize
+    monkeypatch.setattr(MemoryCore, "initialize", lambda self: initialized.append(self) or initialize(self))
+    api = memory.open_management(ui.parser().parse_args(store.target()))
+    assert isinstance(api, MemoryManagement) and len(initialized) == 1
 
 
 @pytest.fixture
@@ -21,7 +75,7 @@ def command(app, monkeypatch, capsys):
     core, context = app
     item, source = initial(core, context)
     api = MemoryManagement(core, InstallationMaintenance(context))
-    monkeypatch.setattr(memory, "open_management", lambda args: api)
+    monkeypatch.setattr(memory, "open_management", lambda args, **_: api)
 
     def call(action, *args):
         code = cli.main(["memory", action, *args, "--json"])
@@ -40,7 +94,7 @@ def command(app, monkeypatch, capsys):
 
 
 @pytest.mark.parametrize(
-    "action", ("list", "search", "show", "history", "revise", "mute", "unmute", "forget", "forget-session")
+    "action", ("list", "search", "show", "history", "revise", "mute", "unmute", "forget", "forget-session", "secrets")
 )
 def test_each_command_reaches_the_owner_api(command, action):
     call, item, _source = command
@@ -54,6 +108,7 @@ def test_each_command_reaches_the_owner_api(command, action):
         "unmute": [item.ref, "--yes"],
         "forget": [item.ref, "--yes"],
         "forget-session": ["--session", "TEST-session", "--yes"],
+        "secrets": [],
     }
     code, result = call(action, *arguments[action])
     assert code == 0 and result["status"] == "ok", result
@@ -159,7 +214,7 @@ def test_malformed_cursor_returns_input_invalid_without_traceback(command):
 def test_previous_schema_upgrades_without_changing_sources(store):
     source = store.say("NameOne uses green.")
     downgrade_store(store.core.storage.path, 1110)
-    assert store.core.initialize().schema_version == 1111
+    assert store.core.initialize().schema_version == SCHEMA_VERSION
     assert store.core.source(store.ctx, source.ref, 1).event == source.event
     with store.core.storage.read(store.ctx) as tx:
         assert tx._check().execute("SELECT count(*) FROM management_actions").fetchone()[0] == 0

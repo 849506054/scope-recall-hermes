@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from functools import partial
 
 from ..contracts import ContractError, TrustedContext
+from . import private
 from .admission import resume_deferred
 from .candidate_lifecycle import PROCESS_BATCH_LIMIT, CandidateEvaluator
 from .consolidate import candidate_evaluation_messages, consolidation_messages
@@ -20,7 +21,7 @@ from .worker_consolidation import (
     build_consolidation_model,
     process_consolidate,
 )
-from .worker_outcomes import BUDGET_PAUSE_ERRORS, budget_left
+from .worker_outcomes import BUDGET_PAUSE_ERRORS, budget_left, hold_for_private_mode
 from .worker_projection import (
     EmbedGroupRefused,
     EmbedPort,
@@ -223,6 +224,7 @@ def _resume_admission(
     page = min(config.candidate_batch_limit, config.max_items)
     with storage.write(context, remaining_seconds=min(1.0, budget_left(started, clock, budget))) as tx:
         tx.candidates.backfill(now=clock.utc_now(), limit=page)
+        tx.candidates.retire_unresolved_backlog(now=clock.utc_now())
         tx.candidates.archive_dormant(now=clock.utc_now(), limit=page)
         if not candidate_available:
             tx.candidates.mark_capability_unavailable()
@@ -290,6 +292,23 @@ def _release_group(
         # The lease expires on its own; a failure to hand work back early is
         # never worth failing a pass over.
         return
+
+
+def _private_allowed(storage, clock, context, allowed: frozenset[str], started: float, budget: float) -> frozenset[str]:
+    """Drop every optional outbound work type while a store-wide full interval is open."""
+    with storage.read(context, remaining_seconds=budget_left(started, clock, budget)) as tx:
+        now = clock.utc_now()
+        rules = private.active_intervals(tx, now)
+    if private.source_blocked(rules, None):
+        return allowed - _HOLDABLE_WORK_TYPES
+    return allowed
+
+
+def _run_member(storage, clock, context, member, *, run, started: float, budget: float):
+    """Run one processor, unless a full interval covers its subject: then hold it without a provider call."""
+    if private.work_blocked(storage, clock, context, member):
+        return hold_for_private_mode(storage, clock, context, member, started=started, budget=budget)
+    return run(storage, clock, context, member, started=started, budget=budget)
 
 
 def _other_work_ready(storage, clock, context, started: float, budget: float, kinds: frozenset[str]) -> bool:
@@ -387,7 +406,7 @@ def _pass_work_types(
     unavailable = _queued_work_types(
         storage, clock, context, started, budget, [kind for kind, port in ports.items() if port is None]
     )
-    return allowed, unavailable
+    return _private_allowed(storage, clock, context, allowed, started, budget), unavailable
 
 
 def _embed_group(storage, clock, context, group: tuple, embed, started: float, budget: float):
@@ -558,7 +577,7 @@ def drain_worker(
                 if member.work_type == "embed"
                 else processors[member.work_type]
             )
-            outcome = run(storage, clock, context, member, started=started, budget=member_budget)
+            outcome = _run_member(storage, clock, context, member, run=run, started=started, budget=member_budget)
             disposition, error_code, state = outcome
             dispositions[disposition] += 1
             receipts.append(

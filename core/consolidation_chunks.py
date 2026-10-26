@@ -6,6 +6,7 @@ import re
 from dataclasses import dataclass
 
 from ..contracts import ContractError
+from .secret_patterns import cut_between_runs
 from .source_records import StoredSource
 
 
@@ -41,8 +42,9 @@ def source_chunk(source, offset, *, formatter, episode_ref=None, resume_seed=())
 
     def view(end):
         chunk = ConsolidationChunk(offset, end, total)
+        values: dict = dict(source.__dict__, event=dict(source.event, content=content[offset:end]))
         return ChunkedSource(
-            **dict(source.__dict__, event=dict(source.event, content=content[offset:end])),
+            **values,
             consolidation_window=chunk,
             consolidation_seed=resume_seed,
         )
@@ -70,4 +72,11 @@ def source_chunk(source, offset, *, formatter, episode_ref=None, resume_seed=())
         boundaries = list(re.finditer(r"[。！？!?;；\n]", text))
         if boundaries and boundaries[-1].end() >= max(1, len(text) // 2):
             best = view(offset + boundaries[-1].end())
+        else:
+            # With no sentence end to stop at, the page ends where the request
+            # guard reads it as the source reads: cut inside a value or a key's
+            # name, it would be refused every time it is asked.
+            end = cut_between_runs(content, offset + len(text), toward=offset + max(1, len(text) // 2))
+            if end != offset + len(text):
+                best = view(end)
     return best, best.consolidation_window

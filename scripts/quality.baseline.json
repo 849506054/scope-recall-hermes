@@ -25,7 +25,6 @@
    "reportOptionalMemberAccess": 3
   },
   "adapters/clients/prompt_recall.py": {
-   "reportArgumentType": 3,
    "reportOptionalCall": 1
   },
   "adapters/clients/record_reader.py": {
@@ -87,7 +86,6 @@
    "reportGeneralTypeIssues": 2
   },
   "core/consolidation_chunks.py": {
-   "reportArgumentType": 12,
    "reportOptionalMemberAccess": 1
   },
   "core/consolidation_summary.py": {
@@ -154,7 +152,7 @@
    "reportAttributeAccessIssue": 1
   },
   "core/worker_projection.py": {
-   "reportArgumentType": 2
+   "reportArgumentType": 1
   },
   "distribution/hermes/__init__.py": {
    "reportCallIssue": 1
@@ -219,7 +217,7 @@
    "reportAttributeAccessIssue": 2
   },
   "runtime/http_session.py": {
-   "reportOptionalMemberAccess": 7
+   "reportOptionalMemberAccess": 4
   },
   "runtime/instance.py": {
    "reportArgumentType": 6,
@@ -595,13 +593,7 @@
   "core/recall.py": {
    "BLE001": 5,
    "C901": {
-    "RetrievalPipeline._expand": 26
-   },
-   "PLR0911": {
-    "RetrievalPipeline._expand": 9
-   },
-   "PLR0912": {
-    "RetrievalPipeline._expand": 24
+    "RetrievalPipeline._expand": 17
    }
   },
   "core/recall_diagnostics.py": {
@@ -666,7 +658,7 @@
    "E501": 2
   },
   "core/source_storage.py": {
-   "E501": 8
+   "E501": 7
   },
   "core/storage.py": {
    "B010": 1,
@@ -675,13 +667,13 @@
   },
   "core/trace.py": {
    "C901": {
-    "read_trace": 20
-   },
-   "PLR0912": {
     "read_trace": 19
    },
+   "PLR0912": {
+    "read_trace": 18
+   },
    "PLR0915": {
-    "read_trace": 68
+    "read_trace": 66
    }
   },
   "core/truth_connection.py": {
@@ -725,7 +717,7 @@
   "core/worker_consolidation.py": {
    "BLE001": 1,
    "PLR0911": {
-    "process_consolidate": 10
+    "process_consolidate": 9
    }
   },
   "core/worker_outcomes.py": {
@@ -738,8 +730,7 @@
    "B905": 1,
    "BLE001": 6,
    "C901": {
-    "_purge_layers": 20,
-    "process_embed": 22
+    "_purge_layers": 20
    },
    "PLR0911": {
     "_purge_layers": 15,
@@ -760,9 +751,6 @@
    "BLE001": 3,
    "UP035": 1
   },
-  "maintenance/autostart.py": {
-   "UP017": 1
-  },
   "maintenance/cli.py": {
    "E501": 1,
    "PLR0911": {
@@ -770,9 +758,7 @@
    },
    "PLR0915": {
     "_upgrade_store": 64
-   },
-   "UP017": 1,
-   "UP035": 1
+   }
   },
   "maintenance/doctor.py": {
    "E501": 1
@@ -945,26 +931,22 @@
   },
   "runtime/scheduling.py": {
    "C901": {
-    "next_wake": 26,
+    "next_wake": 25,
     "supervise": 23
    },
    "PLR0912": {
-    "next_wake": 22,
+    "next_wake": 21,
     "supervise": 23
    },
    "PLR0915": {
-    "next_wake": 77,
-    "supervise": 84
+    "next_wake": 74,
+    "supervise": 83
    },
    "UP017": 5
   },
   "runtime/subscription_budget.py": {
    "E501": 1,
    "UP017": 1
-  },
-  "runtime/validation.py": {
-   "UP017": 1,
-   "UP035": 1
   },
   "runtime/vector_retention.py": {
    "E501": 1,

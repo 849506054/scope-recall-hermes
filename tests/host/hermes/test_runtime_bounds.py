@@ -893,10 +893,10 @@ def test_a_shutdown_waits_for_the_turn_being_written(adapter, monkeypatch):
     assert any(":sync_assistant:" in key for key in keys), keys
 
 
-def test_a_turn_is_dated_when_its_writing_begins(adapter, monkeypatch):
-    """The next turn's hooks may write between this turn's captures; dated as each is reached, the reply would be
-    said after the next turn's message."""
+def test_turn_reply_keeps_observation_time_when_its_sync_is_delayed(adapter, monkeypatch):
+    """A reply witnessed before sync keeps that instant; intervening turns do not move it forward."""
     provider, _clock = adapter
+    observed_at = provider._utc_now()
     _turn_with_interim(provider, "turn-10", 2)
     times = iter(f"2026-10-01T12:00:{second:02d}Z" for second in range(60))
     monkeypatch.setattr(provider, "_utc_now", lambda: next(times))
@@ -910,7 +910,8 @@ def test_a_turn_is_dated_when_its_writing_begins(adapter, monkeypatch):
     monkeypatch.setattr(provider._core, "record_host_event", record_host_event)
     monkeypatch.setattr(provider._core, "source_by_event_key", lambda *args, **kwargs: None, raising=False)
     provider.sync_turn("TEST 跑几步", "TEST 跑完了。", session_id="TEST-session-1")
-    assert [when for key, when in dated.items() if ":sync_assistant:" in key] == ["2026-10-01T12:00:00Z"], dated
+    assert [when for key, when in dated.items() if ":sync_assistant:" in key] == [observed_at], dated
+    assert [when for key, when in dated.items() if ":user:" in key] == ["2026-10-01T12:00:00Z"], dated
 
 
 def test_a_skipped_pre_llm_call_leaves_its_turn_id_for_the_turn(adapter, monkeypatch):
@@ -1179,7 +1180,9 @@ def test_a_capture_kept_to_retry_is_said_once_until_it_is_stored(adapter, hermes
     ], lines
 
 
-def test_a_shutdown_on_a_held_store_spends_at_most_its_short_pass(adapter, hermes_home, monkeypatch, metered_store):
+def test_a_shutdown_on_a_held_store_spends_at_most_its_short_pass(
+    adapter, hermes_home, monkeypatch, metered_store, kept_capture_seconds
+):
     """On a writer held past every budget a shutdown spends at most its short pass, not a whole 5 s pass for each
     adapter that kept anything, which would hold up a gateway's planned stop.  The writer's wait moves the clock on by
     what it was given, and each read of the store by 0.01 s, however long the runner's store takes."""
@@ -1198,7 +1201,7 @@ def test_a_shutdown_on_a_held_store_spends_at_most_its_short_pass(adapter, herme
     monkeypatch.setattr(provider._core, "record_host_event", held)
     started = clock()
     provider.shutdown()
-    assert_hook_budget(clock() - started, capture_retry.SHUTDOWN_RETRY_SECONDS)
+    assert_hook_budget(clock() - started - kept_capture_seconds(), capture_retry.SHUTDOWN_RETRY_SECONDS)
     assert capture_retry.SHUTDOWN_RETRY_SECONDS == 2.0
 
 

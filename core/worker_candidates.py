@@ -11,7 +11,9 @@ from dataclasses import replace
 from functools import partial
 
 from ..contracts import ContractError
+from . import private
 from .candidate_lifecycle import CandidateEvaluator, candidate_identity_restored
+from .candidate_tables import UNRESOLVED_SUBJECT_REASON
 from .claim_normalization import normalize_frame
 from .claims import evidence_refs
 from .evidence_question import evidence_text, rooted_verdict
@@ -251,9 +253,11 @@ def process_candidate_evaluation(
         if not tx.work._verify_lease(*item.lease, now=clock.utc_now()):
             return stale_result(tx, item)
         feedback = tx.work.derivation_feedback(item.work_id)
+        if tx.candidates.retire_unresolved_evaluation(item.subject_revision, now=clock.utc_now()):
+            return "obsolete", UNRESOLVED_SUBJECT_REASON, "obsolete"
         evaluation = tx.candidates.evaluation(item.subject_revision)
         live = _live_evidence(tx, evaluation)
-        if live is None:
+        if evaluation is None or live is None:
             invalid_reason = "authority_revoked"
         else:
             evidence_sources = live
@@ -275,21 +279,30 @@ def process_candidate_evaluation(
                     *item.lease,
                     now=clock.utc_now(),
                 )
-    if invalid_reason is not None:
-        return obsolete(reason=invalid_reason)
     # Commit the at-most-once fence before the optional model call. A crash
     # after this point fails closed and waits for genuinely new evidence; an
     # attempt already begun by an earlier lease is that crash observed.
-    if not began:
-        return fail(code="candidate_attempt_interrupted")
+    if evaluation is None or invalid_reason is not None or not began:
+        return (
+            obsolete(reason=invalid_reason)
+            if invalid_reason is not None
+            else fail(code="candidate_attempt_interrupted")
+        )
     try:
         repair = {"validation_feedback": feedback} if feedback is not None else {}
-        raw = evaluator.evaluate_candidate(
-            evaluation.candidate,
-            evidence_sources,
-            remaining_seconds=budget_left(started, clock, budget),
-            **repair,
-        )
+        if private.outbound_blocked(storage, clock, context, sources=evidence_sources, claims=(evaluation.candidate,)):
+            return fail(code="private_mode", budget_pause=True)
+        with private.using_outbound_check(
+            lambda: private.outbound_blocked(
+                storage, clock, context, sources=evidence_sources, claims=(evaluation.candidate,)
+            )
+        ):
+            raw = evaluator.evaluate_candidate(
+                evaluation.candidate,
+                evidence_sources,
+                remaining_seconds=budget_left(started, clock, budget),
+                **repair,
+            )
     except ContractError as exc:
         code = (exc.code or "candidate_evaluation_failed").lower()
         return fail(code=code, field=exc.field, budget_pause=code in BUDGET_PAUSE_ERRORS)
@@ -316,6 +329,8 @@ def process_candidate_evaluation(
             return _record_verdict(tx, item, evaluation, dependencies, value, result_digest, now)
     except ContractError as exc:
         code = exc.code or "DERIVATION_INVALID"
-        if code in {"SOURCE_MISSING", "VERSION_CONFLICT", "ACCESS_DENIED"}:
-            return obsolete(reason="memory_epoch_changed" if exc.field == "memory_epoch" else "authority_revoked")
-        return fail(code=code.lower(), field=exc.field)
+        return (
+            obsolete(reason="memory_epoch_changed" if exc.field == "memory_epoch" else "authority_revoked")
+            if code in {"SOURCE_MISSING", "VERSION_CONFLICT", "ACCESS_DENIED"}
+            else fail(code=code.lower(), field=exc.field)
+        )

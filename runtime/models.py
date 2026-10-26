@@ -20,6 +20,7 @@ from typing import Any, Protocol
 
 from ..contracts import ContractError
 from ..core.endpoint_policy import endpoint_scheme_allowed
+from ..core.private import require_outbound
 from ..core.secret_patterns import contains_secret_like_text
 from .model_budget import AuxiliaryBudgetLedger
 
@@ -276,6 +277,7 @@ class HttpsTransport:
     ) -> tuple[int, bytes]:
         """Bound the entire exchange, including waiting for a query session."""
         if self._session is None:
+            require_outbound()
             return self._post(
                 url, body=body, headers=headers, timeout_seconds=timeout_seconds, max_response_bytes=max_response_bytes
             )
@@ -283,6 +285,7 @@ class HttpsTransport:
         if not self._post_lock.acquire(timeout=max(0, seconds_left(deadline))):
             raise AuxiliaryModelError("timeout")
         try:
+            require_outbound()
             return self._post(
                 url,
                 body=body,
@@ -324,6 +327,7 @@ class HttpsTransport:
             if seconds_left(deadline) <= 0:
                 raise AuxiliaryModelError("timeout")
             if self._session is not None:
+                require_outbound()
                 stdout, stderr = self._session.exchange(
                     command,
                     request_bytes,
@@ -344,6 +348,7 @@ class HttpsTransport:
                 remaining = seconds_left(deadline)
                 if remaining <= 0:
                     raise AuxiliaryModelError("timeout")
+                require_outbound()
                 stdout, stderr = process.communicate(input=request_bytes, timeout=remaining)
             if seconds_left(deadline) <= 0:
                 raise AuxiliaryModelError("timeout")
@@ -402,6 +407,7 @@ class HttpsTransportPool:
                 raise AuxiliaryModelError("timeout")
             transport = self._available.pop()
         try:
+            require_outbound()
             return transport.post(
                 url,
                 body=body,
@@ -561,6 +567,7 @@ def metered_post(
         http_remaining = seconds_left(deadline)
         if http_remaining <= 0:
             raise AuxiliaryModelError("timeout")
+        require_outbound()
         status_code, raw = transport.post(
             endpoint, body=body, headers=headers, timeout_seconds=http_remaining, max_response_bytes=max_response_bytes
         )

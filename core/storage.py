@@ -18,7 +18,7 @@ from ..contracts import (
     TrustedContext,
 )
 from .deadline import remaining_seconds as request_remaining_seconds
-from .delete_storage import Deletions
+from .delete_storage import Deletions, watch_mirrored_tombstones
 from .failure_retry import failure_kind, retry_class
 from .registry_storage import Registry
 from .restore import restore_pending
@@ -34,6 +34,7 @@ from .schema import (
     upgrade_1108,
     upgrade_1109,
     upgrade_1110,
+    upgrade_1111,
 )
 from .source_records import SOURCE_COLUMNS, StoredSource, source_size, stored_source
 from .source_storage import Sources
@@ -667,7 +668,15 @@ class SQLiteStorage:
 
     def _upgrade_schema(self, conn: sqlite3.Connection) -> None:
         """Apply each supported migration in order after checking its input identity."""
-        migrations = (upgrade_1105, upgrade_1106, upgrade_1107, upgrade_1108, upgrade_1109, upgrade_1110)
+        migrations = (
+            upgrade_1105,
+            upgrade_1106,
+            upgrade_1107,
+            upgrade_1108,
+            upgrade_1109,
+            upgrade_1110,
+            upgrade_1111,
+        )
         for version, migrate in zip(UPGRADE_CHAIN, migrations, strict=True):
             if conn.execute("PRAGMA user_version").fetchone()[0] == version:
                 self.verify(conn, expected_schema=version)
@@ -812,6 +821,7 @@ class SQLiteStorage:
             conn = self._open("rw" if writable else "ro", remaining_seconds, restoring=restoring)
         tx = Transaction(conn, context, writable=writable)
         original = None
+        mirror = False
         try:
             conn.execute("BEGIN IMMEDIATE" if writable else "BEGIN")
             self.verify(conn)
@@ -819,10 +829,12 @@ class SQLiteStorage:
             # for the writer lease. Recheck after acquiring the transaction.
             if not restoring and restore_pending(self.binding.data_directory):
                 raise ContractError("RESTORE_UNVERIFIED")
-            yield tx
+            with watch_mirrored_tombstones(conn) as touched:
+                yield tx
             if writable:
                 tx._assert_committable()
                 conn.commit()
+                mirror = bool(touched)
             else:
                 conn.rollback()
         except BaseException as exc:
@@ -836,6 +848,17 @@ class SQLiteStorage:
         finally:
             tx._finish()
             self._close(conn, original)
+        if mirror:
+            self._after_commit_deletions()
+
+    def _after_commit_deletions(self) -> None:
+        """Try bounded mirroring after lease cleanup; I/O errors leave durable catch-up."""
+        try:
+            from .deletion_mirror import mirror_committed_deletions
+
+            mirror_committed_deletions(self.binding.data_directory, self.path)
+        except Exception:  # noqa: BLE001
+            pass
 
     def write(self, context: TrustedContext, *, remaining_seconds: float | None = None):
         return self._transaction(context, writable=True, remaining_seconds=remaining_seconds)
