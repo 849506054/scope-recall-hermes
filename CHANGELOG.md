@@ -2,6 +2,28 @@
 
 A line or two per release.  Each release's full notes are on its GitHub release page (tag ``v<version>``).
 
+## [3.16.0.1] - 2026-10-28
+
+Follows upstream v3.16.0. The report we filed, #327, is fixed there: `upgrade-store --backup-dir` holds the store's writer lease from the schema read through the snapshot and the migration, reads both schema markers back from the snapshot, and stops with `backup_schema_mismatch` instead of leaving a snapshot named for the old schema that holds the new one. Receipts now carry `backup_schema`, `backup_recorded_schema` and `session_index`.
+
+Capture also gains the session-first index on `source_events`, so a captured event no longer scans every source in its scope for the session's latest episode (0.2 s per event on 350,000 sources, under a millisecond with the index). The schema version stays 1112; the index needs no migration step and arrives with the next worker pass, `apply-install` or `upgrade-store`.
+
+Kept from this fork: the query prefetch that starts the vector search beside the SQLite channels (`_QuerySearch`), the vector-loss timeline with the adapter's one-line warning, the remote maintenance commands (`snapshot-remote`, `recover-remote`, `plan-vector-migration`, `run-vector-migration`, `clear-pending-remote`), the Qdrant backend and its `proxy_url` pass-through, the consolidation route's `allow_insecure_endpoint`, and `vector.tool_output_embedding`.
+
+Retired with the merge: the packaged Codex manifest under `distribution/codex/scope-recall/.codex-plugin/`, which upstream removed and no installer read. The consolidation route gains an optional `temperature`; this install leaves it unset, so request bodies are unchanged.
+
+## [3.16.0] - 2026-10-27
+
+Capture finds a session's latest episode through a session-first index on sources instead of scanning every source in the session's scope for each captured event, which held the write transaction for about 0.2 s per event on a store of 350,000 sources; with the index the lookup takes under a millisecond. The index needs no schema step, and stores read the same with or without it. New stores create it; an existing store gains it on the first writable open whose budget can carry the build (a worker pass with a minute left, `apply-install`, `upgrade-store`, or any writable open of a store under 100 MB), and shorter calls on larger stores go on without it.
+
+`upgrade-store --backup-dir` holds the store's writer lease, reported as `upgrade_store`, from reading the schema through the snapshot and the migration. A worker migrating the store while its snapshot was being copied could leave a snapshot named for the old schema that held the new one, which then could not roll the upgrade back. The command reads both schema markers back from the snapshot and stops with `backup_schema_mismatch`, keeping the snapshot and leaving the store untouched, unless they match. Receipts add `backup_schema`, `backup_recorded_schema` and, for a current or restamped store, `session_index`. The wait must be finite and is capped at 30 seconds; a zero wait makes one immediate attempt.
+
+Chat-completions and Responses consolidation routes accept an optional `temperature`, a finite number from 0 to 2, sent only when set; the `codex_cli` route refuses it when the configuration loads. Unset, request bodies are unchanged. Some providers refuse a temperature for reasoning models.
+
+The Codex and Claude Code plugin manifests the installers write carry the project's author and description and say what the plugin does in that host instead of placeholder text. Hooks, MCP wiring, names and versions are unchanged, so Codex keeps trusting its hooks. The packaged Codex manifest that no installer read is removed.
+
+After upgrading, the session index arrives with the next worker pass or `apply-install`; `scope-recall upgrade-store` adds it at once and reports `session_index`.
+
 ## [3.15.1.1] - 2026-10-26
 
 Follows upstream v3.15.1, absorbing 3.13.0, 3.14.0, 3.14.1, 3.15.0 and 3.15.1 in one merge. The two reports we filed are fixed there and the local workarounds are retired: candidates whose subject is the `unresolved-source:` placeholder leave candidate evaluation and their queued, leased and failed evaluations are retired by the worker, and a Chinese predicate restated with a trailing 了, 着 or 的 keeps the candidate's stored identity.
