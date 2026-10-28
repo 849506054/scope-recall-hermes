@@ -7,7 +7,7 @@ import json
 import logging
 import threading
 import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 from scope_recall.contracts import RecallPacket, RecallRequest
 from scope_recall.core.private import notice_for_mode
@@ -91,7 +91,8 @@ class Prefetch:
         )
         recall_seconds = time.monotonic() - timed
         self.last_prefetch_at = time.monotonic()
-        self._log_vector_loss(packet, recall_seconds)
+        # ``core.recall_packet`` carries no return annotation, so pyright reads ``dict | RecallPacket``.
+        self._log_vector_loss(cast(RecallPacket, packet), recall_seconds)
         preparation = core.prepare_recall_render(context, packet)
         with self._adapter._lock:
             if self._adapter._active_turn_id == turn:

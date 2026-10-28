@@ -377,9 +377,7 @@ class HttpsTransportPool:
     Closing wakes waiters and cancels all owned helpers, including active ones.
     """
 
-    def __init__(
-        self, *, size: int, allow_insecure_endpoint: bool = False, proxy_url: str | None = None
-    ) -> None:
+    def __init__(self, *, size: int, allow_insecure_endpoint: bool = False, proxy_url: str | None = None) -> None:
         if type(size) is not int or size <= 0:
             raise ValueError("transport_pool_size")
         if proxy_url is not None and not proxy_url_allowed(proxy_url):

@@ -298,7 +298,9 @@ class _LazyVectorPort:
         # embedding lands (``_QuerySearch.deadline_for``): a cold provider round trip is not the collection's to pay.
         pending = _QuerySearch(context.query, limit, context.deadline, share_seconds=window * QUERY_SEARCH_SHARE)
         pending.embedding = embedding
-        threading.Thread(target=embedding.run, args=(checked,), name="scope-recall-query-embedding", daemon=True).start()
+        threading.Thread(
+            target=embedding.run, args=(checked,), name="scope-recall-query-embedding", daemon=True
+        ).start()
         search = partial(
             self._search, context, limit=limit, prefetched=embedding, opened=pending.opened, search=pending
         )

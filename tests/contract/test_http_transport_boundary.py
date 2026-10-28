@@ -760,6 +760,7 @@ def test_only_a_transport_that_names_a_proxy_gives_its_helper_one(tmp_path, monk
     assert _proxy_post(models.HttpsTransport(proxy_url="http://proxy.local:7890")) == (200, b"http://proxy.local:7890")
     assert "HTTPS_PROXY" not in os.environ
 
+
 @pytest.mark.parametrize("batch", [False, True])
 def test_concurrent_query_embeddings_use_bounded_independent_connections(tmp_path, monkeypatch, batch, metered_ledger):
     """Only the provider is simulated; each persistent transport keeps its real serialization lock."""

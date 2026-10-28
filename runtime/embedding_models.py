@@ -326,7 +326,6 @@ class GeminiEmbeddingAdapter:
         # is the owner's message as typed, screened by nothing before this.
         reject_secrets(text)
         encoded = encode_embedding_text(text, kind="query")
-        deadline = time.monotonic() + validate_timeout_seconds(remaining_seconds)
         return self._embed(encoded, remaining_seconds=remaining_seconds, transport=self._query_transport)
 
     def embed_queries(self, texts: Sequence[str], *, remaining_seconds: float) -> tuple[tuple[float, ...], ...]:
@@ -342,8 +341,8 @@ class GeminiEmbeddingAdapter:
             self._request_body(encoded),
             deadline,
             self._query_transport,
-                partial(_embedding_vectors, dialect=self._dialect, dimensions=self._dimensions, count=len(encoded)),
-            )
+            partial(_embedding_vectors, dialect=self._dialect, dimensions=self._dimensions, count=len(encoded)),
+        )
 
     def close(self):
         """Release only transports created by this adapter, not injected ports."""
