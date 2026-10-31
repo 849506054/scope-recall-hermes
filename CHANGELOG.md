@@ -2,6 +2,29 @@
 
 A line or two per release.  Each release's full notes are on its GitHub release page (tag ``v<version>``).
 
+## [3.17.0.1] - 2026-10-31
+
+Follows upstream v3.17.0 and absorbs the patch release held back at v3.16.1; both arrive in one merge, and the schema stays 1112.
+
+Capture now masks a detected credential instead of refusing the whole message: the value becomes `[REDACTED_SECRET]` while the label and the surrounding text are kept, and a receipt, a hook diagnostic or the remote server's hook log reports how many values it masked. The Hermes adapter carries that count through a retried capture and re-splits a held capture into its segments on replay. A credential in an identity or reference field, a private-key block and a message that would be left as the marker alone are still refused.
+
+Upstream's new vector trace names the stage a recall lost its vector search or query embedding at. It instruments the local backends (`runtime/lance_port.py`, `vector/process_store.py`); this install reads a remote Qdrant collection, so the fork's own vector-loss timeline (`_QuerySearch.timeline`, `RetrievalPipeline.last_vector_failure`) stays and keeps feeding the adapter's one-line warning.
+
+v3.16.1 retried an unfinished native import probe instead of leaving the process without vectors until it restarted; the probe guards `import lancedb`, which this install never reaches, so it changes nothing here.
+
+Kept from this fork: the query prefetch that starts the vector search beside the SQLite channels (`_QuerySearch`), the vector-loss timeline with the adapter's one-line warning, the remote maintenance commands (`snapshot-remote`, `recover-remote`, `plan-vector-migration`, `run-vector-migration`, `clear-pending-remote`), the Qdrant backend and its `proxy_url` pass-through, the consolidation route's `allow_insecure_endpoint`, and `vector.tool_output_embedding`.
+
+Retired with the merge: none; upstream absorbed no fork patch in this release.
+
+## [3.17.0] - 2026-10-31
+
+Capture masks a detected credential instead of refusing the whole message. The value after a credential label, and a key-shaped token, becomes `[REDACTED_SECRET]`; the label and the text outside the value are kept. An unquoted value is masked to the end of its line or its item in a structure; a quoted one to its closing quote, or to the end of the line when anything after the quote could extend it; a three-quote literal to its closing quotes. Capture still refuses a credential in an identity or reference field, a message that would be left as the marker alone, a private-key block and a value that may continue on the next line. Receipts, hook diagnostics and the remote server's hook log report how many values were masked (`masked_secret_count`). What counts as a credential is unchanged, and recall, model requests and corrections keep their checks.
+
+A remote `UserPromptSubmit` hook no longer makes its recall wait for the prompt's capture: once the prompt is durably queued, the server commits it on its own thread, and the hook reports a capture still being written as queued. A prompt sent again with only a later time is answered as the message already stored instead of `capture_failed (VERSION_CONFLICT)`; a different message under the same key stays queued as `capture_conflict_pending`. The Codex client's background sender no longer sends a spooled hook that its own request is still sending; this part takes effect once the machine that runs the hooks is upgraded. The server's hook log adds the capture's outcome and, for each recall, where a vector search or query embedding stopped.
+
+## [3.16.1] - 2026-10-28
+
+Outside Windows, a native import probe that times out or cannot start no longer leaves the process without vectors until it restarts. The child that rehearses `import lancedb, pyarrow` ends itself after 10 seconds, even when its host has already exited. A later call retries an attempt that did not finish after a 30-second cooldown, which doubles for each further unfinished attempt up to 30 minutes; a completed result stays cached as before. Callers share one child, and a recall or prefetch waits for it only within its remaining request budget. A probe that does not pass logs one line with its outcome (the timeout, the exit status or signal, or the start error's type and errno) and nothing the child printed; a passing probe logs nothing. Windows, where vectors run in a separate helper process, is unchanged.
 ## [3.16.0.1] - 2026-10-28
 
 Follows upstream v3.16.0. The report we filed, #327, is fixed there: `upgrade-store --backup-dir` holds the store's writer lease from the schema read through the snapshot and the migration, reads both schema markers back from the snapshot, and stops with `backup_schema_mismatch` instead of leaving a snapshot named for the old schema that holds the new one. Receipts now carry `backup_schema`, `backup_recorded_schema` and `session_index`.
