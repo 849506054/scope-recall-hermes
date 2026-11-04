@@ -47,20 +47,6 @@ def test_each_native_fault_gets_its_own_name(message, expected):
     assert vector_failure_label(RuntimeError(message)) == expected
 
 
-@pytest.mark.parametrize("message,expected", NATIVE_FAULTS)
-def test_remote_runtime_errors_keep_the_specific_native_fault(message, expected):
-    """The helper's generic exception class must not hide a known native fault."""
-    from scope_recall.vector.process_store import _remote_failure
-
-    assert vector_failure_label(_remote_failure("RuntimeError", message)) == expected
-
-
-def test_an_unknown_remote_runtime_error_invents_no_category():
-    from scope_recall.vector.process_store import _remote_failure
-
-    assert vector_failure_label(_remote_failure("RuntimeError", "unknown private detail")) == "RuntimeError"
-
-
 def test_the_faults_an_operator_must_tell_apart_are_told_apart():
     """A helper that is busy, one that is gone, and one that never started need
     three different answers; before this they had one label between them."""
@@ -125,7 +111,7 @@ def _runtime_error_messages(module_name: str) -> list[str]:
     return messages
 
 
-@pytest.mark.parametrize("module_name", ["scope_recall.vector.process_store", "scope_recall.vector.store"])
+@pytest.mark.parametrize("module_name", ["scope_recall.vector.sqlite_store", "scope_recall.vector.store"])
 def test_the_vocabulary_cannot_silently_fall_behind_the_code(module_name):
     """A new RuntimeError in the vector path that nothing here names would arrive
     as a bare class again, which is the fault this module exists to remove."""
@@ -147,36 +133,6 @@ def test_recall_uses_this_and_not_its_own_copy():
 # --- the other half: a remote failure already knows its own name --------------
 
 
-def test_a_remote_failure_keeps_the_name_the_helper_gave_it():
-    """``_lance_worker`` reports ``error_type``; the parent read it, handled two
-    classes, and dropped the rest -- so every other subprocess failure arrived as
-    the bare word RuntimeError with the diagnosis stranded in a discarded
-    message."""
-    from scope_recall.vector.process_store import _remote_failure
-
-    assert vector_failure_label(_remote_failure("ValueError", "table missing")) == "RuntimeError:ValueError"
-    assert vector_failure_label(_remote_failure("OSError", "pipe closed")) == "RuntimeError:OSError"
-
-
-@pytest.mark.parametrize("bogus", [None, 123, "", "bad type!", "A" * 80, "sk-ant-api03-AAAA!"])
-def test_a_malformed_remote_type_is_refused_rather_than_reported(bogus):
-    from scope_recall.vector.process_store import _remote_failure
-
-    assert vector_failure_label(_remote_failure(bogus, "something went wrong")) == "RuntimeError"
-
-
-def test_the_one_remote_fallback_carries_the_type():
-    """Plain and fenced responses are judged by one function: two copies would drift."""
-    import inspect
-
-    from scope_recall.vector import process_store as lance_process_store
-
-    source = inspect.getsource(lance_process_store)
-    assert source.count("raise _remote_failure(error_type, message)") == 1
-    # The bare fallback must be gone.
-    assert "raise RuntimeError(message)" not in source
-
-
 def test_a_refused_call_says_which_answer_the_provider_gave():
     """When a provider refuses every embedding call, the gap names the answer it gave,
     not only ``http_status`` -- what a malformed request would also say."""
@@ -193,19 +149,3 @@ def test_a_refused_call_says_which_answer_the_provider_gave():
     assert vector_failure_label(AuxiliaryModelError("http_status")) == "AuxiliaryModelError:http_status"
     assert vector_failure_label(AuxiliaryModelError("http_status", detail="4x9")) == "AuxiliaryModelError:http_status"
     assert vector_failure_label(AuxiliaryModelError("timeout")) == "AuxiliaryModelError:timeout"
-
-
-def test_the_qdrant_transport_fault_says_its_wire_code():
-    """A recall lost to a timeout and a recall lost to a 401 read as the same bare class
-    until the transport exception carried the vocabulary the label looks for.  On this
-    instance that label is the only place the fault survives -- the exception is caught
-    and discarded, so a bare name means the fault is unrecoverable from anywhere."""
-    from scope_recall.core.vector_failure import vector_failure_label
-    from scope_recall.vector.qdrant_http import QdrantHTTPError
-
-    assert vector_failure_label(QdrantHTTPError("timeout")) == "QdrantHTTPError:timeout"
-    assert vector_failure_label(QdrantHTTPError("worker_protocol")) == "QdrantHTTPError:worker_protocol"
-    assert vector_failure_label(QdrantHTTPError("http_status", 401)) == "QdrantHTTPError:http_status:401"
-    # A code outside the wire vocabulary is normalized at construction, so the gap names
-    # one of the closed set rather than the text a caller passed in.
-    assert vector_failure_label(QdrantHTTPError("something_else")) == "QdrantHTTPError:worker_protocol"

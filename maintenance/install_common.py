@@ -24,6 +24,8 @@ from typing import Any, Literal
 
 import yaml
 from scope_recall._version import __version__
+from scope_recall._version import manifest_version as _manifest_version
+from scope_recall.adapters.installation_receipt import RECEIPT_FILENAME as RECEIPT_FILENAME
 
 from .backup import first_link
 
@@ -52,7 +54,7 @@ SKILLS: dict[str, Path] = {
 }
 PACKAGE_VERSION = __version__
 HostChoice = Literal["hermes", "codex", "claude-code", "workbuddy", "dsh"]
-RECEIPT_FILENAME = ".scope-recall-install-receipt.json"
+
 BACKUP_DIRNAME = ".scope-recall-backups"
 #: What a store's runtime-config.json may weigh, for the shared commands that write it and the doctor that
 #: reads it.  The shared worker's lists every scope of the store twice (its binding and its allowed scopes),
@@ -125,8 +127,10 @@ class InstallPlan:
     changes: list[PlannedChange] = field(default_factory=list)
     conflicts: list[str] = field(default_factory=list)
     reuse_instance: bool = False
-    #: Skill files an agent edited whose packaged copy has not changed, left as they are: each with the digest the
-    #: receipt keeps for it, the package's (``install.plan_install``).
+    #: Read-only planning may describe a shared attachment that setup has not written yet.
+    pending_attachment: bool = False
+    #: Matching artifacts and edited skills whose packaged copy is unchanged, each kept with the package digest
+    #: recorded by the receipt so a later install can distinguish edits from package changes.
     kept: dict[str, str] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -186,10 +190,6 @@ class UninstallPlan:
     purge_paths: list[str] = field(default_factory=list)
     retained_backups: list[str] = field(default_factory=list)
     conflicts: list[str] = field(default_factory=list)
-    #: The remote collection this instance writes to, when its configuration
-    #: names one.  Uninstall removes local files; server-side data is named so
-    #: it is not silently left behind.
-    remote_vector: dict[str, Any] | None = None
     #: The host's own files this entry's entries are taken out of, everything else in them kept (WorkBuddy's).
     unmerged_files: list[str] = field(default_factory=list)
 
@@ -205,7 +205,6 @@ class UninstallPlan:
             "purge_paths": list(self.purge_paths),
             "retained_backups": list(self.retained_backups),
             "conflicts": list(self.conflicts),
-            "remote_vector": self.remote_vector,
             "unmerged_files": list(self.unmerged_files),
         }
 
@@ -379,13 +378,17 @@ def validate_host(host: str) -> HostChoice:
 
 def manifest_version(version: str = PACKAGE_VERSION) -> str:
     """Semver spelling of the PEP 440 package version for host plugin manifests."""
-    if ".dev" in version:
-        return version.replace(".dev", "-dev.", 1)
-    # Unanchored on purpose: with a trailing ``$`` a post-release suffix
-    # (``X.Y.ZrcN.postM``) would stop the match and reach a plugin manifest
-    # verbatim.  The X.Y.Z prefix keeps the pattern specific enough.
-    return re.sub(r"(\d+\.\d+\.\d+)rc(\d+)", r"\1-rc.\2", version)
+    return _manifest_version(version)
 
 
 def json_dump(payload: dict[str, Any]) -> str:
     return json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2) + "\n"
+
+
+def validate_write_path(path: Path) -> None:
+    """Refuse non-files and blocking parent types before an installer mutates any binding."""
+    reject_symlink_chain(path)
+    if path.exists() and not path.is_file():
+        raise InstallError(f"planned file is not a regular file: {path}")
+    if any(parent.exists() and not parent.is_dir() for parent in path.parents):
+        raise InstallError(f"planned file has a non-directory parent: {path}")

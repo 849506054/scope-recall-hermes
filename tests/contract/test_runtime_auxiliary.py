@@ -1963,3 +1963,37 @@ def test_embedding_route_rejects_a_proxy_the_helper_cannot_use(tmp_path, proxy_u
                 "proxy_url": proxy_url,
             },
         )
+
+
+@pytest.mark.parametrize("route", ["embedding", "disabled", "close_error"])
+def test_runtime_close_releases_its_ledger_while_still_referenced(tmp_path, monkeypatch, route):
+    config, path, policy = _runtime_config(tmp_path)
+    if route == "disabled":
+        config = replace(config, external_embedding=False, external_consolidation=False)
+    ledgers = []
+    original = AuxiliaryBudgetLedger.__init__
+
+    def track(self, *args, **kwargs):
+        original(self, *args, **kwargs)
+        ledgers.append(self)
+
+    monkeypatch.setattr(AuxiliaryBudgetLedger, "__init__", track)
+    runtime = build_auxiliary_runtime(config, transport=FakeTransport(lambda **kwargs: (200, b"{}")))
+    ledger = ledgers[0]
+    ledger.reserve(next(iter(policy.approved_models)), b"TEST", reserved_input=0, reserved_output=0)
+    connection = ledger._connection
+    try:
+        if route == "close_error":
+
+            def refuse():
+                raise OSError("TEST transport close")
+
+            monkeypatch.setattr(runtime.query_embedding, "close", refuse)
+            with pytest.raises(OSError, match="TEST transport close"):
+                runtime.close()
+        else:
+            runtime.close()
+        with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+            connection.execute("SELECT 1")
+    finally:
+        ledger.close()

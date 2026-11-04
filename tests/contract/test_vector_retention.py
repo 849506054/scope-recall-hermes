@@ -118,7 +118,7 @@ def test_a_refused_gated_delete_leaves_the_ledger_and_the_vectors_untouched(app,
 
         def delete_by_ids(self, ids):
             self.calls.append(list(ids))
-            raise ContractError("STORAGE_UNAVAILABLE", "qdrant_mutation_uncertain")
+            raise ContractError("STORAGE_UNAVAILABLE", "TEST mutation uncertain")
 
     store = RefusingStore()
     receipt = _pass(core, ctx, store, tmp_path)

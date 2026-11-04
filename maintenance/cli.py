@@ -5,31 +5,32 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import sqlite3
 import sys
 import time
 from collections.abc import Callable
 from contextlib import closing
-from datetime import UTC
 from pathlib import Path
 from typing import Any
 
-from scope_recall.core.failure_retry import TERMINAL_FAILURES
+from scope_recall.contracts import ContractError
+from scope_recall.core.failure_policy import TERMINAL_FAILURES
 from scope_recall.core.schema import (
     SCHEMA_VERSION,
     STATEMENTS,
     UPGRADE_CHAIN,
     source_session_index_present,
-    stale_header_schema,
 )
 from scope_recall.core.storage import SQLiteStorage
+from scope_recall.core.store_upgrade import read_upgrade_state
 from scope_recall.core.truth_connection import connect_truth_database
 from scope_recall.core.writer_lease import TruthWriterBusyError, TruthWriterLease
 
-from .backup import BackupError, backup_sqlite
+from .backup import BackupError, sqlite_busy
 from .doctor import run_doctor
 from .doctor_store import read_journal_mode, recorded_schema_under_stale_header, schema_on_disk
 from .install import InstallError, apply_install, apply_uninstall, plan_install, plan_uninstall
-from .install_common import HostChoice, absolute
+from .install_common import absolute
 from .install_dsh import default_home as dsh_home
 from .install_hermes import LOCAL_PLATFORM_CHOICES
 from .install_workbuddy import default_home
@@ -56,6 +57,12 @@ def _interpreter(value: str | None, field: str) -> Path | None:
 # Sub-commands with their own parser: the first token routes to them before the
 # maintenance parser runs, and the stubs registered below only make ``--help``
 # list them.  Their modules load on demand to keep the common commands quick.
+def _setup(argv: list[str]) -> int:
+    from .setup import main
+
+    return main(argv[1:])
+
+
 def _upgrade_cli(argv: list[str]) -> int:
     from .upgrade_cli import main
 
@@ -116,14 +123,21 @@ def _ui(argv: list[str]) -> int:
     return main(argv[1:])
 
 
+def _replay_sessions(argv: list[str]) -> int:
+    from .replay_sessions import main
+
+    return main(argv[1:])
+
+
 _DELEGATED: dict[str, tuple[str, Callable[[list[str]], int]]] = {
+    "replay-sessions": ("preview or recover missed host session records", _replay_sessions),
     "ui": ("open the local owner's memory management page", _ui),
     "memory": ("browse, correct, mute or forget memories as the local store owner", _memory),
     "private": (
         "turn private full or read-only capture and recall on or off for a session, project or the whole store",
         _private,
     ),
-    "setup": ("agent-operated fresh install/update/migration routing", _upgrade_cli),
+    "setup": ("discover, plan, confirm and configure local memory", _setup),
     "migrate": ("prepare, resume, verify and index a legacy migration job", _upgrade_cli),
     "package-upgrade": ("offline wheel replacement after stopping all target writers", _package_upgrade),
     "autostart": (
@@ -290,16 +304,22 @@ def _add_retry_arguments(parser: argparse.ArgumentParser) -> None:
 
 
 def _retry_failures(args: argparse.Namespace) -> int:
-    return _run_core(
-        args,
-        lambda core, config: core.operations.retry_failed_work(
+    def retry(core, config):
+        from ..adapters.clients.ledger import retry_given_up
+
+        receipt = core.operations.retry_failed_work(
             config.context(),
             limit=args.limit,
             include_terminal=args.include_terminal,
             dry_run=not args.apply,
             remaining_seconds=config.request_seconds,
-        ),
-    )
+        )
+        receipt["transcript_replay"] = retry_given_up(
+            config.binding, limit=args.limit, dry_run=not args.apply, include_terminal=args.include_terminal
+        )
+        return receipt
+
+    return _run_core(args, retry)
 
 
 def _add_respace_arguments(parser: argparse.ArgumentParser) -> None:
@@ -328,231 +348,6 @@ def _respace_embeddings(args: argparse.Namespace) -> int:
             remaining_seconds=config.request_seconds,
         ),
     )
-
-
-#: One bounded budget for a maintenance command's remote work. A snapshot of a
-#: large collection is not instantaneous, and the command is not a request path.
-_REMOTE_SECONDS = 30.0
-
-
-def _remote_store(host: HostChoice, instance_root: Path):
-    """The instance's configured remote companion, built but never opened."""
-    from scope_recall.runtime.instance import RuntimeInstanceConfig, default_vector_factory
-
-    from .doctor import load_binding
-
-    binding, data_directory = load_binding(host, instance_root)
-    raw = json.loads((data_directory / "runtime-config.json").read_text(encoding="utf-8"))
-    config = RuntimeInstanceConfig.from_mapping(raw)
-    if config.vector is None or config.vector.qdrant is None:
-        raise BackupError("this instance has no remote vector backend configured")
-    return default_vector_factory(config.vector, binding=binding, embedding_space=config.embedding_space_id())
-
-
-def _add_snapshot_remote_arguments(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--host", required=True, choices=("hermes", "codex"))
-    parser.add_argument("--instance-root", required=True)
-    parser.add_argument("--output", help="write the snapshot manifest beside the backup")
-
-
-def _snapshot_remote(args: argparse.Namespace) -> int:
-    store = _remote_store(args.host, _path(args.instance_root, "instance_root"))
-    facts = store.describe(remaining_seconds=_REMOTE_SECONDS)
-    if facts.get("status") != "ok":
-        _emit({"status": facts.get("status"), "detail": facts.get("detail"), "collection": facts.get("collection")})
-        return 1
-    result = {
-        "status": "ok",
-        "url": store.config.url,
-        "points_count": facts.get("points_count"),
-        **store.create_snapshot(remaining_seconds=_REMOTE_SECONDS),
-    }
-    if args.output:
-        output = _path(args.output, "output")
-        output.write_text(json.dumps(result, ensure_ascii=False, sort_keys=True, indent=2) + "\n", encoding="utf-8")
-    _emit(result)
-    return 0
-
-
-def _add_recover_remote_arguments(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--host", required=True, choices=("hermes", "codex"))
-    parser.add_argument("--instance-root", required=True)
-    parser.add_argument("--snapshot", required=True)
-    parser.add_argument(
-        "--apply", action="store_true", help="replace the collection; without it only the plan is reported"
-    )
-
-
-def _recover_remote(args: argparse.Namespace) -> int:
-    from ..contracts import ContractError
-    from ..vector.qdrant_http import QdrantHTTPError
-
-    store = _remote_store(args.host, _path(args.instance_root, "instance_root"))
-    plan = store.plan_recovery(args.snapshot, remaining_seconds=_REMOTE_SECONDS)
-    if plan["status"] != "ok" or not args.apply:
-        _emit(plan)
-        return 0 if plan["status"] == "ok" else 1
-    try:
-        _emit(store.recover_snapshot(args.snapshot, remaining_seconds=_REMOTE_SECONDS))
-    except (QdrantHTTPError, ContractError) as error:
-        # An unacknowledged replacement stays pending: say so, and let the
-        # operator decide when the server was quiet enough to clear it.
-        _emit(
-            {
-                "status": "unsettled",
-                "snapshot": args.snapshot,
-                "detail": getattr(error, "code", type(error).__name__),
-                "pending": store.mutation_gate.status(),
-            }
-        )
-        return 1
-    return 0
-
-
-def _add_vector_migration_arguments(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--host", required=True, choices=("hermes", "codex"))
-    parser.add_argument("--instance-root", required=True)
-    parser.add_argument("--qdrant-url", required=True)
-    parser.add_argument("--qdrant-api-key-env", default="SCOPE_RECALL_QDRANT_API_KEY")
-    parser.add_argument("--qdrant-collection-prefix", default="scope-recall")
-    parser.add_argument("--state", help="progress file; defaults beside the companion")
-    parser.add_argument("--batch-size", type=int)
-    parser.add_argument("--seconds", type=float)
-
-
-def _migration_stores(args: argparse.Namespace):
-    """The instance's companion and the collection the same identity derives."""
-    from dataclasses import replace
-
-    from scope_recall.runtime.instance import RuntimeInstanceConfig, default_vector_factory
-
-    from ..vector.qdrant_config import QdrantConfig
-    from .doctor import load_binding
-
-    binding, data_directory = load_binding(args.host, _path(args.instance_root, "instance_root"))
-    raw = json.loads((data_directory / "runtime-config.json").read_text(encoding="utf-8"))
-    config = RuntimeInstanceConfig.from_mapping(raw)
-    if config.vector is None:
-        raise BackupError("this instance has no vector companion configured")
-    source = default_vector_factory(config.vector, binding=binding, embedding_space=config.embedding_space_id())
-    qdrant = QdrantConfig(
-        args.qdrant_url,
-        api_key_env=args.qdrant_api_key_env,
-        collection_prefix=args.qdrant_collection_prefix,
-        timeout_seconds=45.0,
-    )  # a copy is a maintenance call, not a recall
-    target_vector = replace(config.vector, backend="qdrant", qdrant=qdrant)
-    target = default_vector_factory(target_vector, binding=binding, embedding_space=config.embedding_space_id())
-    return source, target, data_directory
-
-
-def _plan_vector_migration(args: argparse.Namespace) -> int:
-    from ..vector import VectorStoreCompatibilityError
-    from . import vector_migration
-
-    source, target, _ = _migration_stores(args)
-    source.open_existing()
-    try:
-        target.open_existing()
-    except VectorStoreCompatibilityError:
-        _emit(
-            {
-                "source": getattr(source, "backend", "?"),
-                "target": "qdrant",
-                "status": "target_missing",
-                "detail": "collection_absent",
-            }
-        )
-        return 1
-    _emit(vector_migration.plan(source, target))
-    return 0
-
-
-def _run_vector_migration(args: argparse.Namespace) -> int:
-    from . import vector_migration
-
-    source, target, data_directory = _migration_stores(args)
-    source.open_existing()
-    target.open()  # the copy's destination: created here, inside the gate
-    options: dict[str, Any] = {
-        "state_path": _optional_path(args.state, "state") or data_directory / "vector-migration-state.json"
-    }
-    if args.batch_size is not None:
-        options["batch_size"] = args.batch_size
-    if args.seconds is not None:
-        options["seconds"] = args.seconds
-    receipt = vector_migration.run(source, target, **options)
-    receipt["verify"] = vector_migration.verify(source, target)
-    _emit(receipt)
-    return 0 if receipt["verify"]["ok"] else 1
-
-
-def _add_clear_pending_arguments(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--host", required=True, choices=("hermes", "codex"))
-    parser.add_argument("--instance-root", required=True)
-    parser.add_argument("--qdrant-url", required=True)
-    parser.add_argument("--qdrant-api-key-env", default="SCOPE_RECALL_QDRANT_API_KEY")
-    parser.add_argument("--qdrant-collection-prefix", default="scope-recall")
-    parser.add_argument(
-        "--confirm", required=True, help="the pending collection's name, exactly as the status reports it"
-    )
-    parser.add_argument(
-        "--after-recopied",
-        action="store_true",
-        help="state that the interrupted work was redone; required when the collection holds points",
-    )
-    parser.add_argument("--seconds", type=float, default=45.0)
-
-
-def _clear_pending_remote(args: argparse.Namespace) -> int:
-    """Clear one pending remote mutation, on a boundary the caller has read back.
-
-    The gate is fail-closed on purpose: an unconfirmed write blocks later
-    mutations and purge confirmation.  Only the server decides.  An absent or
-    empty collection cannot hold the interrupted write, so the marker is stale
-    and may go; a collection that holds points could equally have taken it, so
-    the caller has to declare that the work was redone.
-    """
-    import time
-
-    from ..vector import VectorStoreCompatibilityError
-
-    source, target, _ = _migration_stores(args)
-    del source
-    gate = target.mutation_gate
-    marker = gate.status()
-    if marker is None:
-        _emit({"backend": getattr(target, "backend", "?"), "status": "nothing_to_clear"})
-        return 0
-    pending = {
-        "collection": marker["collection"],
-        "operation": marker["operation"],
-        "operation_id": marker["operation_id"],
-    }
-    if args.confirm != marker["collection"]:
-        _emit({"pending": pending, "reason": "confirm_does_not_name_the_pending_collection", "status": "refused"})
-        return 1
-    points = None
-    try:
-        target.open_existing()
-        points = target.count_rows()
-    except VectorStoreCompatibilityError:
-        points = None  # absent: nothing can have landed
-    if points and not args.after_recopied:
-        _emit(
-            {
-                "pending": pending,
-                "points_count": points,
-                "reason": "collection_holds_points_and_the_work_was_not_declared_redone",
-                "status": "refused",
-            }
-        )
-        return 1
-    gate.release(marker, deadline=time.monotonic() + float(args.seconds))
-    _emit(
-        {"after_recopied": bool(args.after_recopied), "pending": pending, "points_count": points, "status": "cleared"}
-    )
-    return 0
 
 
 def _add_install_arguments(parser: argparse.ArgumentParser) -> None:
@@ -652,6 +447,8 @@ def _add_doctor_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--host", required=True, choices=("hermes", "codex", "claude-code", "workbuddy", "dsh"))
     parser.add_argument("--instance-root", required=True)
     parser.add_argument("--python")
+    parser.add_argument("--recall-request-id")
+    parser.add_argument("--project-root")
 
 
 def _doctor(args: argparse.Namespace) -> int:
@@ -659,24 +456,11 @@ def _doctor(args: argparse.Namespace) -> int:
         host=args.host,
         instance_root=_path(args.instance_root, "instance_root"),
         python_executable=_interpreter(args.python, "python"),
+        recall_request_id=getattr(args, "recall_request_id", None),
+        project_root=_optional_path(args.project_root, "project_root"),
     )
     _emit(report.to_dict())
     return 0 if report.status == "ok" else 1
-
-
-def _restamp_header(database: Path, recorded: int, *, timeout: float) -> bool:
-    """Write ``recorded`` into the header if, inside the write transaction, it is still what the store records."""
-    from contextlib import closing
-
-    # mode=rw: a store that disappeared meanwhile is an error, never a new empty file.
-    with closing(connect_truth_database(database, mode="rw", timeout=timeout, isolation_level=None)) as db:
-        db.execute("BEGIN IMMEDIATE")
-        if stale_header_schema(db) != recorded:
-            db.execute("ROLLBACK")
-            return False
-        db.execute(f"PRAGMA user_version={int(recorded)}")
-        db.execute("COMMIT")
-    return True
 
 
 def _tables_not_in_schema(database: Path) -> dict[str, int]:
@@ -708,7 +492,7 @@ def _tables_not_in_schema(database: Path) -> dict[str, int]:
 def _add_upgrade_store_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--host", required=True, choices=("hermes", "codex"))
     parser.add_argument("--instance-root", required=True)
-    parser.add_argument("--backup-dir", help="take a verified snapshot of memory.sqlite3 here before touching it")
+    parser.add_argument("--backup-dir", help="snapshot directory; defaults to upgrade-snapshots beside the store")
     parser.add_argument(
         "--wait-seconds",
         type=float,
@@ -742,19 +526,6 @@ def _wait_for_upgrade_lease(data_directory: Path, wait: float) -> TruthWriterLea
         slept += pause
 
 
-def _snapshot_schemas(snapshot: Path) -> tuple[int | None, int | None]:
-    """Read both schema markers from the copy without initializing or changing it."""
-    import sqlite3
-
-    try:
-        with closing(sqlite3.connect(f"{snapshot.as_uri()}?mode=ro", uri=True)) as db:
-            header = int(db.execute("PRAGMA user_version").fetchone()[0])
-            row = db.execute("SELECT schema_version FROM instance_meta WHERE singleton=1").fetchone()
-            return header, int(row[0]) if row else None
-    except (sqlite3.Error, ValueError, TypeError):
-        return None, None
-
-
 def _supply_session_index(binding, database: Path, wait: float) -> str:
     """Supply a missing lookup index under the caller's writer lease and report its state."""
     with closing(connect_truth_database(database, mode="ro", timeout=wait)) as conn:
@@ -764,10 +535,9 @@ def _supply_session_index(binding, database: Path, wait: float) -> str:
     return "present" if present else "added"
 
 
-def _upgrade_held_store(args, binding, database: Path, wait: float, result: dict[str, Any]) -> int:
+def _upgrade_held_store(args, binding, database: Path, result: dict[str, Any]) -> int:
     """Snapshot and migrate while the caller holds the canonical writer lease."""
-    from datetime import datetime
-
+    wait = _upgrade_wait_seconds(float(args.wait_seconds))
     before = schema_on_disk(database)
     recorded = recorded_schema_under_stale_header(database)
     result.update(schema_before=before, schema_target=SCHEMA_VERSION)
@@ -781,51 +551,22 @@ def _upgrade_held_store(args, binding, database: Path, wait: float, result: dict
     if recorded is None and before not in UPGRADE_CHAIN:
         result.update(status="unsupported", error="schema_not_in_upgrade_chain")
         return 2
-    if not args.backup_dir:
-        result.update(
-            status="not_upgraded",
-            error="backup_required",
-            hint="provide --backup-dir for the verified pre-upgrade snapshot",
+    with closing(connect_truth_database(database, mode="ro", timeout=wait)) as conn:
+        index_present = source_session_index_present(conn)
+    try:
+        status = SQLiteStorage(binding, timeout_seconds=wait).initialize(
+            unbounded_upgrade=True,
+            backup_dir=_optional_path(args.backup_dir, "backup_dir"),
+            repair_header=True,
+            receipt=result,
         )
-        return 2
-    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
-    snapshot = _path(args.backup_dir, "backup_dir") / f"memory-{before}-{stamp}.sqlite3"
-    backup_sqlite(database, snapshot, manifest=snapshot.with_suffix(".json"))
-    header, metadata = _snapshot_schemas(snapshot)
-    result.update(backup=str(snapshot), backup_schema=header, backup_recorded_schema=metadata)
-    # A header repair preserves the original unequal markers in its rollback copy.
-    # Ordinary migrations require both markers to name the pre-upgrade schema.
-    if (header, metadata) != (before, recorded if recorded is not None else before):
-        result.update(status="not_upgraded", error="backup_schema_mismatch")
-        return 2
-    if recorded is not None:
-        if not _restamp_header(database, recorded, timeout=wait):
-            result.update(
-                status="not_upgraded",
-                error="store_changed",
-                hint="the header or the recorded schema changed while this ran; run again",
-            )
-            return 2
-        result["header_restamped"] = {
-            "from": before,
-            "to": recorded,
-            "cause": "a 2.0 process opened this store after its migration; make sure none runs",
-        }
-        if recorded == SCHEMA_VERSION:
-            result.update(
-                status="restamped",
-                schema_after=SCHEMA_VERSION,
-                session_index=_supply_session_index(binding, database, wait),
-                journal_mode=read_journal_mode(database),
-            )
-            _report_other_tables(result, database)
-            return 0
-    started = time.monotonic()
-    status = SQLiteStorage(binding, timeout_seconds=wait).initialize()
+    except (ContractError, BackupError, OSError, sqlite3.Error):
+        result.update(read_upgrade_state(database.parent))
+        raise
     result.update(
-        status="upgraded",
+        status="restamped" if recorded == SCHEMA_VERSION else "upgraded",
         schema_after=status.schema_version,
-        seconds=round(time.monotonic() - started, 1),
+        session_index="present" if index_present else "added",
         journal_mode=read_journal_mode(database),
     )
     if recorded is not None:
@@ -853,10 +594,10 @@ def _upgrade_store(args: argparse.Namespace) -> int:
     try:
         lease = _wait_for_upgrade_lease(data_directory, wait)
         try:
-            code = _upgrade_held_store(args, binding, database, wait, result)
+            code = _upgrade_held_store(args, binding, database, result)
         finally:
             lease.release()
-    except (TruthWriterBusyError, sqlite3.OperationalError) as exc:
+    except TruthWriterBusyError as exc:
         result.update(
             status="not_upgraded",
             error="store_busy",
@@ -864,8 +605,24 @@ def _upgrade_store(args: argparse.Namespace) -> int:
             hint="stop the worker (autostart pause) and run again",
         )
         code = 2
+    except sqlite3.Error as exc:
+        busy = result.get("reason") == "upgrade_blocked_by_reader" or (
+            isinstance(exc, sqlite3.OperationalError) and sqlite_busy(exc)
+        )
+        result.update(
+            status="not_upgraded",
+            error="store_busy" if busy else getattr(exc, "sqlite_errorname", type(exc).__name__),
+            detail=type(exc).__name__,
+            hint="close active store read transactions and stop other store writers, then retry upgrade-store"
+            if busy
+            else "resolve the storage error and retry",
+        )
+        code = 2
     except ContractError as exc:
-        result.update(status="not_upgraded", error=exc.code, detail=exc.field)
+        result.update(status="not_upgraded", error=exc.field or exc.code, detail=exc.field)
+        code = 2
+    except (BackupError, OSError) as exc:
+        result.update(status="not_upgraded", error="snapshot_or_upgrade_io", detail=type(exc).__name__)
         code = 2
     _emit(result)
     return code
@@ -960,36 +717,6 @@ _COMMANDS: tuple[
         "re-embed what was embedded so far into a new embedding space, a worker page at a time",
         _add_respace_arguments,
         _respace_embeddings,
-    ),
-    (
-        "snapshot-remote",
-        "take one server-side Qdrant snapshot inside the write boundary",
-        _add_snapshot_remote_arguments,
-        _snapshot_remote,
-    ),
-    (
-        "recover-remote",
-        "inspect recovery from a Qdrant snapshot; --apply replaces the collection",
-        _add_recover_remote_arguments,
-        _recover_remote,
-    ),
-    (
-        "plan-vector-migration",
-        "report what a companion copy would move into another backend",
-        _add_vector_migration_arguments,
-        _plan_vector_migration,
-    ),
-    (
-        "run-vector-migration",
-        "copy companion rows into another backend, resuming from the recorded id, then verify",
-        _add_vector_migration_arguments,
-        _run_vector_migration,
-    ),
-    (
-        "clear-pending-remote",
-        "clear one pending remote mutation after a maintenance read-back",
-        _add_clear_pending_arguments,
-        _clear_pending_remote,
     ),
     ("plan-install", None, _add_install_arguments, _plan_install),
     ("apply-install", None, _add_install_arguments, _apply_install),

@@ -64,44 +64,29 @@ def _write_config(path: Path, payload: dict) -> Path:
     return path
 
 
-@pytest.mark.skipif(os.name != "nt", reason="Windows native path boundary")
-def test_worker_reports_native_path_gap_without_starting_helper(tmp_path, monkeypatch):
+def test_worker_long_table_name_does_not_expand_the_physical_vector_path(tmp_path):
     from io import StringIO
 
-    import scope_recall.vector.process_store as native_store
     from scope_recall.core.recall_policy import SPACE_ID
     from scope_recall.runtime.worker_entry import run_worker
 
     binding = _binding(tmp_path / "data")
-    binding.data_directory.mkdir()
+    MemoryCore(CoreConfig(binding)).initialize()
     vector_root = binding.data_directory / "vectors" / SPACE_ID
     payload = _config_payload(
         binding,
         vector={
-            "backend": "lancedb",
+            "backend": "sqlite-vec",
             "storage_dir": str(vector_root),
             "table_name": "TEST-" + "x" * 150,
             "dimensions": 3072,
         },
     )
     config = _write_config(tmp_path / "worker.json", payload)
-    calls = []
-
-    def unexpected_helper():
-        calls.append("helper")
-        raise AssertionError("unsafe path must be rejected before helper startup")
-
-    monkeypatch.setattr(native_store, "_worker_command", unexpected_helper)
     output = StringIO()
-    assert run_worker(config, output=output) == 1
-    receipt = json.loads(output.getvalue())
-    assert receipt["status"] == "degraded"
-    assert receipt["processed"] == 0
-    assert receipt["capability_gaps"] == ["native_vector_path_too_long"]
-    assert str(vector_root) not in output.getvalue()
-    assert calls == []
-    assert not vector_root.exists()
-    assert not (binding.data_directory / "memory.sqlite3").exists()
+    assert run_worker(config, output=output) == 0, output.getvalue()
+    assert (vector_root / "vectors.sqlite3").is_file()
+    assert "native_vector_path_too_long" not in output.getvalue()
 
 
 def _run_child(tmp_path: Path, monkeypatch, payload: dict):
@@ -164,7 +149,7 @@ def test_runtime_construction_is_pure_and_vector_opens_only_on_demand(tmp_path):
     instance.close()
 
 
-def test_existing_store_is_composed_with_trusted_lance_ports_on_demand(tmp_path):
+def test_existing_store_is_composed_with_trusted_vector_ports_on_demand(tmp_path):
     binding = _binding(tmp_path / "data")
     config = RuntimeInstanceConfig(
         binding=binding,
@@ -214,10 +199,10 @@ def test_existing_store_is_composed_with_trusted_lance_ports_on_demand(tmp_path)
     assert store.opened is False
     instance._ensure_vector_port()
     assert store.opened is True
-    assert type(instance._vector_port).__name__ == "LanceVectorPort"
+    assert type(instance._vector_port).__name__ == "VectorPort"
     assert type(instance.core.vectors).__name__ == "_LazyVectorPort"
-    assert type(instance._default_embed).__name__ == "LanceEmbedPort"
-    assert type(instance._default_purge).__name__ == "LancePurgePort"
+    assert type(instance._default_embed).__name__ == "VectorEmbedPort"
+    assert type(instance._default_purge).__name__ == "VectorPurgePort"
     instance.close()
     assert store.closed is True
 
@@ -283,18 +268,15 @@ def test_lazy_vector_facade_opens_existing_store_for_each_core_search_context(tm
     assert store.opened is True, result
     assert store.open_deadline is not None
     assert store.open_deadline <= context.deadline
-    # The facade starts this context's search with the recall (3.4.8.2), so a search the test
-    # already made by hand is a second one for the same query -- nothing is reused, because a
-    # result from another session's partition may not stand in for this one.  What must hold is
-    # that the recall's own search ran for this context's scope, not the construction session's.
-    assert store.search_calls and store.search_calls[-1][1]
+    assert len(store.search_calls) == 1
+    # The facade does not substitute the instance construction session for
+    # the request-bound physical partition; the search ran for this context.
+    assert store.search_calls[0][1]
     instance.close()
 
 
 def test_a_store_open_that_uses_up_the_recall_s_time_is_a_gap_not_an_empty_search(tmp_path):
-    """A helper still opening the table keeps its answer for the next request.  The search then returned nothing
-    and the recall reported no gap: a Claude Code or Codex hook, which never makes a next request, lost its vector
-    search without a trace."""
+    """An open that consumes the request budget reports the missing semantic stage."""
     binding = _binding(tmp_path / "data")
     config = RuntimeInstanceConfig(
         binding=binding,
@@ -699,7 +681,7 @@ def test_a_query_embedding_that_fails_while_the_table_opens_leaves_the_table_ope
 def test_a_vector_search_left_no_time_is_a_gap_not_an_empty_answer(tmp_path, prepared):
     """With the embedding back and no time left for the search, the port answered nothing and said nothing: the
     recall looked as if it had searched by meaning and found nothing."""
-    from scope_recall.runtime.lance_port import LanceVectorPort
+    from scope_recall.runtime.vector_port import VectorPort
 
     class Embedding:
         def embed_query(self, text, *, remaining_seconds):
@@ -707,7 +689,7 @@ def test_a_vector_search_left_no_time_is_a_gap_not_an_empty_answer(tmp_path, pre
 
     store = _ScopedStore()
     clock = iter([0.0] + [10.0] * 5)  # the search starts at 0 and finds its 5 s gone
-    port = LanceVectorPort(store, Embedding(), clock=lambda: next(clock))
+    port = VectorPort(store, Embedding(), clock=lambda: next(clock))
     binding = _binding(tmp_path / "data")
     context = SearchContext(
         query="TEST query",
@@ -755,82 +737,10 @@ def test_an_embedding_back_with_no_time_left_to_search_is_a_gap(tmp_path):
         instance.close()
 
 
-def test_a_cold_embedding_does_not_spend_the_searchs_share(tmp_path):
-    """The search's share is measured from the moment the embedding lands, not from the recall's start.
-
-    A cold provider connection spends the share before the search can use any of it: on 2026-10-01 an embedding of
-    2.43 s left the collection 0.57 s of a 3.00 s share to answer in, and its 0.57-0.68 s answer missed it -- the
-    share, not the recall's window, was the limit that failed.  Here the embedding takes 0.5 s of a 2 s window.
-    """
-    from scope_recall.core.deadline import remaining_seconds as ambient_remaining_seconds
-
-    class ColdEmbedding:
-        def embed_query(self, text, *, remaining_seconds):
-            time.sleep(0.5)
-            return (0.1, 0.2)
-
-    class RecordingStore(_ScopedStore):
-        def __init__(self):
-            super().__init__()
-            self.budgets = []
-
-        def search_scopes(self, vector, *, scope_ids, limit):
-            self.budgets.append(ambient_remaining_seconds(time.monotonic()))
-            return super().search_scopes(vector, scope_ids=scope_ids, limit=limit)
-
-    store = RecordingStore()
-    instance, binding = _vector_instance(tmp_path, store, ColdEmbedding())
-    try:
-        result = instance.core.recall_pipeline.search(_search_context(binding, 2.0))
-        assert not [gap for gap in result.gaps if gap.startswith("vector")], result.gaps
-        assert len(store.searches) == 1, store.searches
-        # 0.75 of the 2 s window, less the milliseconds between the embedding's arrival and the search: the 0.5 s the
-        # embedding took is not the collection's answer to pay for.
-        assert 1.35 < store.budgets[0] <= 1.55, store.budgets
-    finally:
-        instance.close()
-
-
-def test_a_prefetched_embedding_is_waited_for_until_its_own_deadline(tmp_path):
-    """The search waits for a prefetched embedding until the embedding's own deadline, not its own.
-
-    A provider that never answers must not hold the recall past the share the embedding was given: on 2026-10-02 a
-    cold embedding was cut at its 2.8 s share while the search, waiting with the recall's own 4 s deadline, kept the
-    round waiting for it.  Here the embedding's deadline is 0.2 s and the search's is 5 s.
-    """
-
-    class Embedding:
-        def embed_query(self, text, *, remaining_seconds):
-            return (0.1, 0.2)
-
-    class Never:
-        query = "TEST query"
-
-        def __init__(self):
-            self.deadline = time.monotonic() + 0.2
-
-        def result(self, deadline):
-            time.sleep(max(0.0, deadline - time.monotonic()))
-            raise TimeoutError("query embedding stage deadline exhausted")
-
-    store = _ScopedStore()
-    instance, binding = _vector_instance(tmp_path, store, Embedding())
-    port = instance.core.recall_pipeline.vector_port
-    try:
-        instance._ensure_vector_port(allow_create=False, deadline=time.monotonic() + 5.0)
-        started = time.monotonic()
-        with pytest.raises(TimeoutError, match="embedding stage deadline exhausted"):
-            port.search(_search_context(binding, 5.0), limit=1, remaining_seconds=5.0, prefetched=Never())
-        assert time.monotonic() - started < 1.0, "the embedding wait is bounded by its own stage deadline"
-        assert store.searches == []
-    finally:
-        instance.close()
-
-
 def test_warming_opens_the_store_and_searches_one_of_its_partitions(tmp_path):
     """A kept handler's first prompt opened the table and read the index inside its recall; warmed when the server
     starts, that prompt finds them ready."""
-    from scope_recall.runtime.lance_port import physical_partition_scope_id
+    from scope_recall.runtime.vector_port import physical_partition_scope_id
 
     class Embedding:
         def embed_query(self, text, *, remaining_seconds):
@@ -1006,7 +916,7 @@ def test_lazy_vector_facade_reopens_poisoned_cached_store_on_next_search(tmp_pat
     assert store.closed
 
 
-def test_default_vector_factory_selects_process_store_without_opening(tmp_path):
+def test_default_vector_factory_selects_sqlite_store_without_opening(tmp_path):
     config = VectorRuntimeConfig(
         backend="lancedb",
         storage_dir=tmp_path / "vectors",
@@ -1015,8 +925,8 @@ def test_default_vector_factory_selects_process_store_without_opening(tmp_path):
         test_injection_override=True,
     )
     store = default_vector_factory(config)
-    assert type(store).__name__ in {"ProcessLanceVectorStore", "LanceVectorStore"}
-    assert not (config.storage_dir / "lancedb").exists()
+    assert store.backend == "sqlite"
+    assert not config.storage_dir.exists()
     store.close()
 
 
@@ -1748,11 +1658,10 @@ def test_the_two_stop_loss_layers_stay_distinct():
     down decides how many of that type are tried in one pass. Neither is an
     instance-wide brake, and a backward-looking ledger window must not become
     one."""
-    from scope_recall.core.work_storage import CAPACITY_REFUSALS
-    from scope_recall.core.worker import _RATE_LIMITED_ERRORS
+    from scope_recall.core.failure_policy import CAPACITY_REFUSALS, RATE_LIMITED_ERRORS
 
-    assert CAPACITY_REFUSALS < _RATE_LIMITED_ERRORS
-    assert "http_429" in _RATE_LIMITED_ERRORS
+    assert CAPACITY_REFUSALS < RATE_LIMITED_ERRORS
+    assert "http_429" in RATE_LIMITED_ERRORS
 
 
 # --- the watcher and the operator must read the same instance ----------------
@@ -1847,54 +1756,16 @@ def test_the_split_the_worker_computed_reaches_the_file_that_is_polled():
     assert "terminal_failed_work=terminal_failed" in payload_source
 
 
-class _Embedding:
-    def embed_query(self, text, *, remaining_seconds):
-        return (0.1, 0.2)
+def test_credential_file_only_needs_variables_of_routes_that_use_credentials(tmp_path):
+    from types import SimpleNamespace
 
+    from scope_recall.runtime.worker_entry import credential_environment
 
-class _RoundTripStore(_ScopedStore):
-    """A store whose search is a round trip of ``seconds``, failed as the helper fails when its time does not cover
-    it."""
-
-    def __init__(self, seconds):
-        super().__init__()
-        self.seconds = seconds
-        self.started = []
-
-    def search_scopes(self, vector, *, scope_ids, limit):
-        from scope_recall.core.deadline import remaining_seconds
-
-        self.started.append(time.monotonic())
-        left = remaining_seconds()
-        if left is None or left < self.seconds:
-            time.sleep(max(0.0, left or 0.0))
-            raise TimeoutError("native vector helper request deadline exhausted")
-        time.sleep(self.seconds)
-        return super().search_scopes(vector, scope_ids=scope_ids, limit=limit)
-
-
-def test_a_slow_sqlite_channel_leaves_the_vector_search_its_window(tmp_path, monkeypatch):
-    """Started after the SQLite channels, the search had three quarters of what they left, and one that leaves the
-    machine came back too late: a contributor whose store is a remote collection measured a recall whose channels took
-    3.66 s of a 5 s window lose it, the collection answering in 0.21-0.62 s (#173).  Started with the recall, the search
-    runs beside them: here the word search takes 1.1 s of a 1.6 s window and the store answers in 0.45 s, which the
-    0.36 s it left would not cover."""
-    from scope_recall.core.retrieval_storage import RetrievalStorage
-
-    lexical = RetrievalStorage.lexical
-    finished = []
-
-    def slow_lexical(self, tx, context, *, limit):
-        time.sleep(1.1)
-        finished.append(time.monotonic())
-        return lexical(self, tx, context, limit=limit)
-
-    monkeypatch.setattr(RetrievalStorage, "lexical", slow_lexical)
-    store = _RoundTripStore(0.45)
-    instance, binding = _vector_instance(tmp_path, store, _Embedding())
-    try:
-        result = instance.core.recall_pipeline.search(_search_context(binding, 1.6))
-        assert not [gap for gap in result.gaps if gap.startswith(("vector", "deadline"))], result.gaps
-        assert len(store.searches) == 1 and store.started[0] < finished[0], "the search ran beside the word search"
-    finally:
-        instance.close()
+    file = tmp_path / "TEST-environment"
+    file.write_text("TEST_EMBED_ENV=synthetic\nTEST_UNRELATED=ignored\n", encoding="utf-8")
+    config = SimpleNamespace(
+        auxiliary=SimpleNamespace(
+            embedding=SimpleNamespace(credential_env="TEST_EMBED_ENV"), consolidation=SimpleNamespace(kind="codex_cli")
+        )
+    )
+    assert credential_environment(config, str(file)) == {"TEST_EMBED_ENV": "synthetic"}
