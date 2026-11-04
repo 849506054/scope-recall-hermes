@@ -518,7 +518,7 @@ def test_interpreter_probes_measure_an_environment_provided_install(tmp_path, mo
     isolated interpreter strips PYTHONPATH, which reports a healthy install as
     missing and leaves the version check permanently incomplete.
     """
-    from scope_recall.maintenance.doctor import _probe_python_package, check_host_registration
+    from scope_recall.maintenance.doctor import check_host_registration, probe_python_package
 
     served = tmp_path / "served"
     package = served / "scope_recall"
@@ -535,7 +535,7 @@ def test_interpreter_probes_measure_an_environment_provided_install(tmp_path, mo
     )
     monkeypatch.setenv("PYTHONPATH", str(served))
 
-    probe = _probe_python_package(Path(sys.executable))
+    probe = probe_python_package(Path(sys.executable))
     assert probe.get("version") == "9.9.9", probe
     assert probe.get("path", "").startswith(str(package)), probe
 

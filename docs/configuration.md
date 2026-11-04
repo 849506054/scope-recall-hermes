@@ -91,6 +91,7 @@ Credentials are environment variable references. Never put their values in a rou
 | <a id="metric"></a>`metric` | `str` | `"cosine"` |
 | <a id="test_injection_override"></a>`test_injection_override` | `bool` | `false` |
 | <a id="tool_output_retention_days"></a>`tool_output_retention_days` | `int` | `180` |
+| <a id="tool_output_embedding"></a>`tool_output_embedding` | `bool` | `true` |
 
 ## AuxiliaryRuntimeConfig
 
@@ -141,7 +142,7 @@ Credentials are environment variable references. Never put their values in a rou
 | `dimensions` | `int &#124; None` | `null` |
 | <a id="dialect"></a>`dialect` | `str &#124; None` | `null` |
 | <a id="dimensions_field"></a>`dimensions_field` | `str` | `"dimensions"` |
-| <a id="proxy_url"></a>`proxy_url` | `str` | `null` |
+| <a id="proxy_url"></a>`proxy_url` | `str &#124; None` | `null` |
 | <a id="allow_insecure_endpoint"></a>`allow_insecure_endpoint` | `bool` | `false` |
 
 ## ConsolidationRouteConfig
