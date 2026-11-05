@@ -2,6 +2,19 @@
 
 A line or two per release.  Each release's full notes are on its GitHub release page (tag ``v<version>``).
 
+## [4.0.0.3] - 2026-11-05
+
+把 3.17 里两处 fork 补丁按 4.0 的接口恢复回来——它们不是上游已覆盖的重复实现，而是这台机器上真正起作用的保护：
+
+- **会话绑定时预热查询路由**（`Prefetch.warm_query_route`，从 `SessionBinding.bind` 调用）：经代理的连接在闲置几分钟后会冷掉，冷启动一次嵌入约 2.9 s，超过召回分给嵌入的窗口，那一轮就没有向量通道；单独先要一次之后，召回自己的嵌入是 1.4 s 左右。只在距上次召回超过 60 s 时预热，fire-and-forget，自带 8 s 预算，失败不影响召回。
+- **向量通道丢失的记录**（`Prefetch._log_vector_loss` + `RetrievalPipeline.last_vector_failure` + `_QueryEmbedding.timeline`）：召回没有语义通道时记一条 warning，带上嵌入自己的时间线（窗口多长、实际多久、错误类型），所以这类丢失能被数出来，而不是只能从 gaps 里猜。
+- 检索份额那处（`QUERY_SEARCH_SHARE`）没有搬：4.0 的 `_vector_candidates` 已经把 `remaining * 0.75` 留给检索、并预留 25% 给水合，对应关系已经在上游实现里。
+
+## [4.0.0.2] - 2026-11-05
+
+- 适配器在 `initialize` 时预热查询嵌入（`warm_query_embedding`，best-effort 后台线程）。这台机器上冷启动一次要 2.9 s（助手进程启动加 TLS 握手），比召回分给嵌入的窗口还长，导致每个进程的头两轮召回丢向量通道；预热之后同一进程内的召回是 1.4 s。
+- 嵌入路由继续经代理出网：本机实测直连 Voyage 2.86 s、经代理 2.0 s。
+
 ## [4.0.0.1] - 2026-11-05
 
 Follows upstream v4.0.0, a major release whose store structure move from 1112 to 1134 makes the upgrade one way. It also ends this fork's reason to carry a vector backend of its own: 4.0 keeps vectors in SQLite, LanceDB is reached only when importing an old directory, and the `import lancedb` that faulted on an AVX2-less CPU is off the running path. The remote Qdrant companion is retired here rather than carried forward.

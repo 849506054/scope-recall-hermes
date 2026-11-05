@@ -1,6 +1,6 @@
 # scope-recall-hermes（个人 fork）
 
-本仓库是 [`410979729/scope-recall-hermes`](https://github.com/410979729/scope-recall-hermes) 的 fork，仓库名 `849506054/scope-recall-hermes`，当前版本 `4.0.0.1`，跟版基线上游 `v4.0.0`。每次发版的说明在本仓库的 [CHANGELOG.md](CHANGELOG.md) 里，每个版本对应一个 fork tag。
+本仓库是 [`410979729/scope-recall-hermes`](https://github.com/410979729/scope-recall-hermes) 的 fork，仓库名 `849506054/scope-recall-hermes`，当前版本 `4.0.0.2`，跟版基线上游 `v4.0.0`。每次发版的说明在本仓库的 [CHANGELOG.md](CHANGELOG.md) 里，每个版本对应一个 fork tag。
 
 fork 只保留上游没有、而这套部署又必须有的改动：**嵌入路由的出网代理**。远端 embedding 服务要经本机自己的代理出去，上游的传输层不认代理设置；其余一切按上游走，包括向量存储。
 

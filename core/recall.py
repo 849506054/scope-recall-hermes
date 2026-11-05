@@ -303,6 +303,10 @@ class RetrievalPipeline:
         self.storage_reader = storage_reader if storage_reader is not None else RetrievalStorage(clock=self.clock)
         if hasattr(self.storage_reader, "clock"):
             self.storage_reader.clock = self.clock
+        #: What the query embedding was doing when a recall came back without the semantic channel
+        #: (``runtime/instance.py`` ``_QueryEmbedding.timeline``); read once by the host adapter that logs the loss, so
+        #: an install that loses the channel says where the window went instead of only that it is gone.
+        self.last_vector_failure: dict | None = None
 
     def _remaining(self, context: SearchContext) -> float:
         return context.deadline - self.clock.monotonic()
@@ -399,6 +403,9 @@ class RetrievalPipeline:
             # The class alone does not say what went wrong; see core/vector_failure.py.
             gaps.append("vector_unavailable")
             gaps.append(f"vector_error:{vector_failure_label(exc)}")
+            timeline = getattr(prefetched, "timeline", None)
+            detail = timeline() if callable(timeline) else None
+            self.last_vector_failure = detail if isinstance(detail, dict) else None
             if self._remaining(context) <= 0:
                 gaps.append("deadline_exceeded_vector")
             return ()

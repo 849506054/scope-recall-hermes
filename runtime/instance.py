@@ -78,6 +78,22 @@ class _QueryEmbedding:
         self._done = threading.Event()
         self._vectors: tuple[Any, ...] = ()
         self._error: BaseException | None = None
+        #: When the route was asked and when it settled, so a recall that comes back without the channel says where
+        #: the window went instead of only that it is gone (``core/recall.py`` ``last_vector_failure``).
+        self._asked_at = self._clock()
+        self._settled_at: float | None = None
+
+    def timeline(self) -> dict[str, Any]:
+        """This embedding's own timings, for the host adapter that logs a lost vector channel."""
+        settled = self._settled_at
+        return {
+            "asked_at": round(self._asked_at, 3),
+            "deadline_at": round(self.deadline, 3),
+            "window_s": round(self.deadline - self._asked_at, 3),
+            "answered_after_s": None if settled is None else round(settled - self._asked_at, 3),
+            "settled": settled is not None,
+            "error": None if self._error is None else type(self._error).__name__,
+        }
 
     def run(self, embed: Callable[[tuple[str, ...], float], Sequence[Any]]) -> None:
         began = self._clock()
@@ -106,6 +122,7 @@ class _QueryEmbedding:
         except BaseException as exc:  # the recall that waits for it reports it
             self._error = exc
         finally:
+            self._settled_at = self._clock()
             self._done.set()
 
     def result(self, deadline: float, query: str | None = None) -> Any:

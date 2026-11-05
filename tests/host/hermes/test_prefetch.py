@@ -487,3 +487,114 @@ def test_paused_prefetch_does_not_read_host_memory(adapter, monkeypatch):
     )
     provider.on_turn_start(1, "TEST question", turn_id="TEST-paused")
     assert provider.prefetch("TEST question") == ""
+
+
+def test_a_lost_vector_channel_is_logged_with_the_embedding_timeline(adapter, initialize_kwargs, caplog):
+    """A recall that comes back without the semantic channel says so once, with the embedding's own timings beside
+    it: on an install where it happens to a minority of recalls, that line is the count."""
+    provider, _clock = adapter
+    core = provider._core
+    ctx = _bind_context(core, initialize_kwargs, session_id="TEST-session-1")
+
+    class LostPipeline:
+        storage_reader = core.recall_pipeline.storage_reader
+        last_vector_failure = {
+            "asked_at": 10.0,
+            "deadline_at": 13.0,
+            "window_s": 3.0,
+            "answered_after_s": 2.8,
+            "settled": True,
+            "error": "AuxiliaryModelError",
+        }
+
+        def search(self, search_context):
+            return RetrievalResult(
+                items=(),
+                candidates=(),
+                memory_epoch=core.status(ctx).memory_epoch,
+                gaps=("vector_unavailable", "vector_error:AuxiliaryModelError:timeout"),
+                answerability_hint="unknown",
+                coverage="partial",
+                candidate_count=0,
+                admitted_count=0,
+                request_id="TEST-request",
+            )
+
+    core.recall_pipeline = LostPipeline()
+    with caplog.at_level(logging.WARNING, logger="scope_recall.adapters.hermes.provider"):
+        provider.prefetch("继续 TEST 项目", session_id="")
+    assert "vector channel lost" in caplog.text
+    assert "vector_error:AuxiliaryModelError:timeout" in caplog.text
+    assert '"answered_after_s": 2.8' in caplog.text
+
+
+def test_a_recall_that_kept_its_vector_channel_logs_nothing(adapter, initialize_kwargs, caplog):
+    provider, _clock = adapter
+    core = provider._core
+    ctx = _bind_context(core, initialize_kwargs, session_id="TEST-session-1")
+
+    class KeptPipeline:
+        storage_reader = core.recall_pipeline.storage_reader
+        last_vector_failure = None
+
+        def search(self, search_context):
+            return RetrievalResult(
+                items=(),
+                candidates=(),
+                memory_epoch=core.status(ctx).memory_epoch,
+                gaps=("relation_bound_reached",),
+                answerability_hint="unknown",
+                coverage="partial",
+                candidate_count=0,
+                admitted_count=0,
+                request_id="TEST-request",
+            )
+
+    core.recall_pipeline = KeptPipeline()
+    with caplog.at_level(logging.WARNING, logger="scope_recall.adapters.hermes.provider"):
+        provider.prefetch("继续 TEST 项目", session_id="")
+    assert "vector channel lost" not in caplog.text
+
+
+def test_the_query_route_is_warmed_once_after_a_gap(adapter, monkeypatch):
+    """The first query embedding after idle costs seconds of a recall's window.  Asked for before the recall needs
+    it, the recall's own embedding is short.  Only after a gap: a chatty exchange leaves the route warm."""
+    provider, _clock = adapter
+    calls = []
+
+    class Embedder:
+        def embed_query(self, text, *, remaining_seconds):
+            calls.append((text, remaining_seconds))
+            return (0.1, 0.2)
+
+    runtime = types.SimpleNamespace(auxiliary=types.SimpleNamespace(query_embedding=Embedder()))
+    monkeypatch.setattr(provider, "_host_runtime", types.SimpleNamespace(runtime=runtime, close=lambda: None))
+
+    provider._prefetch.last_prefetch_at = 0.0
+    provider._prefetch.warm_query_route()
+    for _ in range(200):
+        if calls:
+            break
+        time.sleep(0.01)
+    assert calls and calls[0][0] == "warm", calls
+    assert calls[0][1] > 0
+
+    calls.clear()
+    provider._prefetch.last_prefetch_at = time.monotonic()
+    provider._prefetch.warm_query_route()
+    time.sleep(0.05)
+    assert calls == [], "a recall just ran: the route is warm"
+
+
+def test_a_warm_up_that_fails_is_not_the_recall_s_problem(adapter, monkeypatch):
+    provider, _clock = adapter
+
+    class Failing:
+        def embed_query(self, text, *, remaining_seconds):
+            raise RuntimeError("route down")
+
+    runtime = types.SimpleNamespace(auxiliary=types.SimpleNamespace(query_embedding=Failing()))
+    monkeypatch.setattr(provider, "_host_runtime", types.SimpleNamespace(runtime=runtime, close=lambda: None))
+    provider._prefetch.last_prefetch_at = 0.0
+    provider._prefetch.warm_query_route()  # raised nowhere: the warm-up is fire-and-forget
+    time.sleep(0.05)

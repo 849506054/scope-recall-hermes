@@ -3,7 +3,10 @@ lock, the recall run without it, its context rendered for the model."""
 
 from __future__ import annotations
 
+import json
+import logging
 import sqlite3
+import threading
 import time
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any
@@ -26,12 +29,22 @@ if TYPE_CHECKING:
 #: and an automatic recall takes up to 5.
 _PREFETCH_STATE_WAIT_S = 2.0
 
+#: Keep the adapter's log name across the module split for host logging configurations and loss counts.
+_log = logging.getLogger("scope_recall.adapters.hermes.provider")
+
+#: Seconds without a recall after which the query route is warmed before the next one (``warm_query_route``).
+_QUERY_ROUTE_WARM_AFTER_SECONDS = 60.0
+#: The warm-up's own budget: it is not a recall, and a route that will not answer within it is not warm.
+_QUERY_ROUTE_WARM_BUDGET_SECONDS = 8.0
+
 
 class Prefetch:
     """A Hermes adapter's turn recall; one per adapter."""
 
     def __init__(self, adapter: ScopeRecallHermesAdapter) -> None:
         self._adapter = adapter
+        #: The last completed recall, retained across session bindings for ``warm_query_route``.
+        self.last_prefetch_at = 0.0
 
     def recall(self, query: str, *, session_id: str = "") -> str:
         """Read the turn's state under the lock, recall without it.
@@ -152,6 +165,7 @@ class Prefetch:
         except Exception:  # noqa: BLE001 - optional host reading must not prevent prefetch
             entries = frozenset()
         host_context: dict[str, Any] = {"host_memory_entries": entries} if entries else {}
+        timed = time.monotonic()
         try:
             packet = core.recall_packet(
                 context,
@@ -168,6 +182,9 @@ class Prefetch:
             return self._confirm(
                 core, context, effective_session, turn, briefing, text, started, request_id=request["request_id"]
             )
+        recall_seconds = time.monotonic() - timed
+        self.last_prefetch_at = time.monotonic()
+        self._log_vector_loss(packet, recall_seconds)
         preparation = core.prepare_recall_render(context, packet)
         current = getattr(core, "recall_packet_current", None)
         if packet.get("items") and callable(current) and not current(context, packet):
@@ -272,6 +289,48 @@ class Prefetch:
         if reason in {"brief_delivery_unconfirmed", "injection_delivery_unconfirmed", "brief_safety_unconfirmed"}:
             self._adapter._diagnostics.capability_gaps = (*self._adapter._diagnostics.capability_gaps, reason)
         return text
+
+    def _log_vector_loss(self, packet, recall_seconds: float) -> None:
+        """Record a lost semantic channel once, with the Core pipeline's failure timeline.
+
+        The channel is lost on a minority of recalls, and only when the install is busy or its connection to the
+        provider has gone cold, so it is recorded where it happens rather than probed for: the gaps name the failure
+        and the embedding's own timeline names where the window went.
+        """
+        gaps = tuple(str(gap) for gap in (packet.get("gaps") or ()))
+        if not any(gap == "vector_unavailable" or gap.startswith("vector_error:") for gap in gaps):
+            return
+        pipeline = getattr(self._adapter._require_core(), "recall_pipeline", None)
+        _log.warning(
+            "scope-recall: vector channel lost recall=%.2fs status=%s gaps=%s timeline=%s",
+            recall_seconds,
+            packet.get("status"),
+            ",".join(gaps[:10]),
+            json.dumps(getattr(pipeline, "last_vector_failure", None), sort_keys=True),
+        )
+
+    def warm_query_route(self) -> None:
+        """Warm the query embedding route asynchronously when binding a session after an idle gap.
+
+        This machine's route through the proxy goes cold over idle minutes: the first embedding after that costs
+        about 2.9 s, more than the share of a recall window it is given, so that recall comes back without its
+        semantic channel.  Asked for on its own the same embedding leaves the next recall's at about 1.4 s.  Recent
+        recalls keep the route warm by themselves; the thread owns its 8 s budget and never blocks a recall.
+        """
+        if time.monotonic() - self.last_prefetch_at < _QUERY_ROUTE_WARM_AFTER_SECONDS:
+            return
+        runtime = getattr(self._adapter._host_runtime, "runtime", None)
+        embedder = getattr(getattr(runtime, "auxiliary", None), "query_embedding", None)
+        if embedder is None:
+            return
+
+        def warm() -> None:
+            try:
+                embedder.embed_query("warm", remaining_seconds=_QUERY_ROUTE_WARM_BUDGET_SECONDS)
+            except Exception:  # noqa: BLE001 - the warm-up owns its budget and its failure
+                pass
+
+        threading.Thread(target=warm, name="scope-recall-query-route-warmth", daemon=True).start()
 
     def _request(self, query: str, session_id: str) -> RecallRequest:
         self._adapter._require_identity()

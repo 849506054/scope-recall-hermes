@@ -120,6 +120,8 @@ class SessionBinding:
 
             update_adapter_binding(self._adapter)
 
+        self._adapter._prefetch.warm_query_route()
+
     def switch(
         self,
         new_session_id: str,
