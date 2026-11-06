@@ -1,6 +1,6 @@
 # scope-recall-hermes（个人 fork）
 
-本仓库是 [`410979729/scope-recall-hermes`](https://github.com/410979729/scope-recall-hermes) 的 fork，仓库名 `849506054/scope-recall-hermes`，当前版本 `4.0.0.2`，跟版基线上游 `v4.0.0`。每次发版的说明在本仓库的 [CHANGELOG.md](CHANGELOG.md) 里，每个版本对应一个 fork tag。
+本仓库是 [`410979729/scope-recall-hermes`](https://github.com/410979729/scope-recall-hermes) 的 fork，仓库名 `849506054/scope-recall-hermes`，当前版本 `4.0.0.4`，跟版基线上游 `v4.0.0`。每次发版的说明在本仓库的 [CHANGELOG.md](CHANGELOG.md) 里，每个版本对应一个 fork tag。
 
 fork 只保留上游没有、而这套部署又必须有的改动：**嵌入路由的出网代理**。远端 embedding 服务要经本机自己的代理出去，上游的传输层不认代理设置；其余一切按上游走，包括向量存储。
 
@@ -32,7 +32,7 @@ git diff --stat upstream/v4.0.0 HEAD
 
 以「Hermes 宿主 + 远端 embedding」为准，路径按自己的实例替换。
 
-1. 装 wheel：宿主那个 venv 里 `pip install -U hermes_scope_recall-4.0.0.1-py3-none-any.whl`。
+1. 装 wheel：宿主那个 venv 里 `pip install -U hermes_scope_recall-4.0.0.4-py3-none-any.whl`。
 2. 写 `runtime-config.json`：`vector.backend` 用上游的 `"sqlite"`（省略也是它），`vector.storage_dir` 指到实例自己的向量目录；嵌入路由给 `endpoint`、`model`、`dimensions`、`dimensions_field`、`dialect`，以及 `proxy_url`。
 3. 起 worker 前先 `scope-recall upgrade-store --backup-dir <目录>`：4.0 的 store 结构 1112 → 1134，首开自动迁移，升上去之后老版本打不开。
 4. `scope-recall doctor` 看四路诊断，再起 worker。
@@ -50,7 +50,7 @@ git diff --stat upstream/v4.0.0 HEAD
 
 下面是上游 `410979729/scope-recall-hermes` 的 README 原文，只把一级标题降到这里，其余保持原样；上游文档里的 `pip install -U`、PyPI 发包、GitHub Release 等说法针对上游自己的仓库，本 fork 不发布包，只出 tag。
 
-This checkout is `4.0.0.1`. Local, source-backed memory shared by Claude Code, Codex, Hermes, WorkBuddy and DeepSeek Harness.
+This checkout is `4.0.0.4`. Local, source-backed memory shared by Claude Code, Codex, Hermes, WorkBuddy and DeepSeek Harness.
 SQLite keeps the original conversations; model-derived facts and vectors remain traceable and rebuildable.
 
 ## Quick start

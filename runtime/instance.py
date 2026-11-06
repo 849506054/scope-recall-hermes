@@ -56,8 +56,10 @@ from .vector_upkeep import (
 )
 
 #: Share of a recall's window its query embedding may take when it is asked for as the recall starts.  The rest is the
-#: vector search's own: an embedding that took all of it would leave the search nothing.
-QUERY_EMBEDDING_SHARE = 0.7
+#: vector search's own: an embedding that took all of it would leave the search nothing.  Held at 0.9 while this host's
+#: query embeddings carry a tail (median 1.4 s, p90 3.1 s) longer than 0.7 of a ~3.3 s window; the search keeps its own
+#: bound, taken from the recall deadline, so widening this does not widen the search's.
+QUERY_EMBEDDING_SHARE = 0.9
 
 
 class _QueryEmbedding:
