@@ -170,7 +170,7 @@ def test_prefetch_wait_timeout_names_its_phase(monkeypatch):
     assert failure.value.elapsed_ms >= 0
 
     pending = _QueryEmbedding(("TEST query",), 1.0)
-    moments = iter((2.0, 2.0, 2.017, 2.017))
+    moments = iter((2.0, 2.0, 2.017))
     with monkeypatch.context() as patched:
         patched.setattr(instance.time, "monotonic", lambda: next(moments))
         pending.run(lambda *args: pytest.fail("an expired prefetch must not call the embedding route"))

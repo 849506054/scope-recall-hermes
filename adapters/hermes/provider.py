@@ -37,13 +37,32 @@ _log = logging.getLogger(__name__)
 _CAPTURE_DRAIN_WAIT_S = 10.0
 
 
+def _participating_session(*, empty=None):
+    """Skip hooks only for an explicitly unbound session, preserving each hook's empty return value.
+
+    Other initialization failures still reach the normal identity checks. A hook
+    cannot borrow an earlier session's identity or replay its captures here.
+    """
+
+    def decorate(method):
+        @wraps(method)
+        def guarded(self, *args, **kwargs):
+            if self._unbound_session:
+                return empty
+            return method(self, *args, **kwargs)
+
+        return guarded
+
+    return decorate
+
+
 def _serialized_host_event(method):
     @wraps(method)
     def guarded(self, *args, **kwargs):
         with self._lock, self._calls.holding(method.__name__):
             return method(self, *args, **kwargs)
 
-    return guarded
+    return _participating_session()(guarded)
 
 
 def _memory_provider_base():
@@ -96,6 +115,7 @@ class ScopeRecallHermesAdapter(HermesToolSurface, _MemoryProviderBase):  # pyrig
         core: MemoryCore | None = None,
         host_runtime: TrustedHostRuntime | None = None,
         clock: Any | None = None,
+        setup: Any | None = None,
     ) -> None:
         self._lock = threading.RLock()
         self._brief_lock = threading.Lock()
@@ -110,6 +130,8 @@ class ScopeRecallHermesAdapter(HermesToolSurface, _MemoryProviderBase):  # pyrig
         self._host_runtime = host_runtime
         self._core = host_runtime.core if host_runtime is not None else core
         self._clock = clock
+        # Registration supplies the operator workflow; runtime capture never imports maintenance.
+        self._setup = setup
         self._worker = AdapterWorker()
         self._ledger = SourceObservationLedger()
         self._outcomes = TurnOutcomeTracker()
@@ -150,6 +172,9 @@ class ScopeRecallHermesAdapter(HermesToolSurface, _MemoryProviderBase):  # pyrig
         #: What the last worker launch attempt added to capability_gaps.
         self._worker_launch_gaps: tuple[str, ...] = ()
         self._initialized = False
+        #: A valid installation's scheduled session with no person behind it.
+        #: Keep it distinct from a failed initialization: only this case is quiet.
+        self._unbound_session = False
         #: Which call holds ``_lock``, since when, on which thread: read without the lock, to say what a call that
         #: could not wait was waiting for.
         self._holder: tuple[str, float, int] | None = None
@@ -181,7 +206,23 @@ class ScopeRecallHermesAdapter(HermesToolSurface, _MemoryProviderBase):  # pyrig
 
     def is_available(self) -> bool:
         if self._identity is None:
-            return True
+            from pathlib import Path
+
+            from .shared_entries import load_binding_for_home
+
+            try:
+                from hermes_constants import get_hermes_home  # pyright: ignore[reportMissingImports]
+            except ImportError:
+                import os
+
+                home = Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes")
+            else:
+                home = get_hermes_home()
+            try:
+                manifest = load_binding_for_home(home)
+            except (HermesIdentityError, OSError, ValueError):
+                return False
+            return (manifest.data_directory / "memory.sqlite3").is_file()
         manifest_path = self._identity.manifest.data_directory / "installation.json"
         db_path = self._identity.manifest.data_directory / "memory.sqlite3"
         return manifest_path.is_file() and db_path.is_file()
@@ -189,14 +230,20 @@ class ScopeRecallHermesAdapter(HermesToolSurface, _MemoryProviderBase):  # pyrig
     def unavailable_reason(self) -> str:
         if self.is_available():
             return ""
-        return "scope-recall installation manifest or database is unavailable"
+        return "Scope Recall is not bound to a usable store; run hermes memory setup and select scope-recall."
+
+    def post_setup(self, hermes_home: str, config: dict) -> None:
+        """Let the host wizard run the ordinary noninteractive setup before activating the provider."""
+        if self._setup is None:
+            raise ValueError("Use the registered Scope Recall plugin with hermes memory setup.")
+        self._setup(hermes_home, config)
 
     def initialize(self, session_id: str, **kwargs) -> None:
         """Bind the session Hermes opens (``SessionBinding.bind``)."""
         self._binding.bind(session_id, **kwargs)
 
     def _require_identity(self) -> HermesIdentity:
-        if self._identity is None or not self._initialized:
+        if self._unbound_session or self._identity is None or not self._initialized:
             raise HermesIdentityError("adapter is not initialized")
         return self._identity
 
@@ -223,6 +270,7 @@ class ScopeRecallHermesAdapter(HermesToolSurface, _MemoryProviderBase):  # pyrig
         merged = tuple(dict.fromkeys(values))[-128:]
         self._diagnostics.pending_outcome_gaps = merged
 
+    @_participating_session(empty="")
     def prefetch(self, query: str, *, session_id: str = "") -> str:
         """The turn's automatic recall (``Prefetch.recall``)."""
         return self._prefetch.recall(query, session_id=session_id)
@@ -243,6 +291,7 @@ class ScopeRecallHermesAdapter(HermesToolSurface, _MemoryProviderBase):  # pyrig
     def observe_post_tool_call(self, **kwargs) -> None:
         self._turns.tool_result(**kwargs)
 
+    @_participating_session()
     def _observe_post_tool_call(self, **kwargs) -> None:
         """A tool result, for ``hooks``, which holds ``_lock`` exactly once (``TurnCapture.tool_result``)."""
         self._turns.tool_result(**kwargs)
@@ -251,9 +300,11 @@ class ScopeRecallHermesAdapter(HermesToolSurface, _MemoryProviderBase):  # pyrig
     def observe_api_request_error(self, **kwargs) -> None:
         self._turns.request_error(**kwargs)
 
+    @_participating_session()
     def observe_post_llm_call(self, **kwargs) -> None:
         self._turns.post_llm(**kwargs)
 
+    @_participating_session()
     def sync_turn(
         self,
         user_content: str,
@@ -263,6 +314,8 @@ class ScopeRecallHermesAdapter(HermesToolSurface, _MemoryProviderBase):  # pyrig
         messages: Optional[List[Dict[str, Any]]] = None,
     ) -> None:
         """Write the finished turn (``TurnCapture.sync``); one turn at a time, and a shutdown waits for it."""
+        if not self._initialized:
+            return
         with self._sync_lock:
             self._turns.sync(user_content, assistant_content, session_id=session_id, messages=messages)
 
@@ -273,7 +326,10 @@ class ScopeRecallHermesAdapter(HermesToolSurface, _MemoryProviderBase):  # pyrig
 
         record_memory_write(self, action, target, content, metadata)
 
+    @_participating_session()
     def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
+        if not self._initialized:
+            return
         # One capture pass (``steer_deadline``) for the steers and the retry inside ``end``. The steers' store
         # I/O runs without the lock; ``end`` then holds it, serialized with shutdown, and never drains. The worker
         # start in ``end`` keeps its own budget and is not this pass.
@@ -297,6 +353,7 @@ class ScopeRecallHermesAdapter(HermesToolSurface, _MemoryProviderBase):  # pyrig
             new_session_id, parent_session_id=parent_session_id, reset=reset, rewound=rewound, **kwargs
         )
 
+    @_participating_session(empty="")
     def on_pre_compress(self, messages: List[Dict[str, Any]], **kwargs) -> str:
         # One budget for the hook's captures: what the retry pass leaves of it is the steers'.
         deadline = steer_deadline()
@@ -383,13 +440,3 @@ class ScopeRecallHermesAdapter(HermesToolSurface, _MemoryProviderBase):  # pyrig
                 state["captures_still_writing"] = still_writing
             self._diagnostics.shutdown_state = state
             self._initialized = False
-
-
-def register_adapter(ctx: Any) -> ScopeRecallHermesAdapter:
-    from .hooks import register_capture_hooks, unsupported_host_fields
-
-    adapter = ScopeRecallHermesAdapter()
-    adapter._diagnostics.unsupported_fields = unsupported_host_fields()
-    ctx.register_memory_provider(adapter)
-    register_capture_hooks(ctx, adapter)
-    return adapter

@@ -4,9 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import sqlite3
-import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from decimal import Decimal
@@ -29,8 +27,6 @@ from scope_recall.runtime.consolidation_models import (
 from scope_recall.runtime.embedding_models import (
     EmbeddingRouteConfig,
     GeminiEmbeddingAdapter,
-    _embedding_usage,
-    _embedding_vector,
     build_gemini_embed_body,
     validate_embedding_vector,
 )
@@ -1240,107 +1236,6 @@ def test_unknown_usage_keeps_reserve(tmp_path, monkeypatch):
     assert status["charge_micro_usd"] > 0
 
 
-@pytest.mark.parametrize("batch", [False, True], ids=["single", "batch"])
-@pytest.mark.parametrize(
-    "usage,actual,error",
-    [
-        ({"prompt_tokens": 10}, 10, None),
-        ({"prompt_tokens": 0, "total_tokens": 10}, 0, None),
-        ({"prompt_tokens": 7, "total_tokens": 10}, 7, None),
-        ({"prompt_tokens": 7, "total_tokens": "bad"}, 7, None),
-        ({"total_tokens": 10}, 10, None),
-        ({"total_tokens": 0}, 0, None),
-        (None, None, "missing_usage"),
-        ({}, None, "missing_usage"),
-        ([], None, "missing_usage"),
-        ({"completion_tokens": 10}, None, "missing_usage"),
-        *[
-            ({"prompt_tokens": bad, "total_tokens": 10}, None, "missing_usage")
-            for bad in (None, True, False, "7", 7.0, -1)
-        ],
-        *[({"total_tokens": bad}, None, "missing_usage") for bad in (None, True, False, "7", 7.0, -1)],
-        ({"total_tokens": 999_999}, 999_999, "meter_breach"),
-    ],
-)
-def test_openai_embedding_usage_settles_single_and_batch(tmp_path, monkeypatch, batch, usage, actual, error):
-    _, ledger, budget = _runtime_config(tmp_path)
-    route = EmbeddingRouteConfig(
-        credential_env="SCOPE_RECALL_TEST_EMBED_KEY",
-        model=EMBEDDING_SPACE["model"],
-        endpoint="https://example.test/v1/embeddings",
-        dimensions=8,
-        dialect="openai",
-    )
-    monkeypatch.setenv("SCOPE_RECALL_TEST_EMBED_KEY", "test-key")
-    count = 2 if batch else 1
-    vector = [1.0] * 8
-    payload = {"data": [{"index": index, "embedding": vector} for index in range(count)]}
-    if usage is not None:
-        payload["usage"] = usage
-    transport = FakeTransport(lambda **kwargs: (200, json.dumps(payload).encode()))
-    adapter = GeminiEmbeddingAdapter(route, ledger=AuxiliaryBudgetLedger(ledger, budget), transport=transport)
-
-    def call():
-        if batch:
-            return adapter.embed_texts(["TEST first", "TEST second"], remaining_seconds=2.0)
-        return adapter.embed_query("TEST query", remaining_seconds=2.0)
-
-    if error:
-        with pytest.raises(AuxiliaryModelError) as exc:
-            call()
-        assert exc.value.error_type == error
-    else:
-        result = call()
-        assert result == ((tuple(vector),) * count if batch else tuple(vector))
-    row = _ledger_rows(ledger)[0]
-    assert row["reserved_output"] == 0
-    if actual is None:
-        assert row["status"] == "http_200_usage_unknown_reserved_charge_retained"
-        assert (row["actual_input"], row["actual_output"]) == (None, None)
-        charged_input = row["reserved_input"]
-    else:
-        assert row["status"] == ("meter_breach" if error else "http_200")
-        assert (row["actual_input"], row["actual_output"]) == (actual, 0)
-        charged_input = actual
-    assert row["charge_micro_usd"] == budget.pricing[EMBEDDING_SPACE["model"]].charge_micro_usd(charged_input, 0)
-    if error == "meter_breach":
-        with pytest.raises(AuxiliaryModelError) as exc:
-            call()
-        assert exc.value.error_type == "budget_exhausted"
-    assert transport.calls == len(_ledger_rows(ledger)) == 1
-
-
-@pytest.mark.parametrize(
-    "dialect,metadata,expected",
-    [
-        ("openai", {"usage": {"total_tokens": 7}}, {"promptTokenCount": 7}),
-        ("gemini", {"usageMetadata": {"promptTokenCount": 7, "total_tokens": 10}}, {"promptTokenCount": 7}),
-        ("gemini", {"usageMetadata": {"promptTokenCount": -1}}, {"promptTokenCount": -1}),
-        ("gemini", {"usageMetadata": {"total_tokens": 7}, "usage": {"total_tokens": 7}}, None),
-        ("gemini", {"usageMetadata": {"promptTokenCount": True, "total_tokens": 7}}, None),
-    ],
-)
-def test_embedding_response_parsers_keep_dialect_usage(dialect, metadata, expected):
-    payload = {"embeddings": [{"values": [1.0, 0.0]}], "data": [{"embedding": [1.0, 0.0]}], **metadata}
-    assert _embedding_vector(payload, dialect=dialect, dimensions=2) == (1.0, 0.0)
-    assert _embedding_usage(payload, dialect=dialect) == expected
-
-
-def test_chat_total_tokens_keeps_unknown_input_reserved(tmp_path, monkeypatch):
-    config, ledger, budget = _runtime_config(tmp_path)
-    monkeypatch.setenv("SCOPE_RECALL_TEST_CHAT_KEY", "test-key")
-    runtime = build_auxiliary_runtime(config, transport=_cached_reply({"total_tokens": 12, "completion_tokens": 2}))
-    with pytest.raises(AuxiliaryModelError) as exc:
-        runtime.consolidation.propose([{"role": "user", "content": "TEST input"}], remaining_seconds=2.0)
-    assert exc.value.error_type == "missing_usage"
-    row = _ledger_rows(ledger)[0]
-    assert row["status"] == "http_200_usage_unknown_reserved_charge_retained"
-    assert (row["actual_input"], row["actual_output"]) == (None, None)
-    assert row["charge_micro_usd"] == budget.pricing["deepseek-v4-flash"].charge_micro_usd(
-        row["reserved_input"], row["reserved_output"]
-    )
-
-
 def test_concurrent_reservations_are_atomic(tmp_path, monkeypatch):
     config, ledger, budget = _runtime_config(tmp_path)
     monkeypatch.setenv("SCOPE_RECALL_TEST_EMBED_KEY", "test-key")
@@ -1879,90 +1774,6 @@ def test_uncapped_policy_still_refuses_a_metered_breach(tmp_path):
         db.execute("UPDATE requests SET status='meter_breach'")
     with pytest.raises(ValueError, match="budget_exhausted_or_meter_breach"):
         _reserve(ledger, uncapped, "deepseek-v4-flash")
-
-
-def test_concurrent_recalls_borrow_separate_query_channels(tmp_path, monkeypatch):
-    """One warm connection serialized recalls behind each other; the pool gives each its own."""
-    monkeypatch.setenv("SCOPE_RECALL_TEST_EMBED_KEY", "synthetic-local-value")
-    config, _, _ = _runtime_config(tmp_path)
-    runtime = build_auxiliary_runtime(config)
-    try:
-        adapter = runtime.query_embedding
-        barrier = Barrier(2)
-        held: list[object] = []
-
-        def hold(_index: int) -> None:
-            with adapter._query_channel(time.monotonic() + 5) as channel:
-                held.append(channel)
-                barrier.wait(timeout=5)
-
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            list(pool.map(hold, range(2)))
-        assert len(held) == 2
-        assert held[0] is not held[1]
-    finally:
-        runtime.close()
-
-
-def test_embedding_route_states_an_egress_proxy_for_its_helper(tmp_path, monkeypatch):
-    """The proxy belongs to the route, not to the host: it reaches this route's own helpers and leaves
-    the environment every other process shares alone."""
-    monkeypatch.setenv("SCOPE_RECALL_TEST_EMBED_KEY", "synthetic-local-value")
-    monkeypatch.delenv("HTTPS_PROXY", raising=False)
-    config, _, _ = _runtime_config(
-        tmp_path,
-        embedding={
-            "credential_env": "SCOPE_RECALL_TEST_EMBED_KEY",
-            "proxy_url": "http://proxy.local:7890",
-        },
-    )
-
-    runtime = build_auxiliary_runtime(config)
-    try:
-        adapter = runtime.query_embedding
-        for transport in (adapter._transport, *adapter._query_channels):
-            assert transport._worker_environment()["HTTPS_PROXY"] == "http://proxy.local:7890"
-    finally:
-        runtime.close()
-    assert "HTTPS_PROXY" not in os.environ
-
-
-def test_embedding_route_without_a_proxy_leaves_the_environment_alone(tmp_path, monkeypatch):
-    monkeypatch.setenv("SCOPE_RECALL_TEST_EMBED_KEY", "synthetic-local-value")
-    monkeypatch.delenv("HTTPS_PROXY", raising=False)
-    config, _, _ = _runtime_config(tmp_path)
-
-    assert config.embedding.proxy_url is None
-    runtime = build_auxiliary_runtime(config)
-    try:
-        adapter = runtime.query_embedding
-        for transport in (adapter._transport, *adapter._query_channels):
-            assert transport._worker_environment() is None
-    finally:
-        runtime.close()
-
-
-@pytest.mark.parametrize(
-    "proxy_url",
-    [
-        "socks5://proxy.local:1080",
-        "https://proxy.local:7890",
-        "proxy.local:7890",
-        "http://",
-        "http://proxy.local:99999",
-    ],
-)
-def test_embedding_route_rejects_a_proxy_the_helper_cannot_use(tmp_path, proxy_url):
-    """The helper tunnels TLS through an ``http://`` proxy and refuses any other scheme, so a route
-    stating one the helper would reject is refused where the setting is read, not per request."""
-    with pytest.raises(ValueError, match="embedding_route_proxy_url"):
-        _runtime_config(
-            tmp_path,
-            embedding={
-                "credential_env": "SCOPE_RECALL_TEST_EMBED_KEY",
-                "proxy_url": proxy_url,
-            },
-        )
 
 
 @pytest.mark.parametrize("route", ["embedding", "disabled", "close_error"])

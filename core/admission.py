@@ -16,6 +16,7 @@ from dataclasses import dataclass, replace
 
 from ..contracts import ContractError
 from .events import withheld_tool_output
+from .evidence_question import DERIVATION_ROOT_ORIGINS
 from .visibility import allowed
 from .work_storage import FRESH_CONVERSATION_ORIGINS, fresh_since
 
@@ -29,19 +30,17 @@ class AdmissionPolicy:
     enabled: bool = True
     max_pending_work: int = 2048
     important_reserve: int = 128
-    #: When false, a tool result is still stored and lexically indexed but earns
-    #: no embed work: tool output is recalled by its words, never by meaning.
-    embed_tool_outputs: bool = True
+    tool_output_embedding: bool = True
 
     def __post_init__(self):
         if type(self.enabled) is not bool:
             raise ValueError("admission enabled must be boolean")
+        if type(self.tool_output_embedding) is not bool:
+            raise ValueError("tool_output_embedding must be boolean")
         if type(self.max_pending_work) is not int or not 2 <= self.max_pending_work <= 100000:
             raise ValueError("max_pending_work must be between 2 and 100000")
         if type(self.important_reserve) is not int or not 0 <= self.important_reserve <= 10000:
             raise ValueError("important_reserve must be between zero and 10000")
-        if type(self.embed_tool_outputs) is not bool:
-            raise ValueError("embed_tool_outputs must be boolean")
 
 
 @dataclass(frozen=True)
@@ -206,16 +205,9 @@ def classify(event, policy=None):
     if not policy.enabled:
         return AdmissionDecision("schedule", "policy_disabled")
     text = event["content"]
-    withheld_reason = None
     if withheld_tool_output(event):
         # Nothing in it to search for by meaning, to derive from or to find by its words (``core/events.py``).
-        withheld_reason = "tool_output_omitted"
-    elif event.get("role") == "tool" and not policy.embed_tool_outputs:
-        # Stored and lexically searchable, never embedded: the source text keeps
-        # every word it had, so keyword recall still finds it.
-        withheld_reason = "tool_output_not_embedded"
-    if withheld_reason:
-        return AdmissionDecision("source_only", withheld_reason)
+        return AdmissionDecision("source_only", "tool_output_omitted")
     important = bool(
         event.get("artifact_refs") or event.get("evidence_refs") or event.get("segment") or _IMPORTANT.search(text)
     )
@@ -283,19 +275,26 @@ def _repeated_tool_output(tx, scope_id, text, source_ref, source_revision) -> bo
     )
 
 
-#: What a tool output earns: an embedding, so it is recalled by meaning.  It is not consolidated;
-#: tool output is no derivation root (``evidence_question.DERIVATION_ROOT_ORIGINS``), so a
-#: consolidation of it would show the model nothing.
-TOOL_OUTPUT_WORK_TYPES = frozenset({"embed"})
+#: Non-root sources stay semantically searchable. Consolidation can derive no claim
+#: from them, irrespective of the role the host uses to transport their content.
+NON_ROOT_WORK_TYPES = frozenset({"embed"})
+
+
+def _effective_origin(event):
+    """Use an import's original origin solely to decide which work it is owed."""
+    return event.get("source_original_origin") if event.get("origin") == "imported" else event.get("origin")
 
 
 def wanted_work_types(event) -> frozenset[str]:
-    """The derived work a scheduled source is owed: every kind, or an embedding alone for tool output."""
-    return TOOL_OUTPUT_WORK_TYPES if event.get("role") == "tool" else WORK_TYPES
+    """The derived work owed by a source's origin, not its transport role."""
+    # This only limits scheduling; the worker verifies import provenance before deriving claims.
+    return WORK_TYPES if _effective_origin(event) in DERIVATION_ROOT_ORIGINS else NON_ROOT_WORK_TYPES
 
 
 def decide(tx, event, scope_id, policy=None, *, source_ref=None, source_revision=None):
     policy = policy or AdmissionPolicy()
+    if not policy.tool_output_embedding and _effective_origin(event) == "tool_observation":
+        return AdmissionDecision("source_only", "tool_output_not_embedded")
     decision = classify(event, policy)
     if decision.disposition != "schedule":
         return decision
@@ -370,7 +369,7 @@ def _schedule(tx, clock, ref, revision, policy, *, on_demand=True, fresh=False):
     present = {row[0] for row in existing}
     missing = wanted_work_types(source.event) - present
     if not missing:
-        # A tool output deferred before it stopped being owed a consolidation may already hold its
+        # A non-root source deferred before it stopped being owed a consolidation may already hold its
         # embedding; settle its marker, or the refill would select it on every pass.
         if decision_marker(tx, ref, revision) == "admission_deferred:queue_capacity":
             conn.execute(
@@ -504,14 +503,15 @@ def _deferred_page(tx, clock, context, policy, scopes, marks, limit) -> list[tup
             priority = not policy.enabled or count < _capacity(policy, True)
             if not priority:
                 continue
-            # A tool output is owed an embedding only (``wanted_work_types``), so it never holds
+            # A non-root source is owed an embedding only (``wanted_work_types``), so it never holds
             # a consolidation.  It is picked for one only once its embedding is queued, to settle
             # a marker written before that rule; picked while its embedding waits for room, it
             # would come first on every pass and hold the page.
             owed = (
                 ""
-                if kind in TOOL_OUTPUT_WORK_TYPES
-                else """AND (e.role<>'tool' OR EXISTS(
+                if kind in NON_ROOT_WORK_TYPES
+                else f"""AND (CASE WHEN e.origin='imported' THEN e.source_original_origin ELSE e.origin END
+                IN ({",".join("?" for _ in DERIVATION_ROOT_ORIGINS)}) OR EXISTS(
                 SELECT 1 FROM work_items o WHERE o.subject_ref=e.event_id
                 AND o.subject_revision=e.source_revision AND o.work_type='embed'))"""
             )
@@ -522,7 +522,8 @@ def _deferred_page(tx, clock, context, policy, scopes, marks, limit) -> list[tup
             eligible.append(f"""(e.scope_id=? {owed} {priority_filter} AND NOT EXISTS(
                 SELECT 1 FROM work_items w WHERE w.subject_ref=e.event_id
                 AND w.subject_revision=e.source_revision AND w.work_type=?))""")
-            eligibility_params.extend((scope, *priority_params, kind))
+            root_params = () if kind in NON_ROOT_WORK_TYPES else tuple(sorted(DERIVATION_ROOT_ORIGINS))
+            eligibility_params.extend((scope, *root_params, *priority_params, kind))
     if not eligible:
         return []
     return (

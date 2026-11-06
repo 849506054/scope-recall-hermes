@@ -2,6 +2,41 @@
 
 A line or two per release.  Each release's full notes are on its GitHub release page (tag ``v<version>``).
 
+## [4.0.2.1] - 2026-11-06
+
+跟进上游 v4.0.2，一次合并吸收 4.0.1 与 4.0.2 两个补丁版。本轮退役五处本地改动，每一处都有上游实现或本机读数支撑：
+
+- **Voyage 用量回落 `total_tokens`**：上游 #347 已在 `runtime/embedding_models.py::_embedding_usage` 实现，判定更严（显式 prompt 计数优先，显式字段畸形即判用量不可用）。跟版即销项。
+- **工具输出整类不进向量**：上游 #350 收编，开关同名同义（`vector.tool_output_embedding`，reason code 同为 `tool_output_not_embedded`）。本机配置该项本来就是 `false`，装后行为不变。
+- **空闲后预热查询路由**：上游 #348 在 `adapters/hermes/session_binding.py` 实现，静默阈值 60 s、预算 8 s，与本 fork 参数相同；本地那份 `Prefetch.warm_query_route` 一并删除，避免同一行为跑两遍。
+- **嵌入路由自带出网代理**：本机嵌入路由已换硅基流动（国内端点），实测直连 0.10–0.14 s、经 Mihomo 0.08–0.10 s，两侧同速，路由级 `proxy_url` 失去理由；生产配置里的 `proxy_url` 同步删除，代码面（`EmbeddingRouteConfig.proxy_url`、helper 子进程环境、`proxy_url_allowed`）随之销项。
+- **查询嵌入对冲重试**：那套参数是为 Voyage 路由的尾部调的，路由换掉后旧读数不再适用；装后按 `vector channel lost` 计数观察，丢通道回升再按新证据处理。
+
+保留两处：
+
+- **doctor 探针用 `-P -B` 而非 `-I`**：本机由宿主 PYTHONPATH 供包，隔离模式会把健康装机报成缺包；只由本机部署形状造成，上游不收。
+- **向量丢失时间线**：上游 #349 按 not_planned 关闭、#355 按现状关闭（把「晚于份额的嵌入退化成词法召回」定为设计行为），维护者认可 gap 行是重开所需的证据但不打算自己记录；这层留在本地作为取证手段。
+
+另把装机包里热改的两处常量收进树：`IMPORT_EMBED_QUEUE_CEILING` 与 `RESPACE_PAGE` 由 64 改为 1000（本机单趟处理量的瓶颈，装包侧直接改过、体检 `hot_patched` 一直报这两处）。
+
+store 结构不动：4.0.0 及之后的库直接用。
+
+## [4.0.2] - 2026-11-06
+
+A Hermes that installs Scope Recall from its plugin catalog can now use it. `hermes memory setup` with `scope-recall` selected runs the ordinary setup through the provider's setup hook, using the plugin environment's interpreter, and reports a refusal in one line. Hermes entries in a shared store carry the Hermes profile's identity instead of a fixed agent id, so a fresh installation's sessions no longer fail with an `agent_identity` conflict; an unused entry recorded with the old id is repaired. Setup leaves a catalog-installed plugin directory under Hermes's control, treats a home that selects the provider but holds no database, manifest or receipt as a fresh installation, and changes only `memory.provider` in `config.yaml`. The provider reports itself unavailable until it is bound, and unbound turns no longer raise. A named Hermes profile attaches to a shared store as `hermes-<profile>`, so another agent recalling its items can say which profile heard them. `plugin.yaml` declares `provides_hooks`, `requires_hermes` and the pinned core package.
+
+Inside Hermes, model and embedding credentials come from Hermes's own secret source for the active profile; the plugin does not read `.env` or other credential files. Background workers receive only the declared credential names, and work that needs a missing credential is held and rechecked every minute instead of being claimed and returned (#354). On Windows, copying a file's access control no longer needs permission to change its owner when the owner stays the same, and a failed backup leaves no empty file. On macOS, a store no longer repeats its structure check after every write: the check's cache key leaves out the inode change time, which macOS advances on each transaction. The `revise` tool's guidance says that original messages cannot be revised and that a value stated in conversation needs no tool call.
+
+No schema change is needed: stores from 4.0.0 and 4.0.1 work directly with this release. Before release, a pre-release build was taken through the catalog installation on Windows, Linux and macOS with Hermes v0.23.0: install, setup, recall in a new session, and a correction. The test suites now also run on macOS.
+
+## [4.0.1] - 2026-11-05
+
+Empty or whitespace-only HTTP 200 responses now get bounded recovery as unfinished upstream responses, while uncertain billing reservations and duplicate-execution safeguards remain in place. Hermes notices retain their trusted host origin across display timestamps and later human messages; those messages keep their own origin and are captured once. Scheduled Hermes sessions without a user no longer participate in memory and report `capability_gap:unbound_session` in diagnostics. After more than 60 seconds idle, binding a Hermes session warms the query embedding route in the background using the auxiliary budget; private mode skips the warm-up.
+
+Only first-hand human messages, external documents and imports originally from either can start consolidation. Assistant messages, tool output and host notices can still be embedded; old ineligible consolidation work is marked obsolete without a model call. After two automatic decisions, only a first-hand human restatement can reopen a candidate; after five undecided evaluations, retries and other paths also observe the limit of one question per day. OpenAI-compatible embedding routes can settle usage reported only as `total_tokens`, while unknown or invalid usage keeps its reservation. Configuration lines that name a credential environment variable, such as `credential_env: OPENROUTER_API_KEY`, are no longer refused as credentials. The documentation explains that model and embedding routes use the worker process's proxy environment and that local network routes belong in `no_proxy`.
+
+No schema change is needed: stores from 4.0.0 work directly with this release. The optional `vector.tool_output_embedding` setting defaults to `true`, preserving existing behavior; set it to `false` to keep new tool output searchable by keyword without embedding it. The changes in this release have not been verified on a real host; validation was limited to automated tests using synthetic data.
+
 ## [4.0.0.5] - 2026-11-06
 
 查询嵌入加一次对冲重试（`runtime/embedding_retry.py::embed_with_hedge`，召回预取路径走它）：

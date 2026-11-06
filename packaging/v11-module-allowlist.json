@@ -1,6 +1,6 @@
 {
   "schema": "scope-recall.v11-module-allowlist.v1",
-  "package_version": "4.0.0.5",
+  "package_version": "4.0.2.1",
   "packages": [
     "scope_recall",
     "scope_recall.adapters",
@@ -263,6 +263,7 @@
     "maintenance/doctor_recall.py",
     "maintenance/doctor_report.py",
     "maintenance/doctor_store.py",
+    "maintenance/hermes_config.py",
     "maintenance/import_chats.py",
     "maintenance/import_markdown.py",
     "maintenance/import_progress.py",
@@ -382,7 +383,6 @@
     "contracts/memory_export_fact_history.schema.json",
     "contracts/memory_export_manifest.schema.json",
     "contracts/memory_export_source.schema.json",
-    "contracts/memory_management.schema.json",
     "contracts/private_mode.schema.json",
     "contracts/profile_request.schema.json",
     "contracts/profile_view.schema.json",
@@ -411,7 +411,6 @@
     "prompts/credentials.json",
     "prompts/fragment.txt",
     "prompts/query_time.json",
-    "prompts/reflection.txt",
     "prompts/repair.txt",
     "prompts/merge.txt",
     "prompts/support.txt",

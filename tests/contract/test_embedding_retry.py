@@ -8,19 +8,9 @@ channels alone.
 
 from __future__ import annotations
 
-import time
-
 import pytest
 from scope_recall.core.failure_policy import CONNECTION_FAILURES
-from scope_recall.runtime.embedding_retry import (
-    HEDGE_DELAY_SECONDS,
-    MINIMUM_RETRY_FRACTION,
-    embed_with_hedge,
-    embed_with_one_retry,
-    retry_budget,
-    retryable,
-    transient,
-)
+from scope_recall.runtime.embedding_retry import MINIMUM_RETRY_FRACTION, embed_with_one_retry, retry_budget, transient
 from scope_recall.runtime.models import AuxiliaryModelError
 
 # --------------------------------------------------------------------------
@@ -50,11 +40,10 @@ def test_a_rejected_request_is_not_retried(kind):
     assert transient(AuxiliaryModelError(kind)) is False
 
 
-def test_a_timeout_is_not_a_connection_failure_but_may_be_asked_again():
-    """It is not a dead socket; it is a call that was cut short of its answer."""
+def test_a_timeout_is_not_retried():
+    """A call that used its whole budget has none left to use again."""
     assert transient(AuxiliaryModelError("timeout")) is False
     assert "timeout" not in CONNECTION_FAILURES
-    assert retryable(AuxiliaryModelError("timeout")) is True
 
 
 @pytest.mark.parametrize("error", [RuntimeError("boom"), ValueError("x"), TypeError("y")])
@@ -215,117 +204,3 @@ def test_a_code_field_is_accepted_when_there_is_no_type():
     from scope_recall.runtime.models import provider_refusal_code
 
     assert provider_refusal_code(b'{"error":{"code":"insufficient_quota"}}') == "insufficient_quota"
-
-
-# --------------------------------------------------------------------------
-# A call that hangs: the second attempt runs beside it, not after it
-# --------------------------------------------------------------------------
-
-
-def _window(seconds):
-    """A monotonic remaining() for a window of ``seconds``, as the recall's deadline offers."""
-    deadline = time.monotonic() + seconds
-    return lambda: deadline - time.monotonic()
-
-
-def test_a_healthy_attempt_is_answered_alone_and_keeps_its_whole_budget():
-    """The hedge must never cut a request that was going to answer."""
-    calls = []
-
-    def embed(seconds):
-        calls.append(seconds)
-        return [1.0]
-
-    assert embed_with_hedge(embed, budget_seconds=0.4, remaining=_window(0.4), delay_seconds=0.05) == [1.0]
-    assert calls == [0.4], "one attempt, budgeted whole"
-
-
-def test_a_silent_attempt_is_answered_by_one_running_beside_it():
-    calls = []
-
-    def embed(seconds):
-        calls.append(seconds)
-        if len(calls) == 1:
-            time.sleep(0.4)
-            return [9.0]
-        return [2.0]
-
-    assert embed_with_hedge(embed, budget_seconds=0.4, remaining=_window(0.4), delay_seconds=0.05) == [2.0]
-    assert calls[0] == 0.4, "the hedged attempt is not given a shorter first try"
-    time.sleep(0.45)
-
-
-def test_a_fast_connection_failure_is_retried_without_waiting_the_hedge_delay():
-    calls = []
-
-    def embed(seconds):
-        calls.append(seconds)
-        if len(calls) == 1:
-            raise AuxiliaryModelError("network_error")
-        return [3.0]
-
-    began = time.monotonic()
-    assert embed_with_hedge(embed, budget_seconds=0.4, remaining=_window(0.4), delay_seconds=5.0) == [3.0]
-    assert time.monotonic() - began < 0.15, "the retry does not wait for a silence that is not there"
-    assert calls[1] <= 0.4
-
-
-def test_a_rejected_request_is_not_asked_twice_and_not_hedged():
-    calls = []
-
-    def embed(seconds):
-        calls.append(seconds)
-        raise AuxiliaryModelError("input_invalid")
-
-    with pytest.raises(AuxiliaryModelError):
-        embed_with_hedge(embed, budget_seconds=0.4, remaining=_window(0.4), delay_seconds=0.02)
-    assert len(calls) == 1
-
-
-def test_no_second_attempt_starts_without_time_to_answer():
-    calls = []
-
-    def embed(seconds):
-        calls.append(seconds)
-        time.sleep(0.2)
-        return [1.0]
-
-    with pytest.raises(AuxiliaryModelError):
-        embed_with_hedge(embed, budget_seconds=0.3, remaining=lambda: 0.05, delay_seconds=0.02)
-    assert len(calls) == 1
-
-
-def test_both_attempts_failing_raises_the_failure_not_a_timeout():
-    calls = []
-
-    def embed(seconds):
-        calls.append(seconds)
-        raise AuxiliaryModelError("transport_worker")
-
-    with pytest.raises(AuxiliaryModelError) as caught:
-        embed_with_hedge(embed, budget_seconds=0.4, remaining=_window(0.4), delay_seconds=0.02)
-    assert caught.value.error_type == "transport_worker"
-    assert len(calls) == 2
-
-
-def test_the_hedged_attempt_carries_the_callers_context():
-    """The request deadline and the outbound check live in context variables."""
-    import contextvars
-
-    marker = contextvars.ContextVar("scope_recall_test_marker", default="unset")
-    seen = []
-
-    def embed(seconds):
-        seen.append(marker.get())
-        if len(seen) == 1:
-            time.sleep(0.4)
-            return [9.0]
-        return [2.0]
-
-    token = marker.set("recall")
-    try:
-        assert embed_with_hedge(embed, budget_seconds=0.4, remaining=_window(0.4), delay_seconds=0.05) == [2.0]
-    finally:
-        marker.reset(token)
-    assert seen[:2] == ["recall", "recall"]
-    time.sleep(0.45)

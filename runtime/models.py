@@ -13,7 +13,6 @@ import subprocess
 import sys
 import threading
 import time
-import urllib.parse
 from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any, Protocol
@@ -28,6 +27,8 @@ MAX_CHAT_RESPONSE_BYTES = 1_048_576
 RESERVE_ENVELOPE_MARGIN = 256
 MAX_CREDENTIAL_BYTES = 8192
 _ENV_NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]{0,127}$")
+
+CredentialGetter = Callable[[str], str | None]
 
 
 class AuxiliaryModelError(RuntimeError):
@@ -151,23 +152,6 @@ def _hidden_window() -> dict[str, Any]:
     return {"startupinfo": startupinfo, "creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0)}
 
 
-def proxy_url_allowed(proxy_url: object) -> bool:
-    """Whether a configured egress proxy is one the worker can carry TLS through.
-
-    The helper tunnels an ``https://`` target through an ``http://`` proxy and
-    refuses every other scheme, so a route may state only that shape: a setting
-    the helper would reject belongs at load time, not in a failed request.
-    """
-    if type(proxy_url) is not str or not proxy_url.startswith("http://"):
-        return False
-    try:
-        parsed = urllib.parse.urlparse(proxy_url)
-        port = parsed.port
-    except ValueError:
-        return False
-    return bool(parsed.hostname) and (port is None or 1 <= port <= 65535)
-
-
 def _worker_request(
     url: str,
     *,
@@ -246,9 +230,7 @@ def _worker_reply(stdout: bytes, max_response_bytes: int) -> tuple[int, bytes]:
 class HttpsTransport:
     """Bounded HTTPS POST; query callers may own a persistent stdlib worker."""
 
-    def __init__(
-        self, *, persistent: bool = False, proxy_url: str | None = None, allow_insecure_endpoint: bool = False
-    ):
+    def __init__(self, *, persistent: bool = False, allow_insecure_endpoint: bool = False):
         from .http_session import HttpWorkerSession
 
         if type(allow_insecure_endpoint) is not bool:  # only the literal boolean is permission, here as in the config
@@ -258,20 +240,6 @@ class HttpsTransport:
         #: Permission to send plaintext HTTP beyond this machine (loopback HTTP needs none).  Held on the transport
         #: that sends, so the permission cannot be lost between the config and the socket.
         self._allow_insecure_endpoint = allow_insecure_endpoint
-        self._proxy_url = proxy_url
-
-    def _worker_environment(self) -> dict[str, str] | None:
-        """The environment the helper runs with, or ``None`` to inherit this one.
-
-        Only ``HTTPS_PROXY`` is stated: the helper tunnels a TLS target through
-        it and opens a cleartext one directly, so a proxy configured for
-        internet egress cannot carry a request to a local model.  The variable
-        reaches this helper alone -- the parent's own environment, and every
-        other process on the host, is left as it was.
-        """
-        if self._proxy_url is None:
-            return None
-        return {**os.environ, "HTTPS_PROXY": self._proxy_url}
 
     def close(self):
         if self._session is not None:
@@ -329,7 +297,6 @@ class HttpsTransport:
             allow_insecure=self._allow_insecure_endpoint,
         )
         command = [sys.executable, "-I", "-B", str(_HTTP_WORKER_PATH)]
-        environment = self._worker_environment()
         max_stdout = (max_response_bytes * 4) // 3 + _HTTP_WORKER_STDOUT_MARGIN
         process: subprocess.Popen[bytes] | None = None
         try:
@@ -342,7 +309,6 @@ class HttpsTransport:
                     request_bytes,
                     deadline=deadline,
                     max_stdout=max_stdout,
-                    environment=environment,
                     **_hidden_window(),
                 )
             else:
@@ -351,7 +317,6 @@ class HttpsTransport:
                     stdin=subprocess.PIPE,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
-                    env=environment,
                     **_hidden_window(),
                 )
                 remaining = seconds_left(deadline)
@@ -398,14 +363,11 @@ class HttpsTransportPool:
     Closing wakes waiters and cancels all owned helpers, including active ones.
     """
 
-    def __init__(self, *, size: int, allow_insecure_endpoint: bool = False, proxy_url: str | None = None) -> None:
+    def __init__(self, *, size: int, allow_insecure_endpoint: bool = False) -> None:
         if type(size) is not int or size <= 0:
             raise ValueError("transport_pool_size")
-        if proxy_url is not None and not proxy_url_allowed(proxy_url):
-            raise ValueError("transport_pool_proxy_url")
         self._transports = tuple(
-            HttpsTransport(persistent=True, allow_insecure_endpoint=allow_insecure_endpoint, proxy_url=proxy_url)
-            for _ in range(size)
+            HttpsTransport(persistent=True, allow_insecure_endpoint=allow_insecure_endpoint) for _ in range(size)
         )
         self._available = list(self._transports)
         self._condition = threading.Condition()
@@ -464,9 +426,10 @@ def json_bytes(value: object) -> bytes:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8")
 
 
-def load_credential(env_name: str) -> str:
+def load_credential(env_name: str, credential_getter: CredentialGetter | None = None) -> str:
+    """Resolve and validate a named credential through the host's lookup, or the process environment."""
     validate_credential_env_name(env_name)
-    value = os.environ.get(env_name)
+    value = (credential_getter or os.environ.get)(env_name)
     if type(value) is not str:
         raise AuxiliaryModelError("credential_missing")
     value = value.strip()
@@ -487,6 +450,10 @@ def _load_json_object(raw: bytes) -> dict[str, Any]:
         text = raw.decode("utf-8")
     except UnicodeError as exc:
         raise AuxiliaryModelError("unicode_error", detail=type(exc).__name__) from exc
+    if not text.strip():
+        # An empty envelope gives neither an answer nor proof of an unbilled
+        # refusal; keep its reservation and recover under the ordinary budget.
+        raise AuxiliaryModelError("upstream_empty_response")
     try:
         payload = json.loads(text)
     except json.JSONDecodeError as exc:

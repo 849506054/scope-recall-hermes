@@ -49,8 +49,7 @@ class VectorRuntimeConfig:
     #: 0 keeps every vector (``runtime/vector_retention.py``).  The text, the
     #: lexical index and everything derived from the source are never expired.
     tool_output_retention_days: int = 180
-    #: Whether a tool output's source is embedded at all; false keeps its text and
-    #: its words in the lexical index and withholds only the vector (this fork's knob).
+    #: New tool outputs can remain lexical-only to avoid embedding costs.
     tool_output_embedding: bool = True
 
     def __post_init__(self) -> None:

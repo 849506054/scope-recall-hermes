@@ -19,6 +19,7 @@ import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import closing
+from contextvars import copy_context
 from dataclasses import dataclass, field, replace
 from functools import partial
 from typing import Any, cast
@@ -35,10 +36,10 @@ from ..vector.store import build_vector_store
 from .auxiliary import build_auxiliary_runtime, summary_budget_enabled
 from .backup_upkeep import mirror_if_due
 from .codex_cli import CodexCliConsolidationAdapter
-from .embedding_retry import embed_with_hedge, embed_with_one_retry
+from .embedding_retry import embed_with_one_retry
 from .instance_config import RuntimeInstanceConfig, VectorRuntimeConfig
 from .model_budget import provider_holds
-from .models import AuxiliaryModelError
+from .models import AuxiliaryModelError, CredentialGetter
 from .recall_log_state import worker_observation
 from .running_code import record_running_code
 from .validation import (
@@ -56,9 +57,7 @@ from .vector_upkeep import (
 )
 
 #: Share of a recall's window its query embedding may take when it is asked for as the recall starts.  The rest is the
-#: vector search's own: an embedding that took all of it would leave the search nothing.  0.7 of a ~4.7 s window keeps
-#: ~1 s for the search, which measured 0.39 s warm and 1.17 s cold on this host's 26k-row store; a call that stays
-#: silent is answered by a hedge attempt inside that share rather than by widening the share.
+#: vector search's own: an embedding that took all of it would leave the search nothing.
 QUERY_EMBEDDING_SHARE = 0.7
 
 
@@ -109,11 +108,10 @@ class _QueryEmbedding:
                     error = TimeoutError("query embedding stage deadline exhausted")
                     error.__dict__.update(phase="prefetch", elapsed_ms=round((self._clock() - began) * 1000))
                     raise error
-                # A request that hangs holds its whole window; a second attempt
-                # starts beside it while it is still out. A rejected request is
-                # not asked twice.
+                # A connection that failed in milliseconds costs the whole
+                # semantic channel otherwise; a rejected request is not retried.
                 vectors = tuple(
-                    embed_with_hedge(
+                    embed_with_one_retry(
                         lambda seconds: embed(self.queries, seconds),
                         budget_seconds=budget,
                         remaining=deadline.remaining,
@@ -207,7 +205,9 @@ class _LazyVectorPort:
             return self._checked_query(context, route, texts, seconds)
 
         pending = _QueryEmbedding(queries, now + window * QUERY_EMBEDDING_SHARE, clock=bound.clock)
-        threading.Thread(target=pending.run, args=(checked,), name="scope-recall-query-embedding", daemon=True).start()
+        threading.Thread(
+            target=copy_context().run, args=(pending.run, checked), name="scope-recall-query-embedding", daemon=True
+        ).start()
         return pending
 
     def search(
@@ -553,6 +553,23 @@ class RuntimeInstance:
             deadline_seconds=self.config.request_seconds,
         )
 
+    def _held_work_types(self, purge_only: bool, *, consolidation: Any) -> frozenset[str]:
+        """Combine provider holds with the credential gaps of the routes this pass depends on.
+
+        A core built with its own consolidation port, or a pass given one, does not use the consolidation route's
+        key, so that route's missing key holds none of its work. Embedding work is held by its route's missing key
+        whichever port the pass uses.
+        """
+        self.provider_holds = {} if purge_only else provider_holds(self.config.auxiliary)
+        check = getattr(self.auxiliary, "credential_holds", None)
+        roles = ["embedding"]
+        if consolidation is None and self.core.consolidation is getattr(self.auxiliary, "consolidation", None):
+            roles.append("consolidation")
+        missing = frozenset() if purge_only or check is None else check(roles)
+        if missing:
+            self.background_gaps = (*self.background_gaps, *self.auxiliary.credential_gaps)
+        return frozenset(self.provider_holds) | missing
+
     def drain(
         self,
         *,
@@ -600,7 +617,7 @@ class RuntimeInstance:
         from ..core.worker import WorkerConfig, drain_worker  # only a process that drains loads the worker
 
         model, candidate = self._consolidation_ports(consolidation)
-        self.provider_holds = {} if purge_only else provider_holds(self.config.auxiliary)
+        held_work_types = self._held_work_types(purge_only, consolidation=consolidation)
         # An import's history in a person's roles gets the embedding its source store never queued, a page a pass
         # and only while the queue is shallow (``core.index_rebuild.queue_import_embeddings``).  Embeddings are
         # claimed before candidate evaluations, so while one is ready that this pass would claim, no more than half
@@ -608,9 +625,7 @@ class RuntimeInstance:
         # cannot be done.  One without an evaluator, under a provider hold, or in a pass that only purges does not
         # count.
         evaluations = (
-            frozenset()
-            if purge_only or candidate is None
-            else frozenset({"evaluate_candidate"}) - frozenset(self.provider_holds)
+            frozenset() if purge_only or candidate is None else frozenset({"evaluate_candidate"}) - held_work_types
         )
         page = self.config.max_items if max_items is None else max_items
         embeds = not vector_gaps and (embed if embed is not None else self._default_embed) is not None
@@ -670,7 +685,7 @@ class RuntimeInstance:
                 # The bound the model and embedding ports below are clamped to.
                 request_seconds=limit,
                 model_request_seconds=self.config.model_request_seconds,
-                held_work_types=frozenset(self.provider_holds),
+                held_work_types=held_work_types,
                 summary_capable=summary_budget_enabled(self.config.auxiliary),
                 reflection_capable=summary_budget_enabled(self.config.auxiliary),
             ),
@@ -933,10 +948,16 @@ def build_runtime_instance(
     vector_factory: Callable[[VectorRuntimeConfig], Any] | None = None,
     vectors: Any = None,
     consolidation: Any = None,
+    credential_getter: CredentialGetter | None = None,
 ) -> RuntimeInstance:
+    """Bind lazy runtime ports, forwarding the host credential lookup without retaining credential values."""
     if not isinstance(config, RuntimeInstanceConfig):
         raise TypeError("config must be RuntimeInstanceConfig")
-    auxiliary = build_auxiliary_runtime(config.auxiliary) if config.auxiliary is not None else None
+    auxiliary = (
+        build_auxiliary_runtime(config.auxiliary, credential_getter=credential_getter)
+        if config.auxiliary is not None
+        else None
+    )
     core = MemoryCore(
         CoreConfig(
             config.binding,
@@ -946,10 +967,10 @@ def build_runtime_instance(
             injection_format=config.injection_format,
             injection_token_cap=config.injection_token_cap,
             session_token_cap=config.session_token_cap,
-            recall_log_policy=LogPolicy(config.recall_log_days, config.recall_log_bytes, config.recall_log_queue),
             admission_policy=AdmissionPolicy(
-                embed_tool_outputs=config.vector.tool_output_embedding if config.vector is not None else True
+                tool_output_embedding=config.vector.tool_output_embedding if config.vector else True
             ),
+            recall_log_policy=LogPolicy(config.recall_log_days, config.recall_log_bytes, config.recall_log_queue),
         ),
         storage=SQLiteStorage(config.binding),
         vectors=vectors,

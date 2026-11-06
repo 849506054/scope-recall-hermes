@@ -90,9 +90,7 @@ class HttpWorkerSession:
         self._closed = True
         self.discard()
 
-    def exchange(self, command, request, *, deadline, max_stdout, startupinfo, creationflags, environment=None):
-        """``environment`` is the helper's environment; ``None`` inherits this
-        process's own, which is what a route that states no proxy wants."""
+    def exchange(self, command, request, *, deadline, max_stdout, startupinfo, creationflags):
         if not self._lock.acquire(timeout=max(0, deadline - time.monotonic())):
             raise TimeoutError
         process = None
@@ -109,7 +107,6 @@ class HttpWorkerSession:
                     stdin=subprocess.PIPE,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.DEVNULL,
-                    env=environment,
                     startupinfo=startupinfo,
                     creationflags=creationflags,
                 )

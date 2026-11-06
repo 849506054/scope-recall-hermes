@@ -171,6 +171,7 @@ SCRIPT_GATE_TESTS = [
 GIT_TESTS = ["tests/integration/test_guard_git.py"]
 SUITES = {
     "unit": [
+        "tests/unit/test_file_access.py",
         "tests/unit/test_host_memory_status.py",
         "tests/unit/test_host_memory_context.py",
         "tests/unit/test_setup_discovery.py",
@@ -343,6 +344,8 @@ SUITES = {
         "tests/host/hermes/test_audience_isolation.py",
         "tests/host/hermes/test_bounded_corrections.py",
         "tests/host/hermes/test_dedupe.py",
+        "tests/host/hermes/test_notice_timestamp.py",
+        "tests/host/hermes/test_notice_sync.py",
         "tests/host/hermes/test_steers.py",
         "tests/host/hermes/test_identity.py",
         "tests/host/hermes/test_local_surfaces.py",
@@ -400,6 +403,7 @@ SUITES = {
         "tests/migration/test_upgrade_policy.py",
     ],
     "packaging": [
+        "tests/packaging/test_hermes_catalog_setup.py",
         "tests/packaging/test_setup.py",
         "tests/packaging/test_setup_repairs.py",
         "tests/packaging/test_clean_v11_wheel.py",
@@ -504,6 +508,8 @@ I_SAFETY_MATRIX = {
         "tests/contract/test_capture.py",
         "tests/contract/test_episodes.py",
         "tests/host/hermes/test_dedupe.py",
+        "tests/host/hermes/test_notice_timestamp.py",
+        "tests/host/hermes/test_notice_sync.py",
         "tests/host/hermes/test_steers.py",
     ],
     "I06": [
@@ -610,6 +616,7 @@ CORE_RELEASE_CONTRACTS += [
     "tests/contract/test_embedding_retry.py",
     "tests/contract/test_evidence_question.py",
     "tests/contract/test_failure_retry.py",
+    "tests/contract/test_upstream_empty_response.py",
     "tests/contract/test_recall_probe_set.py",
     "tests/contract/test_running_code.py",
     "tests/contract/test_subject_binding.py",
@@ -661,6 +668,7 @@ CORE_RELEASE_CONTRACTS += [
     "tests/contract/test_processing_loop_survives.py",
     "tests/contract/test_embed_group_bookkeeping.py",
     "tests/contract/test_tool_output_is_not_derived.py",
+    "tests/contract/test_tool_output_embedding.py",
     "tests/contract/test_retire_rootless_claims.py",
 ]
 

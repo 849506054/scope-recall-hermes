@@ -142,7 +142,6 @@ Credentials are environment variable references. Never put their values in a rou
 | `dimensions` | `int &#124; None` | `null` |
 | <a id="dialect"></a>`dialect` | `str &#124; None` | `null` |
 | <a id="dimensions_field"></a>`dimensions_field` | `str` | `"dimensions"` |
-| <a id="proxy_url"></a>`proxy_url` | `str &#124; None` | `null` |
 | <a id="allow_insecure_endpoint"></a>`allow_insecure_endpoint` | `bool` | `false` |
 
 ## ConsolidationRouteConfig

@@ -1,45 +1,34 @@
 # scope-recall-hermes（个人 fork）
 
-本仓库是 [`410979729/scope-recall-hermes`](https://github.com/410979729/scope-recall-hermes) 的 fork，仓库名 `849506054/scope-recall-hermes`，当前版本 `4.0.0.4`，跟版基线上游 `v4.0.0`。每次发版的说明在本仓库的 [CHANGELOG.md](CHANGELOG.md) 里，每个版本对应一个 fork tag。
+本仓库是 [`410979729/scope-recall-hermes`](https://github.com/410979729/scope-recall-hermes) 的 fork，仓库名 `849506054/scope-recall-hermes`，当前版本 `4.0.2.1`，跟版基线上游 `v4.0.2`。每次发版的说明在本仓库的 [CHANGELOG.md](CHANGELOG.md) 里，每个版本对应一个 fork tag。
 
-fork 只保留上游没有、而这套部署又必须有的改动：**嵌入路由的出网代理**。远端 embedding 服务要经本机自己的代理出去，上游的传输层不认代理设置；其余一切按上游走，包括向量存储。
+fork 只保留上游没有、而这套部署又必须有的两处：
 
-上游 4.0 把向量从 LanceDB 搬进了 SQLite，`import lancedb` 不再出现在运行路径上。这个 fork 曾经为此自带一套远端 Qdrant 后端（N5100 / N5105 这类没有 AVX2 的机器加载 LanceDB 会 SIGILL，上游的纯 Python 扫描后端在本机量到 2.7 万条 2048 维向量单次查询 17–22 秒）。4.0 之后那条死路不存在了，Qdrant 后端随之退役，向量改用上游的本地 SQLite 存储。
+- **doctor 的解释器探针用 `-P -B` 而不是 `-I`**：本机由宿主 `PYTHONPATH` 上的常驻目录供包，隔离模式会剥掉它、把健康的装机报成缺包（`maintenance/doctor.py::_PROBE_FLAGS`）。只由这套部署形状造成，上游不收。
+- **向量通道丢失的现场记录**：召回丢掉语义通道时记一条 warning，带上嵌入自己的时间线（窗口多长、实际多久、错误类型）。上游 #349 与 #355 都按 not_planned 关闭——把「晚于份额的嵌入退化成词法召回」定为设计行为——维护者认可这些 gap 行是重开所需的证据，但不打算自己记录；这层留在本地作取证手段。
+
+自 4.0.2.1 起，下面五处本地改动已退役：嵌入路由的出网代理（嵌入路由换成国内端点后实测直连与代理同速）、Voyage 用量回落 `total_tokens`、工具输出整类不进向量、空闲后预热查询路由（三者上游已用同名同义的实现收编）、查询嵌入对冲重试（为换掉的那条路由调的参数，随路由一起退役）。
 
 ## 与上游的差异
 
 完整账本以 git 为准，别照着文档手抄：
 
 ```bash
-git diff --stat upstream/v4.0.0 HEAD
+git diff --stat upstream/v4.0.2 HEAD
 ```
-
-**新增配置**
-
-| 键 | 默认 | 说明 |
-|---|---|---|
-| `auxiliary.embedding.proxy_url` | 无 | 让这条嵌入路由走自己的出网代理；代理只进承载该路由的 helper 子进程，宿主其余进程不受影响 |
-| `vector.tool_output_embedding` | `true` | 设 `false` 时工具输出照常入库、进词法索引，但不做 embedding |
-
-**行为修补**
-
-- **Voyage 用量记账**：`usage` 里只有 `total_tokens` 时按它记账（`runtime/embedding_models.py::_embedding_usage`）。
-- **doctor 的解释器探针**：用 `-P` 而不是 `-I`，让装在常驻目录、靠 `PYTHONPATH` 供货的安装也能被量到（`maintenance/doctor.py::_PROBE_FLAGS`）。
-
-整合路由与嵌入路由的明文 `http://` 许可（`allow_insecure_endpoint`）走上游的 `core/endpoint_policy.py`，fork 直接复用。
 
 ## 部署
 
 以「Hermes 宿主 + 远端 embedding」为准，路径按自己的实例替换。
 
-1. 装 wheel：宿主那个 venv 里 `pip install -U hermes_scope_recall-4.0.0.4-py3-none-any.whl`。
-2. 写 `runtime-config.json`：`vector.backend` 用上游的 `"sqlite"`（省略也是它），`vector.storage_dir` 指到实例自己的向量目录；嵌入路由给 `endpoint`、`model`、`dimensions`、`dimensions_field`、`dialect`，以及 `proxy_url`。
+1. 装 wheel：宿主那个 venv 里 `pip install -U hermes_scope_recall-4.0.2.1-py3-none-any.whl`。
+2. 写 `runtime-config.json`：`vector.backend` 用上游的 `"sqlite"`（省略也是它），`vector.storage_dir` 指到实例自己的向量目录；嵌入路由给 `endpoint`、`model`、`dimensions`、`dimensions_field`、`dialect`。国内端点直连即可，不需要路由级代理。
 3. 起 worker 前先 `scope-recall upgrade-store --backup-dir <目录>`：4.0 的 store 结构 1112 → 1134，首开自动迁移，升上去之后老版本打不开。
 4. `scope-recall doctor` 看四路诊断，再起 worker。
 
 ## 发版与跟版
 
-- **版本号 = 上游版本号加一位**：上游 `v4.0.0` → fork `4.0.0.1`。裸 tag 空间只属于 fork，上游 tag 收在 `refs/tags/upstream/*`。
+- **版本号 = 上游版本号加一位**：上游 `v4.0.2` → fork `4.0.2.1`。裸 tag 空间只属于 fork，上游 tag 收在 `refs/tags/upstream/*`。
 - **只跟稳定 tag，不跟 rc**。小版本前移必跟；同一小版本内的补丁版按「问题有多严重、修复有多急」决定，其余攒到下一个要跟的版本一起做。
 - **跟版即销项**：上游已经修了同一处，就删掉我们的改动，不留双份。
 - 发版前跑完整门禁（unit / contract / packaging / host / migration），tag 只打在门禁验过的提交上；wheel 从该提交构建、与提交逐字节核对后再打 tag。
@@ -50,7 +39,7 @@ git diff --stat upstream/v4.0.0 HEAD
 
 下面是上游 `410979729/scope-recall-hermes` 的 README 原文，只把一级标题降到这里，其余保持原样；上游文档里的 `pip install -U`、PyPI 发包、GitHub Release 等说法针对上游自己的仓库，本 fork 不发布包，只出 tag。
 
-This checkout is `4.0.0.4`. Local, source-backed memory shared by Claude Code, Codex, Hermes, WorkBuddy and DeepSeek Harness.
+This checkout is `4.0.2.1`. Local, source-backed memory shared by Claude Code, Codex, Hermes, WorkBuddy and DeepSeek Harness.
 SQLite keeps the original conversations; model-derived facts and vectors remain traceable and rebuildable.
 
 ## Quick start

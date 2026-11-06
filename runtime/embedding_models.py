@@ -26,13 +26,13 @@ from .model_budget import AuxiliaryBudgetLedger
 from .models import (
     RESERVE_ENVELOPE_MARGIN,
     AuxiliaryModelError,
+    CredentialGetter,
     HttpsTransport,
     HttpsTransportPool,
     HttpTransport,
     json_bytes,
     load_credential,
     metered_post,
-    proxy_url_allowed,
     reject_secrets,
     seconds_left,
     validate_credential_env_name,
@@ -40,6 +40,7 @@ from .models import (
 )
 
 MAX_EMBED_RESPONSE_BYTES = 16 * 1024 * 1024
+
 #: Separate concurrent recalls without creating an unbounded number of HTTP helpers.
 QUERY_EMBED_CONNECTIONS = 3
 
@@ -125,15 +126,32 @@ def build_openai_embed_body(
 
 
 def _embedding_usage(payload: Mapping[str, Any], *, dialect: str) -> dict[str, int] | None:
+    """Read a non-negative integer count without turning an unknown count into zero.
+
+    OpenAI-compatible embedding APIs usually report ``prompt_tokens`` but some
+    routes, including Voyage, expose only ``total_tokens``.  An explicit prompt
+    count remains authoritative; a malformed explicit field makes the usage
+    unusable instead of silently switching fields.
+    """
     if dialect == "gemini":
         metadata, key = payload.get("usageMetadata"), "promptTokenCount"
-    else:
-        metadata, key = payload.get("usage"), "prompt_tokens"
-    # Voyage embeddings report only total_tokens; an explicit prompt count wins.
-    if dialect == "openai" and isinstance(metadata, dict) and key not in metadata:
-        key = "total_tokens"
-    if isinstance(metadata, dict) and type(metadata.get(key)) is int:
-        return {"promptTokenCount": metadata[key]}
+        if isinstance(metadata, dict):
+            count = metadata.get(key)
+            if type(count) is int and count >= 0:
+                return {"promptTokenCount": count}
+        return None
+
+    metadata = payload.get("usage")
+    if not isinstance(metadata, dict):
+        return None
+    if "prompt_tokens" in metadata:
+        prompt = metadata["prompt_tokens"]
+        if type(prompt) is int and prompt >= 0:
+            return {"promptTokenCount": prompt}
+        return None
+    total = metadata.get("total_tokens")
+    if type(total) is int and total >= 0:
+        return {"promptTokenCount": total}
     return None
 
 
@@ -224,14 +242,6 @@ class EmbeddingRouteConfig:
     #: name is the only lever.  A wire detail, not a geometry: it does not enter
     #: the space digest, and the response length is still checked.
     dimensions_field: str = "dimensions"
-    #: The proxy this route's requests leave through, when the operator's own
-    #: network reaches the endpoint that way.  It is stated here, not in the
-    #: environment the whole host shares, because the helper that carries these
-    #: requests is the only process that has to know: nothing else on the host
-    #: gains an egress proxy by this being set.  Routing, not geometry -- it
-    #: does not enter the space digest, and a route that names none is
-    #: unchanged.
-    proxy_url: str | None = None
     #: A literal boolean opt-in for plaintext HTTP to a host that is not this machine: a container reaching the
     #: model server on its host does so over a bridge address (``172.17.0.1``), which is not loopback.  Loopback HTTP
     #: needs no opt-in.  Only a literal ``True`` reads as permission, so a string ``"true"`` cannot open it.
@@ -258,8 +268,6 @@ class EmbeddingRouteConfig:
             raise ValueError("embedding_route_endpoint")
         if type(self.dimensions_field) is not str or not _REQUEST_FIELD_RE.fullmatch(self.dimensions_field):
             raise ValueError("embedding_route_dimensions_field")
-        if self.proxy_url is not None and not proxy_url_allowed(self.proxy_url):
-            raise ValueError("embedding_route_proxy_url")
 
     def space(self) -> dict:
         """The embedding space this route addresses, defaults included."""
@@ -292,22 +300,20 @@ class GeminiEmbeddingAdapter:
         *,
         ledger: AuxiliaryBudgetLedger,
         transport: HttpTransport | None = None,
+        credential_getter: CredentialGetter | None = None,
     ) -> None:
         self._route = route
+        self._credential_getter = credential_getter
         self._ledger = ledger
         self._transport = (
             transport
             if transport is not None
-            else HttpsTransport(proxy_url=route.proxy_url, allow_insecure_endpoint=route.allow_insecure_endpoint)
+            else HttpsTransport(allow_insecure_endpoint=route.allow_insecure_endpoint)
         )
         self._query_transport = (
             transport
             if transport is not None
-            else HttpsTransportPool(
-                size=QUERY_EMBED_CONNECTIONS,
-                allow_insecure_endpoint=route.allow_insecure_endpoint,
-                proxy_url=route.proxy_url,
-            )
+            else HttpsTransportPool(size=QUERY_EMBED_CONNECTIONS, allow_insecure_endpoint=route.allow_insecure_endpoint)
         )
         self._owns_transport = transport is None
         space = route.space()
@@ -442,7 +448,7 @@ class GeminiEmbeddingAdapter:
             # The provider refused the calls just before this one; asking again
             # now only adds a refusal (runtime/model_budget.py).
             raise AuxiliaryModelError("provider_hold")
-        key = load_credential(self._route.credential_env)
+        key = load_credential(self._route.credential_env, self._credential_getter)
         # Google authenticates with its own header; every OpenAI-compatible
         # provider uses bearer auth.
         auth = {"x-goog-api-key": key} if self._dialect == "gemini" else {"Authorization": f"Bearer {key}"}

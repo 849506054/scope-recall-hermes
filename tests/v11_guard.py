@@ -2,7 +2,12 @@ import os
 import re
 import shlex
 import sys
+import zoneinfo
 from pathlib import Path
+
+if sys.platform == "darwin":
+    # Imported before the audit hook is installed, so locating a descriptor never imports from inside the hook.
+    import fcntl
 
 _ROOT = Path(__file__).resolve().parents[1]
 # pytest imports this plugin before it has set up an import path, from whatever directory it runs in, so the tier table
@@ -15,6 +20,9 @@ from tier_allows import TIER_ALLOWS  # noqa: E402
 _ISOLATED = Path(os.environ["SCOPE_RECALL_TEST_BOUNDARY_PARENT"]).resolve()
 _RUNTIME = (Path(sys.prefix).resolve(), Path(sys.base_prefix).resolve())
 _SYSTEM = Path(os.environ.get("SystemRoot", "/usr")).resolve()
+# The IANA time zone database that ``zoneinfo`` reads.  macOS links /usr/share/zoneinfo to a directory outside /usr, so
+# the guard allows where each search path really is.
+_ZONEINFO = tuple(Path(item).resolve() for item in zoneinfo.TZPATH)
 _PYTHON = Path(sys.executable).resolve()
 _ALLOW_CHILD_PROCESSES = os.environ.get("SCOPE_RECALL_TEST_ALLOW_OWNED_SUBPROCESSES") == "1"
 _PROCESS_TIER = os.environ.get("SCOPE_RECALL_TEST_TIER", "")
@@ -233,9 +241,23 @@ def _check_path(value, writing=False):
             flush=True,
         )
         raise PermissionError("TEST_BOUNDARY: write outside isolated test directory (%s)" % path)
-    if any(path.is_relative_to(root) for root in (_ROOT, _ISOLATED, *_RUNTIME, _SYSTEM)):
+    if any(path.is_relative_to(root) for root in (_ROOT, _ISOLATED, *_RUNTIME, _SYSTEM, *_ZONEINFO)):
         return
     raise PermissionError("TEST_BOUNDARY: protected data access")
+
+
+def _descriptor_path(dir_fd):
+    """The directory an open descriptor refers to: its ``/proc/self/fd`` link on Linux, ``F_GETPATH`` on macOS.
+
+    A directory whose ancestors were removed already still owns its children, but on Linux its link carries the
+    kernel's ``(deleted)`` suffix; stripping that suffix recovers the real location. Raises ``OSError`` where
+    neither source exists.
+    """
+
+    if sys.platform == "darwin":
+        return os.fsdecode(fcntl.fcntl(dir_fd, fcntl.F_GETPATH, bytes(1024)).split(b"\0", 1)[0])
+    anchor = os.readlink(f"/proc/self/fd/{dir_fd}")
+    return anchor[: -len(" (deleted)")] if anchor.endswith(" (deleted)") else anchor
 
 
 def _anchored(value, dir_fd=None):
@@ -244,13 +266,10 @@ def _anchored(value, dir_fd=None):
     The fd-based ``shutil.rmtree`` on POSIX passes bare names plus a
     directory descriptor to ``os.remove``/``os.rmdir``; judging a bare name
     against the process cwd would assess the wrong file. The descriptor is
-    re-anchored by reading its ``/proc/self/fd`` link (POSIX only, where the
-    fd-based rmtree exists). A directory whose ancestors were removed
-    already still owns its children, but its readlink target carries the
-    kernel's ``(deleted)`` suffix; stripping that suffix recovers the real
-    location of the file being unlinked. An fd that cannot be read is an
-    anchor we cannot verify, so the bare name passes through and will be
-    denied against the cwd -- fail closed.
+    re-anchored through ``_descriptor_path`` (POSIX only, where the fd-based
+    rmtree exists). An fd that cannot be read is an anchor we cannot verify,
+    so the bare name passes through and will be denied against the cwd --
+    fail closed.
     """
 
     if dir_fd is None or not isinstance(value, (str, bytes, os.PathLike)):
@@ -260,10 +279,7 @@ def _anchored(value, dir_fd=None):
         return value
     try:
         if isinstance(dir_fd, int):
-            anchor = os.readlink(f"/proc/self/fd/{dir_fd}")
-            if anchor.endswith(" (deleted)"):
-                anchor = anchor[: -len(" (deleted)")]
-            return os.path.join(anchor, logical)
+            return os.path.join(_descriptor_path(dir_fd), logical)
         return os.path.join(os.fsdecode(dir_fd), logical)
     except (TypeError, ValueError, OSError):
         return value
@@ -276,9 +292,9 @@ def _anchored_dir(value, dir_fd=None):
     name: a venv's ``bin/python3.12`` is a symlink to the real
     interpreter, so resolving the joined name would judge the interpreter's
     install prefix instead of the directory the test owns and wrongly deny
-    the unlink. Return the directory itself (its ``/proc`` anchor with the
-    kernel's ``(deleted)`` suffix stripped, or the dir_fd path); the
-    absolute joined name is returned unchanged for path-based callers.
+    the unlink. Return the directory itself (``_descriptor_path`` of the
+    descriptor, or the dir_fd path); the absolute joined name is returned
+    unchanged for path-based callers.
     """
 
     if dir_fd is None or not isinstance(value, (str, bytes, os.PathLike)):
@@ -288,10 +304,7 @@ def _anchored_dir(value, dir_fd=None):
         return value
     try:
         if isinstance(dir_fd, int):
-            anchor = os.readlink(f"/proc/self/fd/{dir_fd}")
-            if anchor.endswith(" (deleted)"):
-                anchor = anchor[: -len(" (deleted)")]
-            return anchor
+            return _descriptor_path(dir_fd)
         return os.fsdecode(dir_fd)
     except (TypeError, ValueError, OSError):
         return value

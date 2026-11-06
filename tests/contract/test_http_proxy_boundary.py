@@ -74,30 +74,6 @@ class _RecordingHTTPSConnection:
         return None
 
 
-class _RecordingHTTPConnection:
-    created: list[tuple[object, ...]] = []
-
-    # The constructor-local singleton distinguishes an omitted timeout from an explicit None.
-    def __init__(self, host, port=80, timeout=object()) -> None:  # noqa: B008
-        self.created.append((host, port))
-        self.host = host
-        self.port = port
-        self.timeout = timeout
-        self.sock: _FakeSocket | None = None
-
-    def connect(self) -> None:
-        self.sock = _FakeSocket()
-
-    def request(self, method, path, body=None, headers=None, *, encode_chunked=False) -> None:
-        return None
-
-    def getresponse(self) -> _FakeHTTPResponse:
-        return _FakeHTTPResponse(status=200, body=b"ok")
-
-    def close(self) -> None:
-        return None
-
-
 @pytest.fixture(autouse=True)
 def _reset_recording_connection() -> None:
     _RecordingHTTPSConnection.created = []
@@ -107,7 +83,6 @@ def _reset_recording_connection() -> None:
     _RecordingHTTPSConnection.response_status = 200
     _RecordingHTTPSConnection.response_body = b"ok"
     _RecordingHTTPSConnection.connect_error = None
-    _RecordingHTTPConnection.created = []
 
 
 def _payload(
@@ -117,18 +92,17 @@ def _payload(
     headers: dict[str, str] | None = None,
     timeout_seconds: float = 2.0,
     max_response_bytes: int = 1024,
-    allow_insecure: object = None,
 ) -> bytes:
-    request: dict[str, object] = {
-        "url": url,
-        "body_b64": base64.b64encode(body).decode("ascii"),
-        "headers": headers or {"X-Test": "1"},
-        "timeout_seconds": timeout_seconds,
-        "max_response_bytes": max_response_bytes,
-    }
-    if allow_insecure is not None:
-        request["allow_insecure"] = allow_insecure
-    return json.dumps(request, separators=(",", ":")).encode("utf-8")
+    return json.dumps(
+        {
+            "url": url,
+            "body_b64": base64.b64encode(body).decode("ascii"),
+            "headers": headers or {"X-Test": "1"},
+            "timeout_seconds": timeout_seconds,
+            "max_response_bytes": max_response_bytes,
+        },
+        separators=(",", ":"),
+    ).encode("utf-8")
 
 
 def _decode_result(raw: bytes) -> dict[str, object]:
@@ -236,78 +210,10 @@ def test_caller_proxy_authorization_is_rejected(monkeypatch: pytest.MonkeyPatch)
 def test_https_only_guard_rejects_non_https() -> None:
     result = _decode_result(
         worker._request(
-            _payload(url="ftp://target.example/api"),
+            _payload(url="http://target.example/api"),
         ),
     )
     assert result["error"] == "endpoint_invalid"
-
-
-@pytest.mark.parametrize(
-    "url",
-    [
-        "http://127.0.0.1:8080/v1/chat/completions",
-        "http://localhost:11434/v1/chat/completions",
-        "http://[::1]:8080/api",
-    ],
-)
-def test_plain_http_guard_admits_a_loopback_target(monkeypatch: pytest.MonkeyPatch, url: str) -> None:
-    monkeypatch.setattr(http.client, "HTTPConnection", _RecordingHTTPConnection)
-    monkeypatch.setattr(http.client, "HTTPSConnection", _RecordingHTTPSConnection)
-    monkeypatch.setattr(worker.urllib.request, "getproxies", dict)
-    monkeypatch.setattr(worker.urllib.request, "proxy_bypass", lambda _host: True)
-
-    result = _decode_result(worker._request(_payload(url=url)))
-
-    assert result["ok"] is True
-    assert result["status"] == 200
-    assert _RecordingHTTPConnection.created, "a cleartext request must open a plain connection"
-
-
-@pytest.mark.parametrize(
-    "url",
-    [
-        "http://192.168.5.6:5200/v1/chat/completions",
-        "http://10.0.0.9/v1/embeddings",
-    ],
-)
-def test_plain_http_guard_admits_an_opted_in_target(monkeypatch: pytest.MonkeyPatch, url: str) -> None:
-    """The fork's consolidation route reaches the gateway on this network over plain HTTP; the route's
-    ``allow_insecure_endpoint`` is what the parent states in the request line."""
-    monkeypatch.setattr(http.client, "HTTPConnection", _RecordingHTTPConnection)
-    monkeypatch.setattr(http.client, "HTTPSConnection", _RecordingHTTPSConnection)
-    monkeypatch.setattr(worker.urllib.request, "getproxies", dict)
-    monkeypatch.setattr(worker.urllib.request, "proxy_bypass", lambda _host: True)
-
-    result = _decode_result(worker._request(_payload(url=url, allow_insecure=True)))
-
-    assert result["ok"] is True
-    assert result["status"] == 200
-    assert _RecordingHTTPConnection.created, "a cleartext request must open a plain connection"
-
-
-@pytest.mark.parametrize(
-    "url",
-    [
-        "http://192.168.5.6:5200/v1/chat/completions",
-        "http://10.0.0.9/v1/embeddings",
-        "http://target.example/api",
-        "http://93.184.216.34/api",
-        "http://[2001:db8::1]/api",
-    ],
-)
-def test_plain_http_guard_rejects_a_target_without_the_opt_in(url: str) -> None:
-    result = _decode_result(worker._request(_payload(url=url)))
-
-    assert result["error"] == "endpoint_invalid"
-    assert _RecordingHTTPConnection.created == []
-
-
-@pytest.mark.parametrize("value", ["true", 1, [], {"allow": True}])
-def test_plain_http_guard_reads_only_a_literal_boolean(value: object) -> None:
-    result = _decode_result(worker._request(_payload(url="http://192.168.5.6:5200/v1", allow_insecure=value)))
-
-    assert result["error"] == "http_protocol"
-    assert _RecordingHTTPConnection.created == []
 
 
 def test_redirect_guard_rejects_3xx(monkeypatch: pytest.MonkeyPatch) -> None:
