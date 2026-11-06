@@ -20,7 +20,7 @@ from .visibility import allowed
 IMPORT_EMBED_ROLES = ("user", "assistant", "document", "unknown")
 #: A page is added only while fewer embeddings than this wait, so a message captured now is never queued behind an
 #: import's history for its vector.
-IMPORT_EMBED_QUEUE_CEILING = 64
+IMPORT_EMBED_QUEUE_CEILING = 1000
 #: The queue an import's embeddings are kept to while other work the worker takes after embeddings is ready: half a
 #: pass of the default 32 items (``queue_import_embeddings``).
 IMPORT_EMBED_YIELD_CEILING = 16
