@@ -35,7 +35,7 @@ from ..vector.store import build_vector_store
 from .auxiliary import build_auxiliary_runtime, summary_budget_enabled
 from .backup_upkeep import mirror_if_due
 from .codex_cli import CodexCliConsolidationAdapter
-from .embedding_retry import embed_with_one_retry
+from .embedding_retry import embed_with_hedge, embed_with_one_retry
 from .instance_config import RuntimeInstanceConfig, VectorRuntimeConfig
 from .model_budget import provider_holds
 from .models import AuxiliaryModelError
@@ -56,10 +56,10 @@ from .vector_upkeep import (
 )
 
 #: Share of a recall's window its query embedding may take when it is asked for as the recall starts.  The rest is the
-#: vector search's own: an embedding that took all of it would leave the search nothing.  Held at 0.9 while this host's
-#: query embeddings carry a tail (median 1.4 s, p90 3.1 s) longer than 0.7 of a ~3.3 s window; the search keeps its own
-#: bound, taken from the recall deadline, so widening this does not widen the search's.
-QUERY_EMBEDDING_SHARE = 0.9
+#: vector search's own: an embedding that took all of it would leave the search nothing.  0.7 of a ~4.7 s window keeps
+#: ~1 s for the search, which measured 0.39 s warm and 1.17 s cold on this host's 26k-row store; a call that stays
+#: silent is answered by a hedge attempt inside that share rather than by widening the share.
+QUERY_EMBEDDING_SHARE = 0.7
 
 
 class _QueryEmbedding:
@@ -109,10 +109,11 @@ class _QueryEmbedding:
                     error = TimeoutError("query embedding stage deadline exhausted")
                     error.__dict__.update(phase="prefetch", elapsed_ms=round((self._clock() - began) * 1000))
                     raise error
-                # A connection that failed in milliseconds costs the whole
-                # semantic channel otherwise; a rejected request is not retried.
+                # A request that hangs holds its whole window; a second attempt
+                # starts beside it while it is still out. A rejected request is
+                # not asked twice.
                 vectors = tuple(
-                    embed_with_one_retry(
+                    embed_with_hedge(
                         lambda seconds: embed(self.queries, seconds),
                         budget_seconds=budget,
                         remaining=deadline.remaining,
