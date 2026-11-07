@@ -16,7 +16,7 @@ from .coverage import note_truncation
 from .delete_storage import canonical
 from .events import lexical_terms
 from .recall_needs import asks_to_resume
-from .recall_policy import meaningful_query_terms
+from .recall_policy import meaningful_query_terms, query_is_relevant
 from .retrieval import CandidateRef, RetrievedObject, SearchContext
 from .source_qualification import conditions_match
 
@@ -260,6 +260,8 @@ def background_candidates(
             continue
         conditions = payload.get("conditions", [])
         text = " ".join(str(payload.get(key, "")) for key in ("subject", "predicate", "value_text", "conditions"))
+        if not query_is_relevant(context.query, text):
+            continue
         hits = len(terms.intersection(lexical_terms(text)))
         attribute = (
             effective.scope_id,

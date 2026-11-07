@@ -1,7 +1,7 @@
 """Conservative automatic-recall eligibility, shared by every host.
 
-Only whole conversational messages are skipped. A message with a named topic,
-an owner question or a request about the past still reaches retrieval.
+Conversational follow-ups and attested host notices use the current conversation.
+Named human topics, owner questions and explicit lookups still reach retrieval.
 """
 
 from __future__ import annotations
@@ -13,6 +13,7 @@ import unicodedata
 from typing import Protocol
 
 from ..contracts import ContractError, TrustedContext
+from .claim_storage import parse_source_ref
 
 _SOCIAL = re.compile(
     r"(?:ok(?:ay)?|yes|yeah|yep|sure|alright|understood|got it|sounds good|"
@@ -24,7 +25,15 @@ _FOLLOW_THROUGH = re.compile(
     r"(?:please\s+)?(?:continue|resume|go on|go ahead|keep going|carry on|proceed|"
     r"(?:let['’]s )?do (?:that|it)|(?:do|proceed with) (?:what|as) you (?:recommend|suggest)(?:ed)?)"
     r"(?:\s+please)?|(?:请)?(?:继续|接着|继续执行|继续做|接着做)(?:吧|呀|啊)?|"
-    r"(?:就)?按(?:照)?你(?:推荐|建议|说|刚才说)的(?:办|做|执行|设置|来|改|弄)(?:吧)?",
+    r"(?:就)?按(?:照)?你(?:推荐|建议|说|刚才说)的(?:办|做|执行|设置|来|改|弄)(?:吧)?|"
+    r"(?:现在|现在就)?(?:开始|开始做|开始执行|动手)(?:吧)?",
+    re.I,
+)
+_GENERIC_FOLLOWUP = re.compile(
+    r"(?:(?:is|was) (?:it|that|this) (?:normal|expected|reasonable)|"
+    r"(?:please )?(?:break (?:it|that|this) down|explain (?:it|that|this)))|"
+    r"(?:(?:这|这个|这算|算|这样)?(?:正常|合理)(?:吗|么)|"
+    r"(?:请)?(?:拆分|分解|解释)(?:一下)?(?:组成|构成|这个|这部分)?)",
     re.I,
 )
 _SESSION_STATUS = re.compile(
@@ -41,7 +50,8 @@ _SESSION_STATUS = re.compile(
 _CLOSING = " \t\r\n。.!！?？,，;；~～"
 _CONVERSATIONAL = re.compile(
     rf"(?:(?P<acknowledgment>{_SOCIAL.pattern})|(?P<session_continuation>{_FOLLOW_THROUGH.pattern})|"
-    rf"(?P<session_status>{_SESSION_STATUS.pattern}))(?=[{re.escape(_CLOSING)}]|$)",
+    rf"(?P<session_status>{_SESSION_STATUS.pattern})|(?P<session_followup>{_GENERIC_FOLLOWUP.pattern}))"
+    rf"(?=[{re.escape(_CLOSING)}]|$)",
     re.I,
 )
 #: A busy scope may hide an older turn beyond this window. That uncertainty
@@ -59,7 +69,7 @@ class _Clock(Protocol):
 
 
 def _conversation_reason(text: str) -> str | None:
-    """Recognize only complete sequences of social, continuation and status intents."""
+    """Recognize complete social, continuation, status and generic follow-up intents."""
     tail = text.strip(_CLOSING)
     reasons = set()
     while tail:
@@ -69,7 +79,8 @@ def _conversation_reason(text: str) -> str | None:
         reasons.add(match.lastgroup)
         tail = tail[match.end() :].lstrip(_CLOSING)
     return next(
-        (reason for reason in ("session_status", "session_continuation") if reason in reasons), "acknowledgment"
+        (reason for reason in ("session_status", "session_continuation", "session_followup") if reason in reasons),
+        "acknowledgment",
     )
 
 
@@ -136,8 +147,9 @@ def automatic_recall_skip_reason(
 ) -> str | None:
     """Return a diagnostic reason to skip, or None to recall.
 
-    Blank and slash input need no store read. Conversational messages are
-    skipped only with evidence of an earlier human prompt in this entry's session.
+    Blank and slash input need no store read. Attested host-generated openers
+    use the current conversation; source attestation is scoped to this session and entry.
+    Conversational messages are skipped with evidence of an earlier human prompt.
     Hosts capture the current prompt before recalling, so its source segments
     are excluded from that check. No process-local turn counter is used.
     """
@@ -146,6 +158,22 @@ def automatic_recall_skip_reason(
         return "blank_prompt"
     if text.startswith("/"):
         return "slash_command"
+    if tx is not None and context is not None:
+        if context.actor_origin == "host_generated":
+            return "host_generated"
+        for ref in current_source_refs:
+            try:
+                key, revision = parse_source_ref(ref)
+            except ContractError:
+                continue
+            source = tx.source(key, revision)
+            if (
+                source is not None
+                and source.session_id == context.session_id
+                and source.entry_id == (context.entry_id or "local")
+                and source.event.get("origin") == "host_generated"
+            ):
+                return "host_generated"
     reason = _conversation_reason(text)
     if reason is None:
         return None
