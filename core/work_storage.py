@@ -141,7 +141,7 @@ RESPACE_CURSOR = "embed_respace"
 #: What a reopened row says until it is embedded again.
 RESPACE_MARKER = "embedding_space_changed"
 #: Rows one page reopens at most; the embed queue's room bounds it further.
-RESPACE_PAGE = 1000
+RESPACE_PAGE = 64
 #: Work ids one page looks through at most.
 RESPACE_SCAN = 4096
 _SPACE_ID = re.compile(r"[0-9a-f]{64}")
