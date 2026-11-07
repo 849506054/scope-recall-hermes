@@ -14,7 +14,6 @@ from .claim_storage import parse_source_ref
 from .claims import statement_key
 from .entry_control import context_fence, entry_changed
 from .recall_budget import estimate_tokens
-from .recall_policy import query_is_relevant
 from .retrieval import CandidateRef, SearchContext, SearchLimits
 from .retrieval_hydration import RetrievalHydration
 from .visibility import allowed
@@ -472,7 +471,7 @@ def mark_delivered(tx, context, items, now: str, cutoff: int, source: str = "bri
 
 
 def _render(tx, search, manifests, intervals, token_limit: int, deliver: bool, clock):
-    """Render bounded lines relevant to the current prompt, or a compaction briefing."""
+    """Render at most the per-kind limits, never a partial line."""
     limits = {"task": 3, "decision": 5, "preference": 8}
     items, lines = [], []
     hydration = RetrievalHydration()
@@ -485,10 +484,6 @@ def _render(tx, search, manifests, intervals, token_limit: int, deliver: bool, c
             if found is None:
                 continue
             candidate, obj, line = found
-            if search.query != "session briefing" and not query_is_relevant(
-                search.query, line.partition(" | ")[2].rsplit(" | ", 2)[0]
-            ):
-                continue
             if deliver and already_injected(tx, candidate.kind, candidate.ref, candidate.revision):
                 continue
             if estimate_tokens("\n".join([_HEADING, *lines, line])) > token_limit:
@@ -581,7 +576,7 @@ def read_snapshot(
     now = utc_timestamp(clock.utc_now())
     empty = {"text": "", "items": [], "tokens": 0, "elapsed_ms": 0}
     search = SearchContext(
-        "session briefing" if compact or not context.recent_messages else context.recent_messages[-1],
+        "session briefing",
         "auto",
         None,
         (),
